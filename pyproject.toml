@@ -1,0 +1,27 @@
+[project]
+name = "dataflow-evolve"
+version = "0.1.0"
+description = "多智能体、MCTS 驱动的自动数据工程框架（双反馈环）"
+requires-python = ">=3.10"
+dependencies = [
+    "claude-agent-sdk>=0.2",
+    "openai>=1.0",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+]
+
+# 注意：本地 DataFlow 包需单独安装（editable），见 README。
+# 它会引入 torch/transformers 等重依赖，故不放进本项目的 dependencies。
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["dataflow_evolve*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

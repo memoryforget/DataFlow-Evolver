@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.env
+
+# 运行产物
+workspace/
+!workspace/.gitkeep
+
+# Agent SDK 拷入 _agent_root 的 DataFlow 源码副本（大、可重新拷贝）
+workspace/_agent_root/dataflow/
+
+.claude

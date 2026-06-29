@@ -1,0 +1,114 @@
+"""TreeManager：MCTS 主循环的树操作——select(UCB1) / expand / backpropagate，并维护全局记忆。
+
+借鉴 DataMaster 的 MCTS：从虚拟根沿最大 UCT 下行到"可扩展"节点；扩展时挂上
+PipelineAgent 产出的新配置；回传时沿祖先链累加奖励与访问数。
+"""
+from __future__ import annotations
+
+from dataflow_evolve.core.global_memory import GlobalMemory
+from dataflow_evolve.core.schemas import PipelineConfig
+from dataflow_evolve.core.tree_node import PipelineNode
+from dataflow_evolve.utils.logging import get_logger
+
+logger = get_logger("core.tree_manager")
+
+
+class TreeManager:
+    """持有虚拟根与超参，提供选点 / 扩展 / 回传。"""
+
+    def __init__(
+        self,
+        exploration_constant: float = 1.414,
+        max_children_per_node: int = 4,
+    ) -> None:
+        self.root = PipelineNode()  # 虚拟根，config=None
+        self.exploration_constant = exploration_constant
+        self.max_children_per_node = max_children_per_node
+        self.global_memory = GlobalMemory()
+
+    def set_baseline_root(
+        self, config: PipelineConfig, baseline_dev_score: float
+    ) -> PipelineNode:
+        """暖启动：把虚拟空根替换为持有基线配置的真实根（见 docs/design-decisions.md §2.4）。
+
+        - root 持有基线 `config`（其 `code` 即适配后的基线源码，供首层子节点作变异起点）；
+        - `visits=1`，`total_reward=0.0`——基线相对自身的 Relative Gain 恒为 0，是 UCB 的零点；
+        - `baseline_dev_score` 记到 root，便于复现与日志（奖励换算的真值由 RewardPolicy 持有）。
+        """
+        self.root.config = config
+        self.root.visits = 1
+        self.root.total_reward = 0.0
+        self.root.baseline_dev_score = baseline_dev_score
+        self.global_memory.update(self.root)
+        logger.info(
+            "基线作 root：%s（baseline_dev_score=%.4f, visits=1, reward=0）",
+            self.root.node_dir_name, baseline_dev_score,
+        )
+        return self.root
+
+    def is_expandable(self, node: PipelineNode) -> bool:
+        """未满子节点配额即可扩展。"""
+        return len(node.children) < self.max_children_per_node
+
+    def reserve_child(self, parent: PipelineNode) -> PipelineNode:
+        """先占一个子节点（config 暂为 None）以拿到稳定的 node_dir 名，供生成写入。
+
+        生成成功后由调用方填回 `child.config`；失败则该节点保留为一次已用的扩展尝试。
+        """
+        child = PipelineNode(config=None, parent=parent)
+        parent.children.append(child)
+        logger.info("预留节点：parent=node_%s → %s", parent.id, child.node_dir_name)
+        return child
+
+    def select(self) -> PipelineNode:
+        """自虚拟根沿最大 UCT 下行，返回第一个可扩展节点。
+
+        根节点总是可扩展（直到铺满首层）；否则沿 best_child 下探，遇到可扩展节点即停。
+        """
+        node = self.root
+        while True:
+            if self.is_expandable(node):
+                return node
+            child = node.best_child(self.exploration_constant)
+            if child is None:
+                return node
+            node = child
+
+    def expand(self, parent: PipelineNode, config: PipelineConfig) -> PipelineNode:
+        """在 parent 下挂一个新子节点。"""
+        child = parent.add_child(config)
+        logger.info("扩展：parent=node_%s → child=%s", parent.id, child.node_dir_name)
+        return child
+
+    def backpropagate(self, node: PipelineNode, reward: float) -> None:
+        """从 node 沿父链累加 reward 与 visits（含虚拟根）。"""
+        cur: PipelineNode | None = node
+        while cur is not None:
+            cur.visits += 1
+            cur.total_reward += reward
+            cur = cur.parent
+        self.global_memory.update(node)
+
+    # ---- 便捷查询 ----
+    def best_leaf(self) -> PipelineNode | None:
+        """返回平均奖励最高的已访问非根节点（最终产物挑选用）。"""
+        best: PipelineNode | None = None
+        stack = list(self.root.children)
+        while stack:
+            n = stack.pop()
+            stack.extend(n.children)
+            if n.visits == 0:
+                continue
+            if best is None or n.mean_reward > best.mean_reward:
+                best = n
+        return best
+
+    def all_nodes(self) -> list[PipelineNode]:
+        """前序遍历返回除虚拟根外的所有节点。"""
+        out: list[PipelineNode] = []
+        stack = list(self.root.children)
+        while stack:
+            n = stack.pop()
+            out.append(n)
+            stack.extend(n.children)
+        return out
