@@ -11,7 +11,7 @@
     6. train = TrainerWrapper.run(dataset)               # Phase-2 真实训练（dev 评测，驱动 MCTS）
        report = DiagnosticAgent.analyze(train.bad_cases)
     7. TreeManager.backpropagate(node, reward=RewardPolicy.reward(train.score))
-    8. （可选）DataPool.admit(当前节点数据)；回到 2
+    8. （可选）DataPool.stage(当前节点数据)；回到 2。运行结束 dump() 统一筛/去重/裁剪
 
 奖励/惩罚随 `baseline.enabled` 切换：
     - 冷启动（false）：虚拟空根 + 绝对分奖励 + penalty=0（行为与历史一致）。
@@ -223,15 +223,15 @@ class Orchestrator:
         baseline_dev = train.score
         logger.info("baseline_dev_score=%.4f", baseline_dev)
 
-        # 切换奖励策略 → Relative Gain；basline 作 root；池门槛改为基线自标定
+        # 切换奖励策略 → Relative Gain；basline 作 root；池门槛改为基线自标定（严格 > baseline+margin）
         self.reward_policy = RewardPolicy(
             reward_mode=REWARD_RELATIVE, baseline_dev_score=baseline_dev
         )
         root = self.tree.set_baseline_root(baseline_config, baseline_dev)
         root.train_result = train
         if self.pool is not None:
-            self.pool.admission_threshold = baseline_dev + self.baseline_margin
-            logger.info("数据池准入门槛（暖启动）：≥ %.4f", self.pool.admission_threshold)
+            self.pool.set_warm_gate(baseline_dev, self.baseline_margin)
+            logger.info("数据池门槛（暖启动）：node_dev > %.4f", baseline_dev + self.baseline_margin)
         return True
 
     # ------------------------------------------------------------------
@@ -327,10 +327,10 @@ class Orchestrator:
             child.node_dir_name, train.score, reward, self.reward_policy.reward_mode,
         )
 
-        # 8. 数据池收割（可选；仅 review 通过且 dev 分 ≥ 门槛的节点）
+        # 8. 数据池收割（可选）：运行期只暂存，门槛/去重/占比裁剪留到 run() 末尾 dump 统一处理
         if self.pool is not None:
             rows = _read_jsonl_rows(exec_result.dataset_path)
-            self.pool.admit(
+            self.pool.stage(
                 node_id=child.id,
                 rows=rows,
                 dev_score=train.score,

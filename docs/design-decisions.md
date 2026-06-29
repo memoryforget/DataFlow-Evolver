@@ -165,13 +165,27 @@ baseline 在框架里扮演**三个不同角色**，勿混为一谈：
 
 - 任务窄而同质（单 pipeline 已全覆盖，池只加冗余）；无可靠质量门控（池被噪声拖累）；严格走"pipeline 即方法"想保持聚焦时可缓做。
 
-### 4.3 准入策略（待实测定参）
+### 4.3 准入策略（✅ 已接线，2026-06-28；尺度无关、跨 benchmark 不重调）
 
-- **Pipeline 级**：必须 `review.passed`；且 `node_dev_score ≥ baseline_dev_score + Δ`（Δ=0，见 §2.4；基线关闭时回退到绝对 `data_pool.score_threshold`）。研究级可选「边际贡献」（加入后池 dev 分是否提升，贪心子模），但每候选需在 `池∪节点` 重训，贵。
-- **行级**：默认「准入 pipeline 全部行 − 去重」；现阶段无可靠逐行质量模型，激进逐行过滤引偏差。
-  - **去重**：`content_hash` 精确去重起步（确定性、零依赖）。**嵌入近邻去重明确推后**——它与 bad-case 上采样冲突（失败模式数据往往故意相似，会被误删）。
-  - **命中失败模式的行不丢、应上采样**（bad-case-aware 的精髓）。
-  - **per-pipeline 占比上限**（`data_pool.max_rows_per_pipeline`，尺度无关），防单 pipeline 淹没池。
+**机制改为「运行期暂存 → dump 前统一处理」**（`core/data_pool.py`）：运行中每个评估过的节点
+只 `stage(dev_score, review_passed, rows)`；运行结束 `dump()` 时按固定顺序：①门槛筛节点 →
+②跨源精确去重 → ③占比裁剪。门槛在 dump 时才算，因为冷启动分位数要等本轮完整分布。
+
+- **Pipeline 级门槛**（必须 `review.passed`）：
+  - **暖启动**：`node_dev > baseline_dev + margin`（**严格大于**，`margin=0` 即"严格打败基线"；
+    等号的 baseline 自身被排除 → 与"baseline 不进池"一致）。
+  - **冷启动**：`node_dev ≥ max(本轮全部节点 dev 分的 q 分位数, score_threshold)`（q 默认中位数 0.5）。
+    分位数从本轮分布自算 → **无魔数**；并列时 `≥` 不会空池；`score_threshold` 默认 0 为可选绝对地板。
+  - 研究级可选「边际贡献」（加入后池 dev 是否提升，贪心子模）仍未实现（需在 `池∪节点` 重训，贵）。
+- **行级**：默认「准入 pipeline 全部行 − 去重」；逐行质量过滤未做。
+  - **去重**：`content_hash` 精确去重（确定性、零依赖）；跨源先到先得。嵌入近邻去重**明确推后**（与 bad-case 上采样冲突）。
+  - **per-pipeline 占比上限**（`max_pool_fraction_per_pipeline`，默认 **30%**，尺度无关）：
+    仅当来源数 ≥ ⌈1/f⌉（f=0.3→**4**）时才生效（否则单一来源必占 100%，裁剪无意义）；
+    用 **water-filling** 迭代把超额来源裁到 ≤ f×池总量。可选叠加绝对上限 `max_rows_per_pipeline`（默认 0=不限）。
+  - **命中失败模式的行不丢、应上采样**（bad-case-aware）——**未实现**，且须在去重后、豁免占比裁剪（失败模式行故意相似）。
+- **baseline 数据不进池**（暖启动）：baseline 在 `_run_baseline` 建立、不走 `stage()` → 天然排除；
+  保持池"= 搜索在基线之上发现的覆盖"的身份，且避免 corpus-free/corpus-grounded 范式混入。
+- **边界**：池空（无人过门槛）不报错；分数全并列时冷启动 `≥中位数` 全收（退化安全）。
 
 ### 4.4 与奖励解耦 + 目标—产物错配
 
@@ -231,8 +245,10 @@ baseline 在框架里扮演**三个不同角色**，勿混为一谈：
 | `trainer.dev_eval_cmd` | dev 评测（驱动 MCTS） | 空 → **已接线**回退 `train_eval_cmd` |
 | `trainer.test_eval_cmd` | test 终评（仅一次，手动） | 空 |
 | `data_pool.enabled` | 收割数据池 | false |
-| `data_pool.score_threshold` | **冷启动**时的绝对 τ 回退（暖启动改用 `baseline_dev+margin`，见 `DataPool.admission_threshold`） | 0.0（以 review.passed 为真实门槛） |
-| `data_pool.max_rows_per_pipeline` | per-pipeline 上限（拟改占比） | 0（不限） |
+| `data_pool.score_threshold` | **冷启动**绝对地板（与本轮分位数取 max；暖启动改用 `baseline_dev+margin` 严格 >） | 0.0（不设地板） |
+| `data_pool.quantile` | 冷启动分位数门槛（尺度无关，跨 benchmark 不重调） | 0.5（中位数） |
+| `data_pool.max_pool_fraction_per_pipeline` | per-pipeline 占池上限；来源数 <⌈1/f⌉ 时不生效，否则 water-filling 裁剪 | 0.3 |
+| `data_pool.max_rows_per_pipeline` | 可选叠加的绝对行数上限 | 0（不限） |
 | `data_pool.dedup` | `content_hash`（精确）/ `embedding`（未实现） | content_hash |
 
 > 已锁定但仍待实测重设的硬约束：**一旦有真实 dev 分布，须据基线 + 分位数确认 Δ 与占比上限**。
@@ -247,7 +263,8 @@ baseline 在框架里扮演**三个不同角色**，勿混为一谈：
   - `main.py`：暖启动启动时跑一次基线（seed=42，复用 `SubprocessExecutionWrapper` + `DF_PIPELINE_API_KEY` 注入 + `dev_eval_cmd` 评测）得 `baseline_dev_score`；`TreeManager.set_baseline_root` 把基线作 root（visits=1、reward=0）；回传奖励走 `RewardPolicy.reward`，失败 penalty 走 `RewardPolicy.penalty`；第⑧步按 `node_dev ≥ baseline_dev+margin`（暖）/ `score_threshold`（冷）收割数据池并落盘。
   - 变异机制：`parent_code` 注入生成 prompt（见 §2.7）。
   - dev 评测：`trainer.dev_eval_cmd` 留空回退 `train_eval_cmd`。
+- **数据池准入重构（2026-06-28）**：改为「运行期 `stage()` 暂存 → `dump()` 前统一 [门槛筛→去重→占比裁剪]」。暖启动门槛严格 `>` baseline+margin；冷启动 `≥` max(本轮分位数, score_threshold)（默认中位数，去魔数）；per-pipeline 30% 占比上限（来源≥4 才生效，water-filling）；baseline 数据不进池。见 §4.3。
   - 冷启动（`enabled=false`）：不跑基线、虚拟空根、绝对分奖励、penalty=0——行为与历史一致（27 个既有测试全绿）。
   - 单测：`tests/test_baseline.py`（warm/cold 路径、Relative Gain、penalty 切换、池门槛、源码适配）。
-- **待实测后实现**：行级 bad-case 上采样、嵌入去重、去污染脚本、双评测受控实验、可选边际贡献奖励。见 [`../TODO.md`](../TODO.md) §M7。
+- **待实测后实现**：行级 bad-case 上采样、嵌入去重、去污染脚本、双评测受控实验、可选边际贡献奖励；以及 held-out **test 终评 + 最终报告驱动**（`test_eval_cmd` 目前代码未引用）。见 [`../TODO.md`](../TODO.md) §M7。
 - **注**：`best_leaf()` 仍只在 root 的子节点中挑选（不含 baseline root 自身）。暖启动若所有子节点均逊于基线，返回的是「最不差的子节点」而非基线本身——属次要语义点，留待实测时按需调整。

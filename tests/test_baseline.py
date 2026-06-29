@@ -4,11 +4,12 @@
 - RewardPolicy：绝对分 / Relative Gain 奖励、penalty 随模式切换、relative 缺 baseline 报错。
 - adapt_baseline_source：api_url / model_name / first_entry_file_name / cache_path 替换 + key 注入。
 - TreeManager.set_baseline_root：root 持有基线 config、visits=1、reward=0、记录 baseline_dev。
-- DataPool 准入门槛：暖启动用 admission_threshold、冷启动回退 score_threshold。
+- DataPool 门槛：冷启动分位数(中位数)门槛、暖启动严格 > baseline、去重、占比裁剪 water-filling、空池。
 - Orchestrator 暖/冷两条路径（桩替换执行/训练/SDK），验证奖励与 penalty 实际取值。
 
 不依赖 ANTHROPIC_API_KEY、不真正调用 API。
 """
+import math
 import sys
 from pathlib import Path
 
@@ -139,20 +140,94 @@ def test_set_baseline_root_holds_config_visits1_reward0():
 
 
 # ---------------------------------------------------------------------------
-# DataPool 准入门槛
+# DataPool 门槛（运行期 stage → finalize 统一筛/去重/裁剪）
 # ---------------------------------------------------------------------------
-def test_pool_gate_cold_uses_score_threshold():
-    pool = DataPool(PoolConfig(enabled=True, score_threshold=0.5))
-    assert pool.passes_pipeline_gate(0.6, True) is True
-    assert pool.passes_pipeline_gate(0.4, True) is False
-    assert pool.passes_pipeline_gate(0.9, False) is False
+def _rows(node_tag, n):
+    return [{"instruction": f"{node_tag}-{i}", "output": "x"} for i in range(n)]
 
 
-def test_pool_gate_warm_uses_admission_threshold():
-    pool = DataPool(PoolConfig(enabled=True, score_threshold=0.0))
-    pool.admission_threshold = 0.6        # = baseline_dev + margin
-    assert pool.passes_pipeline_gate(0.65, True) is True   # 打败基线
-    assert pool.passes_pipeline_gate(0.55, True) is False  # 逊于基线（虽 ≥ 绝对 0）
+def test_pool_cold_quantile_gate_admits_upper_half():
+    """冷启动：门槛 = 本轮 dev 分中位数（>=）。"""
+    pool = DataPool(PoolConfig(enabled=True, quantile=0.5,
+                               max_pool_fraction_per_pipeline=0))  # 关掉占比上限单测门槛
+    pool.stage(1, _rows("a", 1), dev_score=0.3, review_passed=True)
+    pool.stage(2, _rows("b", 1), dev_score=0.5, review_passed=True)
+    pool.stage(3, _rows("c", 1), dev_score=0.7, review_passed=True)
+    pool.finalize()
+    sources = set(e.source_node_id for e in pool._entries)
+    # 中位数=0.5 → 收 node2(0.5,=) 与 node3(0.7)，剔除 node1(0.3)
+    assert sources == {2, 3}
+    assert pool.last_stats.threshold == 0.5
+
+
+def test_pool_warm_gate_strict_greater_than_baseline():
+    """暖启动：门槛 = baseline+margin，严格 >（等号的 baseline 自身也被排除）。"""
+    pool = DataPool(PoolConfig(enabled=True, max_pool_fraction_per_pipeline=0))
+    pool.set_warm_gate(baseline_dev=0.6, margin=0.0)
+    pool.stage(1, _rows("a", 1), dev_score=0.65, review_passed=True)  # > 0.6 → 收
+    pool.stage(2, _rows("b", 1), dev_score=0.60, review_passed=True)  # == 0.6 → 拒（严格）
+    pool.stage(3, _rows("c", 1), dev_score=0.55, review_passed=True)  # < 0.6 → 拒
+    pool.finalize()
+    assert set(e.source_node_id for e in pool._entries) == {1}
+
+
+def test_pool_skips_failed_and_unreviewed_nodes():
+    pool = DataPool(PoolConfig(enabled=True, max_pool_fraction_per_pipeline=0))
+    assert pool.stage(1, _rows("a", 1), dev_score=None, review_passed=True) is False
+    assert pool.stage(2, _rows("b", 1), dev_score=0.9, review_passed=False) is False
+    assert pool.stage(3, _rows("c", 1), dev_score=0.9, review_passed=True) is True
+
+
+def test_pool_dedup_across_sources_first_come():
+    pool = DataPool(PoolConfig(enabled=True, quantile=0.0, max_pool_fraction_per_pipeline=0))
+    dup = [{"instruction": "same", "output": "x"}]
+    pool.stage(1, list(dup), dev_score=0.9, review_passed=True)
+    pool.stage(2, list(dup), dev_score=0.9, review_passed=True)  # 同内容 → 去重
+    pool.finalize()
+    assert len(pool) == 1
+    assert pool.last_stats.rejected_dedup == 1
+
+
+def test_pool_fraction_cap_inactive_below_threshold_sources():
+    """来源数 < ⌈1/0.3⌉=4 时占比上限不生效（单一来源必占 100%，裁剪无意义）。"""
+    pool = DataPool(PoolConfig(enabled=True, quantile=0.0, max_pool_fraction_per_pipeline=0.3))
+    pool.stage(1, _rows("a", 100), dev_score=0.9, review_passed=True)
+    pool.finalize()
+    assert len(pool) == 100          # 不被裁
+    assert pool.last_stats.rejected_cap == 0
+
+
+def test_pool_fraction_cap_water_fills_when_feasible():
+    """≥4 个来源时，单一高产来源被裁到 ≤30% 池总量。"""
+    pool = DataPool(PoolConfig(enabled=True, quantile=0.0, max_pool_fraction_per_pipeline=0.3))
+    pool.stage(1, _rows("a", 100), dev_score=0.9, review_passed=True)  # 高产
+    for nid in (2, 3, 4):
+        pool.stage(nid, _rows(chr(96 + nid), 10), dev_score=0.9, review_passed=True)
+    pool.finalize()
+    total = len(pool)
+    by_src = {}
+    for e in pool._entries:
+        by_src[e.source_node_id] = by_src.get(e.source_node_id, 0) + 1
+    # 每个来源占比 ≤ 30%（含浮点容差）
+    for nid, c in by_src.items():
+        assert c <= math.ceil(0.3 * total) + 0, f"src {nid} 占 {c}/{total} 超 30%"
+    assert by_src[1] < 100          # 高产来源确被裁
+    assert pool.last_stats.rejected_cap > 0
+
+
+def test_pool_empty_when_nothing_passes():
+    pool = DataPool(PoolConfig(enabled=True))
+    pool.set_warm_gate(baseline_dev=1.0, margin=0.0)
+    pool.stage(1, _rows("a", 5), dev_score=1.0, review_passed=True)  # 等号，严格 > 拒
+    pool.finalize()
+    assert len(pool) == 0           # 无人打败基线 → 池空（不报错）
+
+
+def test_pool_disabled_stage_is_noop():
+    pool = DataPool(PoolConfig(enabled=False))
+    assert pool.stage(1, _rows("a", 5), dev_score=0.9, review_passed=True) is False
+    pool.finalize()
+    assert len(pool) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +400,8 @@ def test_warm_start_pool_admits_above_baseline(tmp_path, monkeypatch):
     _common_stubs(orch, monkeypatch, train_scores=[0.5, 0.8, 0.3])
 
     orch.run("生成问答数据集")
-    # 池门槛 = baseline_dev + margin = 0.5
-    assert abs(orch.pool.admission_threshold - 0.5) < 1e-9
+    # 暖启动池门槛 = baseline_dev + margin = 0.5，严格 >：0.8 收、0.3 拒
+    assert orch.pool.gate_mode == "relative_baseline"
+    assert abs(orch.pool.last_stats.threshold - 0.5) < 1e-9
     # 仅 0.8 的节点数据被收割（1 行）
     assert len(orch.pool) == 1
