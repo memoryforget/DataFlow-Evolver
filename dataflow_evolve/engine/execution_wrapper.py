@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -103,24 +104,43 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
         )
 
 
-def _find_fresh_jsonl(node_path: Path, since: float) -> Path | None:
-    """返回 node_path 下执行期间产生的输出 jsonl。
+_STEP_RE = re.compile(r"_step(\d+)\.jsonl$", re.IGNORECASE)
 
-    DataFlow 的 FileStorage 会按 step 落多个 `..._step{N}.jsonl`。理想产物是最后一步，
-    但末步偶尔为空（算子产出异常）。因此优先取"最新的非空"文件；若全为空，再退回
-    最新文件（让下游 Review 判其不合格）。
+
+def _find_fresh_jsonl(node_path: Path, since: float) -> Path | None:
+    """返回 node_path 下执行期间产生的输出 jsonl（流水线的最终产物）。
+
+    DataFlow 的 FileStorage 把每个算子产物**确定性**命名为
+    `{file_name_prefix}_step{N}.{cache_type}`（见 storage.py `_get_cache_file_path`），
+    最后一个算子的 step 号最大。因此优先**按 step 号取最大的非空文件**来定位最终产物，
+    而不是靠 mtime 猜（旧实现会被中间步/输入种子的写入时间干扰，见 review M2）。
+
+    若最大 step 文件为空，则依次回退到更小 step 的非空文件；若完全没有 `_step{N}` 命名
+    的文件（自定义产物名），再退回"最新非空 → 最新"的 mtime 启发式。
     """
-    candidates = [
+    fresh = [
         p for p in node_path.rglob("*.jsonl")
         if p.is_file() and p.stat().st_mtime >= since - 1.0
     ]
-    if not candidates:
+    if not fresh:
         return None
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    for p in candidates:
+
+    # 优先：按 _step{N} 命名取最大 step 的非空文件
+    stepped = []
+    for p in fresh:
+        m = _STEP_RE.search(p.name)
+        if m:
+            stepped.append((int(m.group(1)), p))
+    for _, p in sorted(stepped, key=lambda t: t[0], reverse=True):
         if _jsonl_nonempty(p):
             return p
-    return candidates[0]
+
+    # 回退：无 step 命名 → 最新的非空；若全为空 → 最新文件（交由下游 Review 判其不合格）
+    fresh.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for p in fresh:
+        if _jsonl_nonempty(p):
+            return p
+    return fresh[0]
 
 
 def _jsonl_nonempty(path: Path) -> bool:

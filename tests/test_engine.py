@@ -99,3 +99,27 @@ def test_execution_prefers_nonempty_when_last_step_empty(tmp_path):
     result = wrapper.run(cfg, "node_1")
     assert result.success is True
     assert result.dataset_path.endswith("s_step1.jsonl")
+
+
+def test_execution_picks_max_step_over_mtime(tmp_path):
+    """两步都非空时，应按 step 号取最大（最终算子），而非按 mtime（review M2）。
+
+    故意让 step1 比 step2 写得更晚（mtime 更新），证明选择不依赖 mtime。
+    """
+    node = tmp_path / "node_1"
+    (node / "cache").mkdir(parents=True)
+    (node / "pipeline.py").write_text(
+        "import pathlib, time\n"
+        "c = pathlib.Path(__file__).parent / 'cache'\n"
+        "(c / 's_step2.jsonl').write_text('{\\\"q\\\":\\\"final\\\"}\\n', encoding='utf-8')\n"
+        "time.sleep(0.05)\n"
+        "(c / 's_step1.jsonl').write_text('{\\\"q\\\":\\\"mid\\\"}\\n', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    wrapper = SubprocessExecutionWrapper(agent_root=str(tmp_path), timeout_sec=30)
+    from dataflow_evolve.core.schemas import PipelineConfig
+
+    cfg = PipelineConfig(operators=[], field_flow="", code="", rationale="")
+    result = wrapper.run(cfg, "node_1")
+    assert result.success is True
+    assert result.dataset_path.endswith("s_step2.jsonl")

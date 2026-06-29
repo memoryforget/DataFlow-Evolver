@@ -5,25 +5,29 @@ import json
 import re
 from typing import Any
 
-_JSON_FENCE = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.DOTALL)
+_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 _CODE_FENCE = re.compile(r"```(?:python|py)?\s*(.*?)```", re.DOTALL)
 
 
 def extract_json(text: str) -> Any | None:
     """从文本中抽取第一个 JSON 对象/数组。
 
-    依次尝试：① ```json 围栏；② 整段直接 json.loads；③ 第一个平衡的 {...} / [...]。
-    失败返回 None。
+    依次尝试：① ```json 围栏内容（先整体解析，失败再对围栏内容做平衡扫描——
+    旧实现用非贪婪 `\\{.*?\\}` 对嵌套对象会截断，故改为平衡扫描）；② 整段直接
+    json.loads；③ 全文第一个平衡的 {...} / []。失败返回 None。
     """
     if not text:
         return None
 
-    m = _JSON_FENCE.search(text)
+    m = _FENCE.search(text)
     if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
+        inner = m.group(1).strip()
+        for cand in (inner, _first_balanced(inner)):
+            if cand:
+                try:
+                    return json.loads(cand)
+                except json.JSONDecodeError:
+                    pass
 
     stripped = text.strip()
     try:
