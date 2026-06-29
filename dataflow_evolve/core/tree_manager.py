@@ -20,11 +20,23 @@ class TreeManager:
         self,
         exploration_constant: float = 1.414,
         max_children_per_node: int = 4,
+        exploration_decay: float = 1.0,
+        exploration_min: float = 0.0,
     ) -> None:
         self.root = PipelineNode()  # 虚拟根，config=None
         self.exploration_constant = exploration_constant
         self.max_children_per_node = max_children_per_node
+        # 探索常数 c 衰减（借鉴 DataMaster）：早期多探索、后期多利用。
+        # c_eff = max(exploration_min, c0 * decay**已回传次数)。decay=1.0 即不衰减（默认，行为不变）。
+        self.exploration_decay = exploration_decay
+        self.exploration_min = exploration_min
+        self._step_count = 0        # 已回传(评估)次数，驱动衰减
         self.global_memory = GlobalMemory()
+
+    def current_exploration(self) -> float:
+        """当前有效探索常数 c（随已评估节点数指数衰减，下限 exploration_min）。"""
+        c = self.exploration_constant * (self.exploration_decay ** self._step_count)
+        return max(self.exploration_min, c)
 
     def set_baseline_root(
         self, config: PipelineConfig, baseline_dev_score: float
@@ -64,12 +76,14 @@ class TreeManager:
         """自虚拟根沿最大 UCT 下行，返回第一个可扩展节点。
 
         根节点总是可扩展（直到铺满首层）；否则沿 best_child 下探，遇到可扩展节点即停。
+        探索常数随已评估节点数衰减（见 current_exploration）。
         """
+        c = self.current_exploration()
         node = self.root
         while True:
             if self.is_expandable(node):
                 return node
-            child = node.best_child(self.exploration_constant)
+            child = node.best_child(c)
             if child is None:
                 return node
             node = child
@@ -88,6 +102,7 @@ class TreeManager:
             cur.total_reward += reward
             cur = cur.parent
         self.global_memory.update(node)
+        self._step_count += 1   # 驱动探索常数衰减
 
     # ---- 便捷查询 ----
     def best_leaf(self) -> PipelineNode | None:

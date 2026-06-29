@@ -132,6 +132,8 @@ class Orchestrator:
         self.tree = TreeManager(
             exploration_constant=search.get("exploration_constant", 1.414),
             max_children_per_node=search.get("max_children_per_node", 4),
+            exploration_decay=search.get("exploration_decay", 1.0),
+            exploration_min=search.get("exploration_min", 0.0),
         )
         self.max_iterations = search.get("max_iterations", 20)
         self.self_correction_retries = search.get("self_correction_retries", 2)

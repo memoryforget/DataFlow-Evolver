@@ -84,3 +84,22 @@ def test_global_memory_updates_on_backprop():
     assert len(tm.global_memory) == 1
     rendered = tm.global_memory.render()
     assert "gen" in rendered
+
+
+def test_exploration_decay_default_is_no_op():
+    tm = TreeManager(exploration_constant=1.5)  # decay=1.0 默认
+    assert tm.current_exploration() == 1.5
+    tm.backpropagate(tm.expand(tm.root, _cfg("a")), 0.1)
+    tm.backpropagate(tm.expand(tm.root, _cfg("b")), 0.1)
+    assert tm.current_exploration() == 1.5  # 不衰减
+
+
+def test_exploration_decays_with_steps_and_floors():
+    tm = TreeManager(exploration_constant=1.0, exploration_decay=0.5, exploration_min=0.2)
+    assert tm.current_exploration() == 1.0           # step 0: 1.0 * 0.5^0
+    tm.backpropagate(tm.expand(tm.root, _cfg("a")), 0.1)
+    assert abs(tm.current_exploration() - 0.5) < 1e-9  # step 1: 0.5
+    tm.backpropagate(tm.expand(tm.root, _cfg("b")), 0.1)
+    assert abs(tm.current_exploration() - 0.25) < 1e-9  # step 2: 0.25
+    tm.backpropagate(tm.expand(tm.root, _cfg("c")), 0.1)
+    assert tm.current_exploration() == 0.2           # step 3: 0.125 → 触地板 0.2

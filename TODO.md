@@ -293,9 +293,10 @@ class DiagnosticReport:       # DiagnosticAgent 产物，回写节点，指导�
 - [x] `README.md`：安装、配置、运行、外部训练脚本契约说明
 
 ### M6 — 健壮性与打磨（可选 / 后续）
-- [ ] 失败重试与预算（最大节点数 / 最大轮数 / token 预算）
+- [x] 最大轮数 / 最大节点数：`search.max_iterations`（一次迭代=一个节点，已实现）
+- [ ] token/USD 全局预算熔断（`agent_sdk.max_budget_usd` 仅限单次 SDK 调用；全局上限暂不做）
 - [ ] 运行产物与树状态的持久化 / 断点续跑
-- [ ] 探索常数 c 的衰减策略（借鉴 DataMaster mcts_utils）
+- [x] 探索常数 c 的衰减策略（借鉴 DataMaster mcts_utils）：`search.exploration_decay`/`exploration_min`，按已评估节点数指数衰减，默认 1.0 不衰减
 
 ### M7 — 交付物定位 / 奖励锚点 / 数据池 / 防泄露（设计见 `docs/design-decisions.md`）
 > 决策：**主贡献 = pipeline**（data 为证据）；奖励 = **Relative Gain**（相对强基线，Δ=0、seed=42）；data pool 与奖励**解耦**、默认关闭。
