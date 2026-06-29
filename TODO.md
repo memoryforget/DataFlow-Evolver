@@ -295,7 +295,7 @@ class DiagnosticReport:       # DiagnosticAgent 产物，回写节点，指导�
 ### M6 — 健壮性与打磨（可选 / 后续）
 - [x] 最大轮数 / 最大节点数：`search.max_iterations`（一次迭代=一个节点，已实现）
 - [ ] token/USD 全局预算熔断（`agent_sdk.max_budget_usd` 仅限单次 SDK 调用；全局上限暂不做）
-- [ ] 运行产物与树状态的持久化 / 断点续跑
+- [x] 运行产物与树状态的持久化 / 断点续跑：`search.checkpoint` 非空则每轮落盘树状态+奖励策略+池暂存+进度+profile，启动时存在则载入续跑（`core/checkpoint.py`）；默认空=关闭
 - [x] 探索常数 c 的衰减策略（借鉴 DataMaster mcts_utils）：`search.exploration_decay`/`exploration_min`，按已评估节点数指数衰减，默认 1.0 不衰减
 
 ### M7 — 交付物定位 / 奖励锚点 / 数据池 / 防泄露（设计见 `docs/design-decisions.md`）

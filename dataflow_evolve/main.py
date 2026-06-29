@@ -27,6 +27,7 @@ from dataflow_evolve.agents.diagnostic_agent import DiagnosticAgent
 from dataflow_evolve.agents.pipeline_agent import PipelineAgent
 from dataflow_evolve.agents.review_agent import ReviewAgent
 from dataflow_evolve.agents.task_profiler import TaskProfilerAgent
+from dataflow_evolve.core import checkpoint
 from dataflow_evolve.core.baseline import (
     REWARD_ABSOLUTE,
     REWARD_RELATIVE,
@@ -138,24 +139,41 @@ class Orchestrator:
         self.max_iterations = search.get("max_iterations", 20)
         self.self_correction_retries = search.get("self_correction_retries", 2)
         self.review_self_correction_retries = search.get("review_self_correction_retries", 5)
+        # 断点续跑（默认关闭）：非空路径则每轮落盘树状态，启动时若存在则载入续跑
+        self.checkpoint_path = search.get("checkpoint", "")
 
     # ------------------------------------------------------------------
     def run(self, task_description: str) -> PipelineNode | None:
-        profile = self.profiler.run(task_description, seed_path=self.seed_path)
-        if profile is None:
-            logger.error("无法生成 TaskProfile，终止。")
-            return None
-
-        # 1b. 暖启动：跑一次强基线，basline 作 root + 切换到 Relative Gain 奖励
-        if self.baseline_enabled:
-            if not self._run_baseline():
-                logger.error("基线流程失败，暖启动无法继续。终止。")
+        # 0. 若有 checkpoint → 载入续跑；否则正常起步（含暖启动基线）
+        state = checkpoint.read(self.checkpoint_path) if self.checkpoint_path else None
+        if state:
+            profile = checkpoint.restore_profile(state)
+            checkpoint.restore_tree(state, self.tree)
+            self.reward_policy = checkpoint.restore_reward_policy(state)
+            if self.pool is not None:
+                checkpoint.restore_pool(state, self.pool)
+            start_it = state["completed_iterations"] + 1
+            logger.info(
+                "从 checkpoint 续跑：已完成 %d 轮，从第 %d 轮继续（reward_mode=%s）",
+                state["completed_iterations"], start_it, self.reward_policy.reward_mode,
+            )
+        else:
+            profile = self.profiler.run(task_description, seed_path=self.seed_path)
+            if profile is None:
+                logger.error("无法生成 TaskProfile，终止。")
                 return None
+            # 1b. 暖启动：跑一次强基线，basline 作 root + 切换到 Relative Gain 奖励
+            if self.baseline_enabled:
+                if not self._run_baseline():
+                    logger.error("基线流程失败，暖启动无法继续。终止。")
+                    return None
+            start_it = 1
 
-        for it in range(1, self.max_iterations + 1):
+        for it in range(start_it, self.max_iterations + 1):
             logger.info("==== 迭代 %d/%d ====", it, self.max_iterations)
             parent = self.tree.select()
             self._step(parent, profile)
+            self._save_checkpoint(it, profile)
 
         if self.pool is not None:
             self.pool.dump()
@@ -166,6 +184,19 @@ class Orchestrator:
                 "最优节点：%s（mean_reward=%.4f）", best.node_dir_name, best.mean_reward
             )
         return best
+
+    # ------------------------------------------------------------------
+    def _save_checkpoint(self, completed_iterations: int, profile) -> None:
+        """每完成一轮覆盖写一次 checkpoint（关闭时为 no-op）。"""
+        if not self.checkpoint_path:
+            return
+        try:
+            state = checkpoint.serialize(
+                self.tree, self.reward_policy, self.pool, completed_iterations, profile
+            )
+            checkpoint.write(self.checkpoint_path, state)
+        except Exception as exc:  # 落盘失败不应拖垮主循环
+            logger.warning("checkpoint 落盘失败（继续跑）：%s", exc)
 
     # ------------------------------------------------------------------
     def _run_baseline(self) -> bool:

@@ -246,9 +246,10 @@ REAL_BASELINE = (
 )
 
 
-def _make_config(tmp_path: Path, *, baseline_enabled: bool, data_pool: bool = False) -> Config:
+def _make_config(tmp_path: Path, *, baseline_enabled: bool, data_pool: bool = False,
+                 checkpoint: str | None = None, max_iterations: int = 2) -> Config:
     agent_root = tmp_path / "_agent_root"
-    agent_root.mkdir(parents=True)
+    agent_root.mkdir(parents=True, exist_ok=True)
     seed = tmp_path / "seed.jsonl"
     seed.write_text('{"text": "hello"}\n', encoding="utf-8")
     ref_script = Path(__file__).resolve().parents[1] / "scripts" / "reference_train_eval.py"
@@ -270,8 +271,9 @@ def _make_config(tmp_path: Path, *, baseline_enabled: bool, data_pool: bool = Fa
             "seed": 42,
             "baseline_pipeline": str(REAL_BASELINE),
         },
-        "search": {"exploration_constant": 1.414, "max_iterations": 2,
-                   "max_children_per_node": 2, "self_correction_retries": 1},
+        "search": {"exploration_constant": 1.414, "max_iterations": max_iterations,
+                   "max_children_per_node": 2, "self_correction_retries": 1,
+                   "checkpoint": checkpoint or ""},
         "review": {"schema_threshold": 0.6, "relevance_threshold": 0.6, "sample_size": 5},
         "trainer": {"train_eval_cmd": f'{sys.executable} "{ref_script}"', "timeout_sec": 60},
         "diagnostic": {"max_bad_cases": 10},
@@ -405,3 +407,32 @@ def test_warm_start_pool_admits_above_baseline(tmp_path, monkeypatch):
     assert abs(orch.pool.last_stats.threshold - 0.5) < 1e-9
     # 仅 0.8 的节点数据被收割（1 行）
     assert len(orch.pool) == 1
+
+
+def test_checkpoint_resume_continues_without_redoing(tmp_path, monkeypatch):
+    """续跑：run1 完成 1 轮落 checkpoint；run2 用同一 checkpoint 续到第 2 轮，不重做第 1 轮。"""
+    ckpt = str(tmp_path / "run.ckpt.json")
+
+    # run1：max_iterations=1 → 评估 1 个节点，落 checkpoint
+    cfg1 = _make_config(tmp_path / "a", baseline_enabled=False, checkpoint=ckpt, max_iterations=1)
+    orch1 = Orchestrator(cfg1)
+    _common_stubs(orch1, monkeypatch, train_scores=[0.7])
+    orch1.run("任务")
+    nodes1 = orch1.tree.all_nodes()
+    assert len(nodes1) == 1
+    node1_id = nodes1[0].id
+    assert Path(ckpt).exists()
+
+    # run2：新 Orchestrator + 同 checkpoint + max_iterations=2 → 续跑 1 轮
+    cfg2 = _make_config(tmp_path / "b", baseline_enabled=False, checkpoint=ckpt, max_iterations=2)
+    orch2 = Orchestrator(cfg2)
+    _common_stubs(orch2, monkeypatch, train_scores=[0.4])
+    # 续跑应从 checkpoint 恢复 profile —— profiler 不应再被调用
+    def boom(*a, **k):
+        raise AssertionError("续跑不应调用 profiler")
+    monkeypatch.setattr(orch2.profiler, "run", boom)
+
+    orch2.run("任务")
+    ids = sorted(n.id for n in orch2.tree.all_nodes())
+    assert node1_id in ids          # run1 的节点被恢复（未重做）
+    assert len(ids) == 2            # 仅新增 1 个节点

@@ -18,6 +18,12 @@ from dataflow_evolve.core.schemas import (
 _id_counter = count(1)
 
 
+def reseed_id_counter(start: int) -> None:
+    """重置全局节点 id 计数器（断点续跑时调用，使新节点 id 从 `start` 起，避免与已载入节点冲突）。"""
+    global _id_counter
+    _id_counter = count(start)
+
+
 class PipelineNode:
     """一棵 MCTS 树中的节点；根节点为虚拟节点（config 为 None）。"""
 
