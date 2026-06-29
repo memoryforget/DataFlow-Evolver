@@ -91,10 +91,8 @@ class Orchestrator:
             llm_block=llm_block,
         )
 
-        # 引擎——执行流水线的子进程里注入真实 API 密钥到约定的环境变量名
-        from dataflow_evolve.llm.serving import _resolve_api_key
-
-        self.pipeline_api_key = _resolve_api_key(api_cfg.key_name_of_api_key)
+        # 引擎——执行流水线的子进程里把真实 API 密钥注入约定的环境变量名（DF_PIPELINE_API_KEY）
+        self.pipeline_api_key = api_cfg.get("api_key", "")
         agent_pipeline_filename = cfg.agent_sdk.get("pipeline_filename", "pipeline.py")
         self.pipeline_filename = agent_pipeline_filename
         self.executor = SubprocessExecutionWrapper(
@@ -294,6 +292,7 @@ class Orchestrator:
         )
         if config is None:
             logger.warning("PipelineAgent 生成失败，惩罚该扩展并跳过。")
+            child.dead = True
             self.tree.backpropagate(child, penalty)
             return
         child.config = config
@@ -312,6 +311,7 @@ class Orchestrator:
 
         if not exec_result.success or exec_result.dataset_path is None:
             logger.warning("执行最终失败，惩罚节点。")
+            child.dead = True
             self.tree.backpropagate(child, penalty)
             return
 
@@ -337,6 +337,7 @@ class Orchestrator:
             child.review_result = review
         if not review.passed:
             logger.info("数据评审最终未通过，不训练，惩罚节点。issues=%s", review.issues)
+            child.dead = True
             self.tree.backpropagate(child, penalty)
             return
 
@@ -346,6 +347,7 @@ class Orchestrator:
         child.train_result = train
         if train.failed:
             logger.warning("训练系统级失败：%s，惩罚节点。", train.error_msg)
+            child.dead = True
             self.tree.backpropagate(child, penalty)
             return
 

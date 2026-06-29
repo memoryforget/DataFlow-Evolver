@@ -44,6 +44,7 @@ def _node_to_dict(node: PipelineNode) -> dict[str, Any]:
         "config": asdict(node.config) if node.config is not None else None,
         "visits": node.visits,
         "total_reward": node.total_reward,
+        "dead": node.dead,
         "baseline_dev_score": node.baseline_dev_score,
         "review_result": asdict(node.review_result) if node.review_result else None,
         "train_result": asdict(node.train_result) if node.train_result else None,
@@ -162,6 +163,7 @@ def restore_tree(state: dict[str, Any], tree: TreeManager) -> None:
         node.id = nd["id"]
         node.visits = nd["visits"]
         node.total_reward = nd["total_reward"]
+        node.dead = nd.get("dead", False)
         node.baseline_dev_score = nd["baseline_dev_score"]
         node.review_result = _review_from_dict(nd["review_result"])
         node.train_result = _train_from_dict(nd["train_result"])

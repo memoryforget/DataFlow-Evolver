@@ -41,6 +41,10 @@ class PipelineNode:
         self.visits: int = 0
         self.total_reward: float = 0.0
 
+        # 失败标记：生成/执行/评审/训练失败的节点置 True，
+        # 之后不再作为扩展点、不被选点下探、不参与最优产物挑选（见 review M1）。
+        self.dead: bool = False
+
         # 暖启动时 root 记录基线 dev 分（仅 baseline root 使用；其余节点保持 None）
         self.baseline_dev_score: float | None = None
 
@@ -82,10 +86,11 @@ class PipelineNode:
         return self.total_reward / self.visits if self.visits else 0.0
 
     def best_child(self, exploration_constant: float) -> Optional["PipelineNode"]:
-        """按 UCT 选最优子节点；无子节点返回 None。"""
-        if not self.children:
+        """按 UCT 选最优子节点（跳过 dead 节点）；无可选子节点返回 None。"""
+        alive = [c for c in self.children if not c.dead]
+        if not alive:
             return None
-        return max(self.children, key=lambda c: c.uct_value(exploration_constant))
+        return max(alive, key=lambda c: c.uct_value(exploration_constant))
 
     def __repr__(self) -> str:
         return (

@@ -59,8 +59,13 @@ class TreeManager:
         return self.root
 
     def is_expandable(self, node: PipelineNode) -> bool:
-        """未满子节点配额即可扩展。"""
-        return len(node.children) < self.max_children_per_node
+        """存活（非 dead）子节点未满配额即可扩展。
+
+        dead 子节点（生成/执行/评审/训练失败）不占配额——否则一个父节点被几次失败
+        塞满后就再也无法在它下面尝试新流水线（见 review M1）。
+        """
+        live = sum(1 for c in node.children if not c.dead)
+        return live < self.max_children_per_node
 
     def reserve_child(self, parent: PipelineNode) -> PipelineNode:
         """先占一个子节点（config 暂为 None）以拿到稳定的 node_dir 名，供生成写入。
@@ -106,16 +111,26 @@ class TreeManager:
 
     # ---- 便捷查询 ----
     def best_leaf(self) -> PipelineNode | None:
-        """返回平均奖励最高的已访问非根节点（最终产物挑选用）。"""
+        """返回平均奖励最高的已访问、非 dead、非根节点（最终产物挑选用）。
+
+        暖启动兜底（review H2）：若 root 是基线节点（有 config + baseline_dev_score），
+        且没有任何子节点打败基线（最佳子节点平均奖励 ≤ 0，Relative Gain 下即未超基线），
+        则回退返回基线 root——避免把"比已有强基线还差"的流水线当成最优交付。
+        """
         best: PipelineNode | None = None
         stack = list(self.root.children)
         while stack:
             n = stack.pop()
             stack.extend(n.children)
-            if n.visits == 0:
+            if n.visits == 0 or n.dead:
                 continue
             if best is None or n.mean_reward > best.mean_reward:
                 best = n
+        # 暖启动：基线作 root 时，没人超过基线就交付基线本身
+        if self.root.config is not None and self.root.baseline_dev_score is not None:
+            if best is None or best.mean_reward <= 0.0:
+                logger.info("无节点打败基线，best_leaf 回退到基线 root：%s", self.root.node_dir_name)
+                return self.root
         return best
 
     def all_nodes(self) -> list[PipelineNode]:

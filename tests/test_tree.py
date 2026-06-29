@@ -77,6 +77,45 @@ def test_best_leaf_picks_highest_mean_reward():
     assert tm.best_leaf() is b
 
 
+def test_dead_child_not_counted_in_expandable():
+    """dead 子节点不占扩展配额：被失败塞满后父节点仍可扩展（review M1）。"""
+    tm = TreeManager(max_children_per_node=2)
+    a = tm.reserve_child(tm.root)
+    b = tm.reserve_child(tm.root)
+    a.dead = True
+    b.dead = True
+    # 两个子节点都 dead → 存活数 0 < 2 → 仍可扩展，select 回到 root
+    assert tm.is_expandable(tm.root) is True
+    assert tm.select() is tm.root
+
+
+def test_dead_child_skipped_in_selection_and_best_leaf():
+    tm = TreeManager(max_children_per_node=2, exploration_constant=0.1)
+    a = tm.expand(tm.root, _cfg("a"))
+    b = tm.expand(tm.root, _cfg("b"))
+    tm.backpropagate(a, 0.9)   # a 分高但标记 dead
+    tm.backpropagate(b, 0.1)
+    a.dead = True
+    assert tm.root.best_child(0.1) is b      # 跳过 dead 的 a
+    assert tm.best_leaf() is b               # best_leaf 也跳过 dead
+
+
+def test_best_leaf_warm_start_falls_back_to_baseline():
+    """暖启动：没有子节点打败基线（relative 奖励 ≤ 0）时，best_leaf 回退到基线 root（review H2）。"""
+    tm = TreeManager(max_children_per_node=3)
+    tm.set_baseline_root(_cfg("baseline"), baseline_dev_score=0.8)
+    child = tm.reserve_child(tm.root)
+    child.config = _cfg("worse")
+    tm.backpropagate(child, -0.2)            # 逊于基线 → 负的 Relative Gain
+    assert tm.best_leaf() is tm.root         # 回退基线
+
+    # 一旦有节点打败基线（正增益），就返回那个节点
+    winner = tm.reserve_child(tm.root)
+    winner.config = _cfg("better")
+    tm.backpropagate(winner, 0.15)
+    assert tm.best_leaf() is winner
+
+
 def test_global_memory_updates_on_backprop():
     tm = TreeManager()
     a = tm.expand(tm.root, _cfg("gen"))
