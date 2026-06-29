@@ -34,10 +34,23 @@ class AgentABC(ABC):
         raise NotImplementedError
 
     def run_json(self, prompt: str) -> Any:
-        """调用 LLM 并要求 JSON；解析失败则重试，最终失败返回 None。"""
+        """调用 LLM 并要求 JSON；调用异常或解析失败均重试，最终失败返回 None。
+
+        关键：把 `serving.generate_one` 的**任何异常**（网络/超时/鉴权等）接住并降级为
+        一次失败尝试，绝不抛到主循环——与 executor/trainer/SDK 的"失败不拖垮编排器"
+        原则保持一致（见 code review H1）。
+        """
         last_err: Exception | None = None
         for attempt in range(self.max_retries + 1):
-            raw = self.serving.generate_one(prompt)
+            try:
+                raw = self.serving.generate_one(prompt)
+            except Exception as exc:  # noqa: BLE001 —— 故意兜底所有后端异常
+                last_err = exc
+                self.logger.warning(
+                    "[%s] LLM 调用异常（第 %d/%d 次），重试中：%s",
+                    self.name, attempt + 1, self.max_retries + 1, exc,
+                )
+                continue
             parsed = extract_json(raw)
             if parsed is not None:
                 return parsed
@@ -46,5 +59,5 @@ class AgentABC(ABC):
                 "[%s] JSON 解析失败（第 %d/%d 次），重试中。原始输出片段：%s",
                 self.name, attempt + 1, self.max_retries + 1, raw[:200],
             )
-        self.logger.error("[%s] 多次重试后仍无法解析 JSON：%s", self.name, last_err)
+        self.logger.error("[%s] 多次重试后仍失败：%s", self.name, last_err)
         return None

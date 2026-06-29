@@ -7,7 +7,6 @@ OpenAI-compatible API 与本地 vLLM 之间切换（vLLM 路径惰性依赖 Data
 """
 from __future__ import annotations
 
-import os
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -41,6 +40,8 @@ class APILLMServing(LLMServingABC):
         api_key: str,
         max_workers: int = 10,
         temperature: float = 0.7,
+        request_timeout: float = 120.0,
+        max_retries: int = 2,
     ) -> None:
         from openai import OpenAI  # 惰性导入，避免无谓依赖
 
@@ -48,7 +49,13 @@ class APILLMServing(LLMServingABC):
         self.max_workers = max_workers
         self.temperature = temperature
         base_url = _to_base_url(api_url)
-        self._client = OpenAI(base_url=base_url, api_key=api_key or "EMPTY")
+        # timeout / max_retries 交给 openai 客户端：网络抖动在 HTTP 层自动退避重试（见 review H1）
+        self._client = OpenAI(
+            base_url=base_url,
+            api_key=api_key or "EMPTY",
+            timeout=request_timeout,
+            max_retries=max_retries,
+        )
         logger.info("APILLMServing 就绪：model=%s base_url=%s", model_name, base_url)
 
     def _one(self, prompt: str, **kwargs: Any) -> str:
@@ -89,14 +96,17 @@ def build_serving(cfg: Config) -> LLMServingABC:
     backend = cfg.get("backend", "api")
     if backend == "api":
         api = cfg.api
-        api_key = _resolve_api_key(api.key_name_of_api_key)
+        # `api_key` 直接是密钥明文；想避免入库可在 YAML 写 ${ENV_VAR}，加载时已展开（见 utils/config.py）。
+        api_key = api.get("api_key", "")
         if not api_key:
-            logger.warning("未能解析到 API 密钥（key_name_of_api_key 既非已设置的环境变量名，也非密钥明文）。")
+            logger.warning("未配置 llm.api.api_key（可填明文或 ${ENV_VAR}）；API 调用很可能 401。")
         return APILLMServing(
             api_url=api.api_url,
             model_name=api.model_name,
             api_key=api_key,
             max_workers=api.get("max_workers", 10),
+            request_timeout=api.get("request_timeout", 120.0),
+            max_retries=api.get("max_retries", 2),
         )
     if backend == "vllm":
         vllm = cfg.vllm
@@ -105,23 +115,6 @@ def build_serving(cfg: Config) -> LLMServingABC:
             tensor_parallel_size=vllm.get("tensor_parallel_size", 1),
         )
     raise ValueError(f"未知的 llm.backend: {backend!r}（应为 'api' 或 'vllm'）")
-
-
-def _resolve_api_key(key_name_or_value: str) -> str:
-    """宽容地解析 API 密钥。
-
-    配置项 `key_name_of_api_key` 既可能是**环境变量名**（推荐，密钥不入库），
-    也可能被直接填成**密钥明文**。优先按环境变量名查；查不到则：若它本身长得像密钥
-    （如以 sk- 开头），就当作明文密钥返回。
-    """
-    if not key_name_or_value:
-        return ""
-    env_val = os.environ.get(key_name_or_value)
-    if env_val:
-        return env_val
-    if key_name_or_value.startswith("sk-") or len(key_name_or_value) >= 32:
-        return key_name_or_value
-    return ""
 
 
 def _to_base_url(api_url: str) -> str:

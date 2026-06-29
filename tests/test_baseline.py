@@ -261,7 +261,7 @@ def _make_config(tmp_path: Path, *, baseline_enabled: bool, data_pool: bool = Fa
         },
         "llm": {"backend": "api", "api": {
             "api_url": "https://example.invalid/v1/chat/completions",
-            "model_name": "stub", "key_name_of_api_key": "DF_API_KEY", "max_workers": 2,
+            "model_name": "stub", "api_key": "stub-key", "max_workers": 2,
         }},
         "agent_sdk": {"pipeline_filename": "pipeline.py", "permission_mode": "bypassPermissions",
                       "allowed_tools": ["Read", "Write"], "setting_sources": ["project"]},

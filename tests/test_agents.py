@@ -63,6 +63,32 @@ def test_review_empty_dataset_fails(tmp_path):
     assert r.passed is False
 
 
+class _RaisingServing(LLMServingABC):
+    """每次调用都抛异常的后端，用于验证 run_json 的兜底（review H1）。"""
+
+    def generate(self, prompts, **kwargs):
+        raise RuntimeError("网络炸了")
+
+
+def test_review_survives_serving_exception(tmp_path):
+    """后端抛异常不应冒泡到主循环：Review 须降级为未通过而非崩溃。"""
+    ds = tmp_path / "ds.jsonl"
+    ds.write_text('{"instruction":"a","answer":"b"}\n', encoding="utf-8")
+    from dataflow_evolve.core.schemas import TaskProfile
+
+    profile = TaskProfile("t", {"instruction": "str"}, "math", [], "sft")
+    r = ReviewAgent(_RaisingServing()).review(str(ds), profile)
+    assert r.passed is False
+
+
+def test_diagnostic_survives_serving_exception():
+    """诊断后端抛异常时返回空报告，不阻塞主循环。"""
+    rep = DiagnosticAgent(_RaisingServing()).analyze(
+        [BadCase("q", "wrong", "right", "calc")], downstream_task="sft"
+    )
+    assert rep.actionable_suggestions == []
+
+
 def test_diagnostic_empty_bad_cases_short_circuits():
     agent = DiagnosticAgent(StubServing(["{}"]))
     rep = agent.analyze([], downstream_task="sft")

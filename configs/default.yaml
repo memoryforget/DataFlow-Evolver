@@ -12,7 +12,7 @@ llm:
   api:
     api_url: http://123.129.219.111:3000/v1/chat/completions   # 完整端点：DataFlow APILLMServing_request 逐字 POST（base /v1 是 404）；非-SDK serving 会自动剥成 base 再由 openai 客户端补回
     model_name: gpt-5.4
-    key_name_of_api_key: sk-
+    api_key: sk-                     # 明文密钥（committed 占位，本地工作区填真 key）；或写 ${ENV_VAR} 由加载时展开（utils/config.py）
     max_workers: 10
   vllm:
     hf_model_name_or_path: ${VLLM_MODEL:Qwen/Qwen2.5-7B-Instruct}
@@ -43,10 +43,13 @@ baseline:
 # MCTS 树搜索
 search:
   exploration_constant: 1.414
+  exploration_decay: 1.0                    # 探索常数 c 的指数衰减率（按已评估节点数）；1.0=不衰减
+  exploration_min: 0.0                      # 衰减下限，防 c 衰减到 0
   max_iterations: 20
   max_children_per_node: 4
   self_correction_retries: 2               # 流水线执行崩溃后的自修正重试次数
   review_self_correction_retries: 5        # Phase-1 评审打回后的自修正重试次数（看中间 step 产物定位、修复、重审）
+  checkpoint: ""                           # 断点续跑：非空=每轮落盘树状态到该路径，启动时存在则载入续跑；空=关闭
 
 # Phase-1 快反馈：数据评审
 review:
@@ -68,10 +71,13 @@ diagnostic:
   max_bad_cases: 30
 
 # 全局数据池（可选副产品；与 MCTS 奖励解耦，见 docs/design-decisions.md §4）
-# ✅ 已接入 main.py 第⑧步：准入门槛暖启动用 baseline_dev+margin、冷启动用 score_threshold。
+# ✅ 已接入 main.py：运行期暂存 → dump 前统一[门槛筛→去重→占比裁剪]。
+# 门槛：暖启动 node_dev > baseline_dev+margin（严格）；冷启动 node_dev ≥ max(本轮分位数, score_threshold)。
 data_pool:
   enabled: false                  # 默认关闭；开启需先做受控实验（等量对比+多样性量化）
-  score_threshold: 0.0            # τ：冷启动时的绝对 dev 分门槛；0=以 review.passed 为真实门槛（暖启动改用 baseline_dev+margin）
-  max_rows_per_pipeline: 0        # 单 pipeline 贡献上限，0=不限；有数据后重设以防类别失衡
+  score_threshold: 0.0            # 冷启动绝对地板（与分位数取 max；0=不设地板，纯靠分位数+review.passed）
+  quantile: 0.5                   # 冷启动分位数门槛（0.5=中位数；尺度无关，跨 benchmark 不重调）
+  max_pool_fraction_per_pipeline: 0.3   # 单 pipeline 占池上限 30%；来源数 <⌈1/f⌉(=4) 时不生效
+  max_rows_per_pipeline: 0        # 可选叠加绝对行数上限，0=不限
   dedup: content_hash             # 已定：精确去重起步。embedding 语义去重推后（与 bad-case 上采样冲突，未实现）
   output_path: ./workspace/data_pool.jsonl
