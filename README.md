@@ -126,7 +126,7 @@ python <train_eval_cmd> --dataset <ds.jsonl> --output <out_dir>
 
 ## 数学 SFT 下游链路（LlamaFactory + Math Benchmark）
 
-当前已配置的 Phase-2 真实链路：**LoRA SFT + 三 Math Bench 评测**。
+当前已配置的 Phase-2 真实链路：**Full SFT + 三 Math Bench 评测**。
 
 ### 安装训练/评测依赖
 
@@ -134,7 +134,7 @@ python <train_eval_cmd> --dataset <ds.jsonl> --output <out_dir>
 conda activate DataFlow-Evolve
 pip install -e ".[train]"
 # 或手动：
-# pip install llamafactory deepspeed vllm datasets torch transformers peft accelerate math-verify
+# pip install llamafactory deepspeed vllm datasets torch transformers accelerate math-verify
 ```
 
 ### 环境变量
@@ -142,17 +142,15 @@ pip install -e ".[train]"
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `SFT_BASE_MODEL` | `Qwen/Qwen3-8B` | 基座模型（HuggingFace ID 或本地路径） |
-| `SFT_LORA_RANK` | `16` | LoRA rank |
-| `SFT_LORA_ALPHA` | `32` | LoRA alpha |
 | `SFT_NUM_EPOCHS` | `3` | 训练 epoch 数 |
-| `SFT_LEARNING_RATE` | `2e-4` | 学习率 |
+| `SFT_LEARNING_RATE` | `2e-5` | 学习率 |
 | `SFT_BATCH_SIZE` | `4` | per-device batch size |
 | `SFT_GRAD_ACCUM` | `4` | 梯度累积步数 |
 | `SFT_NUM_GPUS` | `16` | 训练 GPU 数（torchrun nproc） |
 | `EVAL_TP_SIZE` | `16` | vLLM 推理 tensor parallel size |
 | `EVAL_MAX_MODEL_LEN` | `4096` | vLLM 最大序列长度 |
 | `EVAL_MAX_NEW_TOKENS` | `2048` | 评测推理最大生成 token 数 |
-| `MATH_TRAIN_PATH` | 自动检测 | dev 评测题库路径（Qwen2.5-Math 的 math/train.jsonl） |
+| `MATH_TRAIN_PATH` | `data/math_train.jsonl` | dev 评测题库路径（MATH competition train 7500 条） |
 | `HF_CACHE_DIR` | `None` | HuggingFace datasets 缓存目录 |
 
 ### 运行方式
@@ -160,7 +158,7 @@ pip install -e ".[train]"
 脚本遵循 Phase-2 契约，由框架自动调用（`trainer.dev_eval_cmd`）：
 
 ```bash
-# dev 模式（MCTS 迭代，框架自动调用）：只跑 GSM8K train split
+# dev 模式（MCTS 迭代，框架自动调用）：MATH train 全量 7500 题
 python scripts/llamafactory_math_sft_eval.py --mode dev --dataset <ds.jsonl> --output <out_dir>
 
 # test 模式（终评，手动调用一次）：跑 GSM8K test + MATH-500 + AIME 2024
@@ -169,8 +167,8 @@ python scripts/llamafactory_math_sft_eval.py --mode test --dataset <ds.jsonl> --
 
 内部流程：
 1. **格式转换**：DataFlow JSONL (`instruction` + `generated_cot`) → LlamaFactory alpaca 格式
-2. **LoRA SFT**：Qwen3-8B + DeepSpeed ZeRO-2（16 GPU），约 5-10 分钟
-3. **评测**：vLLM 加载 base+adapter 推理+判分
+2. **Full SFT**：Qwen3-8B + DeepSpeed ZeRO-2（16 GPU），全量微调
+3. **评测**：vLLM 加载 fine-tuned 模型推理+判分（Qwen2.5-Math prompt 格式）
    - dev：MATH train 全量（7500 条公开竞赛训练题，非 benchmark test set）
    - test：GSM8K test (1319) + MATH-500 (500) + AIME 2024 (30)
 4. **输出**：bench 平均 accuracy 作为 `score` 写入 `results.json`

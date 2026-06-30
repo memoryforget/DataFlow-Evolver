@@ -30,13 +30,12 @@ def load_gsm8k(split: str = "test", cache_dir: str | None = None) -> list[dict]:
 
 
 def build_prompt(question: str) -> str:
-    """构造 GSM8K 评测 prompt。"""
-    return (
-        f"Solve the following math problem step by step. "
-        f"Put your final numerical answer after ####.\n\n"
-        f"Question: {question}\n\n"
-        f"Solution:"
-    )
+    """构造 GSM8K 评测 prompt（Qwen2.5-Math 格式：user message 仅含原题）。
+
+    system prompt 需在推理时单独设置为：
+    "Please reason step by step, and put your final answer within \\boxed{}"
+    """
+    return question
 
 
 def score_predictions(

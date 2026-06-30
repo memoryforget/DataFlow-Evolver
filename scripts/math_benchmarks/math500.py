@@ -27,13 +27,12 @@ def load_math500(cache_dir: str | None = None) -> list[dict]:
 
 
 def build_prompt(question: str) -> str:
-    """构造 MATH-500 评测 prompt。"""
-    return (
-        f"Solve the following math problem. Show your work step by step. "
-        f"Put your final answer in \\boxed{{}}.\n\n"
-        f"Problem: {question}\n\n"
-        f"Solution:"
-    )
+    """构造 MATH-500 评测 prompt（Qwen2.5-Math 格式：user message 仅含原题）。
+
+    system prompt 需在推理时单独设置为：
+    "Please reason step by step, and put your final answer within \\boxed{}"
+    """
+    return question
 
 
 def score_predictions(

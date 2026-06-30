@@ -1,16 +1,16 @@
-"""LlamaFactory LoRA SFT + Math Benchmark 评测脚本。
+"""LlamaFactory Full SFT + Math Benchmark 评测脚本。
 
 契约：
     python scripts/llamafactory_math_sft_eval.py --dataset <ds.jsonl> --output <out_dir> [--mode dev|test]
 
 模式：
-    dev（默认）：GSM8K train split 全量评测，驱动 MCTS 奖励信号。
+    dev（默认）：MATH train 全量 (7500 条) 评测，驱动 MCTS 奖励信号。
     test：GSM8K test + MATH-500 + AIME 2024 完整套件，仅终评用。
 
 流程：
     1. 数据格式转换（DataFlow JSONL → LlamaFactory alpaca 格式）
-    2. LlamaFactory LoRA SFT（Qwen3-8B, DeepSpeed ZeRO-2, 16 GPU）
-    3. vLLM 推理（加载 base+adapter）对选定 bench 评测
+    2. LlamaFactory Full SFT（Qwen3-8B, DeepSpeed ZeRO-2, 16 GPU）
+    3. vLLM 推理（直接加载 fine-tuned 模型）对选定 bench 评测
     4. bench 取平均 accuracy → results.json
 
 输出：<out_dir>/results.json
@@ -34,10 +34,8 @@ logger = logging.getLogger(__name__)
 # 配置常量（可通过环境变量覆盖）
 # ---------------------------------------------------------------------------
 BASE_MODEL = os.environ.get("SFT_BASE_MODEL", "Qwen/Qwen3-8B")
-LORA_RANK = int(os.environ.get("SFT_LORA_RANK", "16"))
-LORA_ALPHA = int(os.environ.get("SFT_LORA_ALPHA", "32"))
 NUM_EPOCHS = float(os.environ.get("SFT_NUM_EPOCHS", "3"))
-LEARNING_RATE = float(os.environ.get("SFT_LEARNING_RATE", "2e-4"))
+LEARNING_RATE = float(os.environ.get("SFT_LEARNING_RATE", "2e-5"))
 BATCH_SIZE = int(os.environ.get("SFT_BATCH_SIZE", "4"))
 GRAD_ACCUM = int(os.environ.get("SFT_GRAD_ACCUM", "4"))
 NUM_GPUS = int(os.environ.get("SFT_NUM_GPUS", "16"))
@@ -85,25 +83,22 @@ def convert_dataset(src_path: Path, dst_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# 2. LlamaFactory LoRA SFT
+# 2. LlamaFactory Full SFT
 # ---------------------------------------------------------------------------
 def run_sft(data_dir: Path, output_dir: Path) -> Path:
-    """调用 LlamaFactory CLI 执行 LoRA SFT 训练。返回 adapter 目录。"""
-    adapter_dir = output_dir / "lora_adapter"
-    adapter_dir.mkdir(parents=True, exist_ok=True)
+    """调用 LlamaFactory CLI 执行全量 SFT 训练。返回模型输出目录。"""
+    model_dir = output_dir / "sft_model"
+    model_dir.mkdir(parents=True, exist_ok=True)
 
     sft_config = {
         "model_name_or_path": BASE_MODEL,
         "stage": "sft",
         "do_train": True,
-        "finetuning_type": "lora",
-        "lora_rank": LORA_RANK,
-        "lora_alpha": LORA_ALPHA,
-        "lora_target": "all",
+        "finetuning_type": "full",
         "dataset_dir": str(data_dir),
         "dataset": "train",
         "template": "qwen3",
-        "output_dir": str(adapter_dir),
+        "output_dir": str(model_dir),
         "num_train_epochs": NUM_EPOCHS,
         "learning_rate": LEARNING_RATE,
         "per_device_train_batch_size": BATCH_SIZE,
@@ -141,7 +136,6 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
     sft_config["deepspeed"] = str(ds_config_path)
 
     sft_yaml_path = config_dir / "sft.yaml"
-    # LlamaFactory 用 yaml 或直接 CLI args；这里写 yaml
     import yaml
     sft_yaml_path.write_text(yaml.dump(sft_config, default_flow_style=False), encoding="utf-8")
 
@@ -153,7 +147,7 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
         "-m", "llamafactory.cli", "train",
         str(sft_yaml_path),
     ]
-    logger.info("开始 SFT 训练：%s", " ".join(cmd))
+    logger.info("开始 Full SFT 训练：%s", " ".join(cmd))
     result = subprocess.run(
         cmd, capture_output=True, text=True, timeout=3600, cwd=str(output_dir)
     )
@@ -163,21 +157,23 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
     if result.returncode != 0:
         raise RuntimeError(f"SFT 训练失败 (exit={result.returncode})，日志：{log_path}")
 
-    logger.info("SFT 训练完成，adapter 保存于：%s", adapter_dir)
-    return adapter_dir
+    logger.info("Full SFT 训练完成，模型保存于：%s", model_dir)
+    return model_dir
 
 
 # ---------------------------------------------------------------------------
 # 3. Math Benchmark 评测
 # ---------------------------------------------------------------------------
-def run_eval(adapter_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
-    """用 vLLM 加载 base+adapter 评测。
+EVAL_SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}"
+
+
+def run_eval(model_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
+    """用 vLLM 加载 fine-tuned 模型评测。
 
     mode='dev': MATH train 全量 (7500 条公开训练题，非 benchmark test set) 驱动 MCTS 奖励。
     mode='test': GSM8K test + MATH-500 + AIME 2024 完整套件，仅终评。
     """
     from vllm import LLM, SamplingParams
-    from vllm.lora.request import LoRARequest
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from math_benchmarks import (
@@ -187,17 +183,14 @@ def run_eval(adapter_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
         load_aime2024, aime_prompt, aime_score,
     )
 
-    logger.info("加载 vLLM 模型：%s (TP=%d)", BASE_MODEL, TP_SIZE)
+    logger.info("加载 vLLM 模型：%s (TP=%d)", model_dir, TP_SIZE)
     llm = LLM(
-        model=BASE_MODEL,
-        enable_lora=True,
-        max_lora_rank=LORA_RANK,
+        model=str(model_dir),
         tensor_parallel_size=TP_SIZE,
         max_model_len=MAX_MODEL_LEN,
         trust_remote_code=True,
     )
     params = SamplingParams(temperature=0, max_tokens=MAX_NEW_TOKENS)
-    lora_req = LoRARequest("sft_adapter", 1, str(adapter_dir))
 
     if mode == "test":
         benchmarks = [
@@ -217,17 +210,30 @@ def run_eval(adapter_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
     all_bad_cases: list[dict] = []
     detail = {}
 
+    tokenizer = llm.get_tokenizer()
+
     for bench_name, load_fn, prompt_fn, score_fn in benchmarks:
         logger.info("评测 %s ...", bench_name)
         examples = load_fn(cache_dir=HF_CACHE_DIR)
-        prompts = [prompt_fn(ex["question"]) for ex in examples]
 
-        outputs = llm.generate(prompts, params, lora_request=lora_req)
+        # 使用 chat template 构造含 system prompt 的完整输入
+        prompts = []
+        for ex in examples:
+            user_msg = prompt_fn(ex["question"])
+            conversation = [
+                {"role": "system", "content": EVAL_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ]
+            prompt_text = tokenizer.apply_chat_template(
+                conversation, tokenize=False, add_generation_prompt=True
+            )
+            prompts.append(prompt_text)
+
+        outputs = llm.generate(prompts, params)
         predictions = [out.outputs[0].text for out in outputs]
 
         accuracy, bad_cases = score_fn(predictions, examples)
         scores.append(accuracy)
-        # 每个 bench 最多取 MAX_BAD_CASES_PER_BENCH 条 bad cases
         for bc in bad_cases[:MAX_BAD_CASES_PER_BENCH]:
             bc["error_type"] = f"{bench_name}:{bc.get('error_type', 'wrong_answer')}"
             all_bad_cases.append(bc)
@@ -258,7 +264,7 @@ def main() -> None:
     parser.add_argument("--output", required=True, help="输出目录")
     parser.add_argument(
         "--mode", default="dev", choices=["dev", "test"],
-        help="dev=GSM8K train only（MCTS 迭代）；test=GSM8K test + MATH-500 + AIME（终评）",
+        help="dev=MATH train only（MCTS 迭代）；test=GSM8K test + MATH-500 + AIME（终评）",
     )
     args = parser.parse_args()
 
@@ -272,11 +278,11 @@ def main() -> None:
         data_dir = output_dir / "sft_data"
         convert_dataset(dataset_path, data_dir)
 
-        # 2. LoRA SFT
-        adapter_dir = run_sft(data_dir, output_dir)
+        # 2. Full SFT
+        model_dir = run_sft(data_dir, output_dir)
 
         # 3. 评测
-        results = run_eval(adapter_dir, output_dir, mode=mode)
+        results = run_eval(model_dir, output_dir, mode=mode)
 
     except Exception as exc:
         logger.error("流程失败：%s", exc, exc_info=True)

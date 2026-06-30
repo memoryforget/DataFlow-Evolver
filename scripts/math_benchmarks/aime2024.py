@@ -29,14 +29,12 @@ def load_aime2024(cache_dir: str | None = None) -> list[dict]:
 
 
 def build_prompt(question: str) -> str:
-    """构造 AIME 评测 prompt。"""
-    return (
-        f"Solve the following AIME competition problem. "
-        f"The answer is an integer between 0 and 999 inclusive. "
-        f"Show your work step by step, then state your final answer as a single integer.\n\n"
-        f"Problem: {question}\n\n"
-        f"Solution:"
-    )
+    """构造 AIME 评测 prompt（Qwen2.5-Math 格式：user message 仅含原题）。
+
+    system prompt 需在推理时单独设置为：
+    "Please reason step by step, and put your final answer within \\boxed{}"
+    """
+    return question
 
 
 def score_predictions(

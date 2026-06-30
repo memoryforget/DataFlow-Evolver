@@ -1,8 +1,9 @@
 """MATH train 题库加载与判分（dev 评测用）。
 
-数据源：Qwen2.5-Math 提供的 MATH competition train split (7500 条)。
+数据源：MATH competition train split (7500 条，含 7 子学科 × 5 难度等级)。
 这些是公开训练语料（非 benchmark test set），用作 MCTS dev 奖励信号不会污染终评。
 答案格式：LaTeX \\boxed{} 内为最终答案。
+评测 prompt 复用 Qwen2.5-Math 的模板格式。
 """
 from __future__ import annotations
 
@@ -10,10 +11,9 @@ from pathlib import Path
 
 from .answer_extract import extract_answer, extract_boxed, is_equiv
 
-# 默认路径：Qwen2.5-Math 仓库中的 MATH train 文件
+# 默认路径：项目内 data/math_train.jsonl
 _DEFAULT_MATH_TRAIN_PATH = str(
-    Path(__file__).resolve().parents[2].parent
-    / "Qwen2.5-Math" / "evaluation" / "data" / "math" / "train.jsonl"
+    Path(__file__).resolve().parents[2] / "data" / "math_train.jsonl"
 )
 
 
@@ -27,7 +27,8 @@ def load_math_train(
     if not path.exists():
         raise FileNotFoundError(
             f"MATH train 文件不存在：{path}\n"
-            f"请确认 Qwen2.5-Math 仓库位于项目同级目录，或通过 MATH_TRAIN_PATH 环境变量指定路径。"
+            f"请将 Qwen2.5-Math/evaluation/data/math/train.jsonl 复制到 data/math_train.jsonl，"
+            f"或通过 MATH_TRAIN_PATH 环境变量指定路径。"
         )
 
     examples = []
@@ -40,11 +41,9 @@ def load_math_train(
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            # MATH train 格式：problem, solution, answer, level, subject, unique_id
             question = row.get("problem", "")
             gold = row.get("answer", "")
             if not gold:
-                # 从 solution 中提取 \boxed{}
                 gold = extract_boxed(row.get("solution", "")) or ""
             examples.append({
                 "question": question,
@@ -56,13 +55,17 @@ def load_math_train(
 
 
 def build_prompt(question: str) -> str:
-    """构造 MATH train dev 评测 prompt。"""
-    return (
-        f"Solve the following math problem. Show your work step by step. "
-        f"Put your final answer in \\boxed{{}}.\n\n"
-        f"Problem: {question}\n\n"
-        f"Solution:"
-    )
+    """构造评测 prompt（复用 Qwen2.5-Math 的 qwen25-math-cot 模板格式）。
+
+    注：这里只返回 user message 内容，chat template 由 vLLM tokenizer 自动处理。
+    system prompt 需在推理时单独设置为：
+    "Please reason step by step, and put your final answer within \\boxed{}"
+    """
+    return question
+
+
+# Qwen2.5-Math 评测用的 system prompt
+SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}"
 
 
 def score_predictions(
