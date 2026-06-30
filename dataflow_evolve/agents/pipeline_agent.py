@@ -32,12 +32,14 @@ class PipelineAgent:
         agent_root: str,
         seed_path: str,
         llm_block: str = "",
+        target_samples: int = 0,
     ) -> None:
         self.agent_cfg = agent_cfg
         self.agent_root = Path(agent_root).resolve()
         self.seed_path = str(Path(seed_path).resolve())
         self.pipeline_filename = agent_cfg.get("pipeline_filename", "pipeline.py")
         self.llm_block = llm_block
+        self.target_samples = target_samples
         self.logger = get_logger(f"agents.{self.name}")
 
     # ---- 生成（首次构建 / 有诊断的变异）----
@@ -66,6 +68,7 @@ class PipelineAgent:
             llm_block=self.llm_block,
             review_issues=review_issues,
             parent_code=parent_code,
+            target_samples=self.target_samples,
         )
         return self._run_and_assemble(prompt, node_dir_name)
 

@@ -59,7 +59,7 @@ Expected outputs: {expected_outputs}
 {llm_block}
 6. FileStorage 的 `cache_path` 设为 `{node_dir}/cache`，使产物落在本节点目录内。\
 确保流水线最终会在 `{node_dir}/` 下产出一个 jsonl 结果文件。
-{parent_block}{diagnostic_block}{review_block}{memory_block}
+{size_block}{parent_block}{diagnostic_block}{review_block}{memory_block}
 约束：这是无头自动化运行，禁止触发任何交互式询问（AskUserQuestion）或 git/gh 仓库同步子流程。\
 若需要超出 6 个核心算子的能力，可查阅 `dataflow-dev` 的 knowledge_base.md。"""
 
@@ -84,7 +84,17 @@ def build_pipeline_prompt(
     llm_block: str = "",
     review_issues: list[str] | None = None,
     parent_code: str | None = None,
+    target_samples: int = 0,
 ) -> str:
+    # 目标产出规模：注入后让 Agent 据此设置算子参数（合成式调 num_samples / 转换式控采样过滤）。
+    # 默认 0 = 不指定（避免 CondorGenerator 默认仅 3 条这种意外的小数据集，见 review）。
+    size_block = ""
+    if target_samples and target_samples > 0:
+        size_block = (
+            f"\n【目标产出规模】最终数据集约需 {target_samples} 条。请据此设置算子参数：\n"
+            f"   - 若用从零合成类算子（如 CondorGenerator），把其 `num_samples` 设到约 {target_samples}；\n"
+            f"   - 若是转换/过滤类流水线，确保读入足够源数据并避免过度过滤，使最终产出接近该规模。\n"
+        )
     # 父节点（暖启动时首层父为基线）pipeline.py 代码作为变异起点：
     # 让 Agent「在父节点基础上做有的放矢的变异」，而非每次从零冷启动（见 docs/design-decisions.md §2.4）。
     parent_block = ""
@@ -121,6 +131,7 @@ def build_pipeline_prompt(
         node_dir=node_dir,
         target_schema=profile.target_schema,
         llm_block=llm_block or "   （未提供具体 API 参数，沿用技能默认。）",
+        size_block=size_block,
         parent_block=parent_block,
         diagnostic_block=diagnostic_block,
         review_block=review_block,

@@ -124,6 +124,20 @@ def test_pipeline_prompt_injects_review_issues():
     assert "qa 字段为空" in with_issues and "与任务不相关" in with_issues
 
 
+def test_pipeline_prompt_injects_target_samples():
+    """目标产出规模：>0 时注入规模指引（含 num_samples 提示）；默认 0 不注入。"""
+    from dataflow_evolve.core.schemas import TaskProfile
+    from dataflow_evolve.llm.prompts import build_pipeline_prompt
+
+    profile = TaskProfile("QA", {"instruction": "str", "output": "str"}, "math", [], "sft")
+    base = build_pipeline_prompt(profile, "seed.jsonl", "node_1")
+    assert "目标产出规模" not in base                      # 默认 0 → 不注入
+
+    sized = build_pipeline_prompt(profile, "seed.jsonl", "node_1", target_samples=1500)
+    assert "目标产出规模" in sized and "1500" in sized
+    assert "num_samples" in sized                          # 指导从零合成类算子
+
+
 def test_review_selfcorrect_prompt_points_to_intermediate_cache():
     """评审自修正 prompt 应告知 Agent：cache 下有每个算子的中间产物，去 Read 定位坏在哪一步。"""
     from dataflow_evolve.llm.prompts import build_review_selfcorrect_prompt

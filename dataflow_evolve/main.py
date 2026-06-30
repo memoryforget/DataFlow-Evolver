@@ -110,11 +110,15 @@ class Orchestrator:
             f"   说明：key_name_of_api_key 是【环境变量名】，运行时框架已在子进程注入该变量，"
             f"流水线只需引用此名字，切勿写死密钥明文。"
         )
+        # 目标产出规模（注入生成 prompt 指导算子产出量；0 或缺省=不指定）
+        gen_cfg = cfg.get("generation")
+        target_samples = int(gen_cfg.get("target_samples", 0)) if gen_cfg else 0
         self.pipeline_agent = PipelineAgent(
             agent_cfg=cfg.agent_sdk,
             agent_root=str(self.agent_root),
             seed_path=self.seed_path,
             llm_block=llm_block,
+            target_samples=target_samples,
         )
 
         # 引擎——执行流水线的子进程里把【pipeline 算子 LLM】密钥注入约定的环境变量名（DF_PIPELINE_API_KEY）

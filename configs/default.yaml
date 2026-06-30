@@ -33,6 +33,10 @@ agent_sdk:
   # 工具：用 claude_code 预设放开全部内置工具（见 llm/agent_sdk.py），不再设白名单
   # 系统提示：保留 claude_code 预设，仅 append DataFlow 指令；可用 system_prompt_append 覆盖该 append 文本
 
+# 数据生成规模：注入生成 prompt，指导算子产出量（合成式据此设 num_samples，转换式控采样/过滤）
+generation:
+  target_samples: 1000                      # 目标产出条数（0=不指定）；按下游 SFT 需求调，Condor 建议 <5000
+
 # 强基线锚点（相对增益奖励 / 池阈值；见 docs/design-decisions.md §2）
 # ✅ 已接入 main.py。锁定决策：Δ=0（node>baseline 即正向）、seed=42、只跑一次基线。
 # enabled=true 时启动会先跑一次基线（消耗真实 API 预算），故默认关闭。
