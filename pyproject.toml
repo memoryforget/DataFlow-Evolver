@@ -15,6 +15,17 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
+train = [
+    "llamafactory>=0.9",
+    "deepspeed>=0.14",
+    "vllm>=0.6",
+    "datasets>=2.18",
+    "torch>=2.1",
+    "transformers>=4.40",
+    "peft>=0.10",
+    "accelerate>=0.30",
+    "math-verify>=0.5",
+]
 
 [build-system]
 requires = ["setuptools>=68"]

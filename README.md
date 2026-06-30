@@ -124,6 +124,69 @@ python <train_eval_cmd> --dataset <ds.jsonl> --output <out_dir>
 
 ---
 
+## 数学 SFT 下游链路（LlamaFactory + Math Benchmark）
+
+当前已配置的 Phase-2 真实链路：**LoRA SFT + 三 Math Bench 评测**。
+
+### 安装训练/评测依赖
+
+```bash
+conda activate DataFlow-Evolve
+pip install -e ".[train]"
+# 或手动：
+# pip install llamafactory deepspeed vllm datasets torch transformers peft accelerate math-verify
+```
+
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `SFT_BASE_MODEL` | `Qwen/Qwen3-8B` | 基座模型（HuggingFace ID 或本地路径） |
+| `SFT_LORA_RANK` | `16` | LoRA rank |
+| `SFT_LORA_ALPHA` | `32` | LoRA alpha |
+| `SFT_NUM_EPOCHS` | `3` | 训练 epoch 数 |
+| `SFT_LEARNING_RATE` | `2e-4` | 学习率 |
+| `SFT_BATCH_SIZE` | `4` | per-device batch size |
+| `SFT_GRAD_ACCUM` | `4` | 梯度累积步数 |
+| `SFT_NUM_GPUS` | `16` | 训练 GPU 数（torchrun nproc） |
+| `EVAL_TP_SIZE` | `16` | vLLM 推理 tensor parallel size |
+| `EVAL_MAX_MODEL_LEN` | `4096` | vLLM 最大序列长度 |
+| `EVAL_MAX_NEW_TOKENS` | `2048` | 评测推理最大生成 token 数 |
+| `HF_CACHE_DIR` | `None` | HuggingFace datasets 缓存目录 |
+
+### 运行方式
+
+脚本遵循 Phase-2 契约，由框架自动调用（`trainer.dev_eval_cmd`）：
+
+```bash
+# 框架自动执行（每轮 MCTS 迭代）：
+python scripts/llamafactory_math_sft_eval.py --dataset <ds.jsonl> --output <out_dir>
+```
+
+内部流程：
+1. **格式转换**：DataFlow JSONL (`instruction` + `generated_cot`) → LlamaFactory alpaca 格式
+2. **LoRA SFT**：Qwen3-8B + DeepSpeed ZeRO-2（16 GPU），约 5-10 分钟
+3. **评测**：vLLM 加载 base+adapter，对 GSM8K / MATH-500 / AIME 2024 推理+判分
+4. **输出**：三个 bench 的平均 accuracy 作为 `score` 写入 `results.json`
+
+### timeout_sec 说明
+
+`configs/default.yaml` 中的 `trainer.timeout_sec: 3600`（1 小时）是**单次训练+评测脚本**的超时上限。
+每轮 MCTS 迭代调用一次 `dev_eval_cmd`（含 SFT 训练 + 三 bench 推理评测），预计耗时 30-60 分钟。
+若超过 `timeout_sec` 则强制终止并标记该节点为 `failed`，不阻塞主循环。
+
+### 评测 Benchmark 详情
+
+| Benchmark | 题数 | 难度 | 答案格式 | 判分方式 |
+|-----------|------|------|----------|----------|
+| GSM8K | 1319 | 小学-初中 | `#### <number>` | 数值精确匹配 |
+| MATH-500 | 500 | 高中竞赛 | `\boxed{...}` | LaTeX 语义等价（math_verify） |
+| AIME 2024 | 30 | 竞赛级 | 整数 0-999 | 整数精确匹配 |
+
+最终 `score = mean(gsm8k_acc, math500_acc, aime_acc)`。
+
+---
+
 ## 防数据泄露：dev / test 评测纪律
 
 MCTS 反复用同一 benchmark 当奖励会**对它过拟合**；若再用同一 benchmark 报告结果，分数虚高、不可泛化。
