@@ -14,7 +14,7 @@ from dataflow_evolve.utils.logging import get_logger
 
 logger = get_logger("llm.agent_sdk")
 
-_DEFAULT_SYSTEM_PROMPT = (
+_DEFAULT_SYSTEM_PROMPT_APPEND = (
     "You write DataFlow pipelines. Use the generating-dataflow-pipeline skill to author "
     "pipelines; consult dataflow-dev (knowledge_base / known_issues) for operators beyond "
     "the core set and to fix execution errors. Do NOT run interactive (AskUserQuestion) or "
@@ -35,16 +35,24 @@ class AgentRunResult:
 
 
 def _build_options(agent_cfg: Config, cwd: str) -> Any:
-    """据 agent_sdk 配置段构造 ClaudeAgentOptions。"""
+    """据 agent_sdk 配置段构造 ClaudeAgentOptions。
+
+    - tools：用 claude_code 预设放开**全部内置工具**（不再用 allowed_tools 白名单限制）。
+    - system_prompt：保留 claude_code 预设，仅 **append** 我们的 DataFlow 指令（不覆盖系统提示）。
+    - max_turns：单次 SDK 运行的最大轮数（默认 10）；不设预算上限。
+    SDK 鉴权（ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL）经环境变量传入，子进程默认继承 os.environ。
+    """
     from claude_agent_sdk import ClaudeAgentOptions
 
+    append_text = agent_cfg.get("system_prompt_append", _DEFAULT_SYSTEM_PROMPT_APPEND)
     return ClaudeAgentOptions(
         cwd=cwd,
         model=agent_cfg.get("model", None),
-        allowed_tools=list(agent_cfg.get("allowed_tools", ["Read", "Write", "Edit", "Glob", "Grep", "Bash"])),
+        tools={"type": "preset", "preset": "claude_code"},
+        system_prompt={"type": "preset", "preset": "claude_code", "append": append_text},
         permission_mode=agent_cfg.get("permission_mode", "bypassPermissions"),
         setting_sources=list(agent_cfg.get("setting_sources", ["project"])),
-        system_prompt=agent_cfg.get("system_prompt", _DEFAULT_SYSTEM_PROMPT),
+        max_turns=agent_cfg.get("max_turns", 10),
     )
 
 

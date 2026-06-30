@@ -11,8 +11,8 @@ llm:
   backend: api                             # api | vllm
   api:
     api_url: http://123.129.219.111:3000/v1/chat/completions   # 完整端点：DataFlow APILLMServing_request 逐字 POST（base /v1 是 404）；非-SDK serving 会自动剥成 base 再由 openai 客户端补回
-    model_name: gpt-5.4
-    api_key: sk-                     # 明文密钥（committed 占位，本地工作区填真 key）；或写 ${ENV_VAR} 由加载时展开（utils/config.py）
+    model_name: gpt-5.5
+    api_key: sk   # 明文密钥；或写 ${ENV_VAR} 由加载时展开（utils/config.py）
     max_workers: 10
   vllm:
     hf_model_name_or_path: ${VLLM_MODEL:Qwen/Qwen2.5-7B-Instruct}
@@ -20,14 +20,14 @@ llm:
 
 # PipelineAgent 使用的 Claude Agent SDK
 agent_sdk:
-  model: ${CLAUDE_MODEL:claude-opus-4-6}
+  model: claude-opus-4-8
   permission_mode: bypassPermissions       # 无头自动化
-  allowed_tools: [Read, Write, Edit, Glob, Grep, Bash]
   setting_sources: [project]               # 从 cwd/.claude 加载技能
-  skills: [generating-dataflow-pipeline, dataflow-dev]
-  max_turns: 40
-  max_budget_usd: 2.0
+  skills: [generating-dataflow-pipeline, dataflow-dev]   # 经 setting_sources(project)+.claude/skills 自动发现
+  max_turns: 10                            # 单次 SDK 运行最大轮数（透传 ClaudeAgentOptions；不设预算上限）
   pipeline_filename: pipeline.py           # 约定：Agent 把流水线写到 <node_id>/pipeline.py
+  # 工具：用 claude_code 预设放开全部内置工具（见 llm/agent_sdk.py），不再设白名单
+  # 系统提示：保留 claude_code 预设，仅 append DataFlow 指令；可用 system_prompt_append 覆盖该 append 文本
 
 # 强基线锚点（相对增益奖励 / 池阈值；见 docs/design-decisions.md §2）
 # ✅ 已接入 main.py。锁定决策：Δ=0（node>baseline 即正向）、seed=42、只跑一次基线。
@@ -55,7 +55,7 @@ search:
 review:
   schema_threshold: 0.6
   relevance_threshold: 0.6
-  sample_size: 20
+  sample_size: 40
 
 # Phase-2 真实训练：外部脚本桥接
 trainer:
