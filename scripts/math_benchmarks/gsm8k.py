@@ -10,11 +10,14 @@ from pathlib import Path
 from .answer_extract import extract_answer, is_equiv
 
 
-def load_gsm8k(cache_dir: str | None = None) -> list[dict]:
-    """加载 GSM8K test set。返回 [{"question", "gold_answer"}, ...]"""
+def load_gsm8k(split: str = "test", cache_dir: str | None = None) -> list[dict]:
+    """加载 GSM8K 指定 split。返回 [{"question", "gold_answer"}, ...]
+
+    split: "train" (~7473 条) 或 "test" (1319 条)
+    """
     from datasets import load_dataset
 
-    ds = load_dataset("openai/gsm8k", "main", split="test", cache_dir=cache_dir)
+    ds = load_dataset("openai/gsm8k", "main", split=split, cache_dir=cache_dir)
     examples = []
     for row in ds:
         answer_text = row["answer"]

@@ -1,13 +1,17 @@
 """LlamaFactory LoRA SFT + Math Benchmark 评测脚本。
 
 契约：
-    python scripts/llamafactory_math_sft_eval.py --dataset <ds.jsonl> --output <out_dir>
+    python scripts/llamafactory_math_sft_eval.py --dataset <ds.jsonl> --output <out_dir> [--mode dev|test]
+
+模式：
+    dev（默认）：GSM8K train split 全量评测，驱动 MCTS 奖励信号。
+    test：GSM8K test + MATH-500 + AIME 2024 完整套件，仅终评用。
 
 流程：
     1. 数据格式转换（DataFlow JSONL → LlamaFactory alpaca 格式）
     2. LlamaFactory LoRA SFT（Qwen3-8B, DeepSpeed ZeRO-2, 16 GPU）
-    3. vLLM 推理（加载 base+adapter）对 GSM8K / MATH-500 / AIME 2024 评测
-    4. 三个 bench 取平均 accuracy → results.json
+    3. vLLM 推理（加载 base+adapter）对选定 bench 评测
+    4. bench 取平均 accuracy → results.json
 
 输出：<out_dir>/results.json
     {"score": float, "metric_name": "math_avg_accuracy", "bad_cases": [...]}
@@ -166,8 +170,8 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
 # ---------------------------------------------------------------------------
 # 3. Math Benchmark 评测
 # ---------------------------------------------------------------------------
-def run_eval(adapter_dir: Path, output_dir: Path) -> dict:
-    """用 vLLM 加载 base+adapter 对三个 bench 评测，返回 results dict。"""
+def run_eval(adapter_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
+    """用 vLLM 加载 base+adapter 评测。mode='dev' 只跑 GSM8K train；mode='test' 跑完整套件。"""
     from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
 
@@ -190,11 +194,18 @@ def run_eval(adapter_dir: Path, output_dir: Path) -> dict:
     params = SamplingParams(temperature=0, max_tokens=MAX_NEW_TOKENS)
     lora_req = LoRARequest("sft_adapter", 1, str(adapter_dir))
 
-    benchmarks = [
-        ("GSM8K", load_gsm8k, gsm8k_prompt, gsm8k_score),
-        ("MATH-500", load_math500, math500_prompt, math500_score),
-        ("AIME-2024", load_aime2024, aime_prompt, aime_score),
-    ]
+    if mode == "test":
+        benchmarks = [
+            ("GSM8K-test", lambda **kw: load_gsm8k(split="test", **kw), gsm8k_prompt, gsm8k_score),
+            ("MATH-500", load_math500, math500_prompt, math500_score),
+            ("AIME-2024", load_aime2024, aime_prompt, aime_score),
+        ]
+        metric_name = "math_test_avg_accuracy"
+    else:
+        benchmarks = [
+            ("GSM8K-train", lambda **kw: load_gsm8k(split="train", **kw), gsm8k_prompt, gsm8k_score),
+        ]
+        metric_name = "gsm8k_train_accuracy"
 
     scores = []
     all_bad_cases: list[dict] = []
@@ -218,7 +229,7 @@ def run_eval(adapter_dir: Path, output_dir: Path) -> dict:
         logger.info("%s accuracy: %.4f (%d 条)", bench_name, accuracy, len(examples))
 
     avg_score = sum(scores) / len(scores) if scores else 0.0
-    logger.info("平均分 (math_avg_accuracy): %.4f", avg_score)
+    logger.info("平均分 (%s): %.4f", metric_name, avg_score)
 
     # 保存各 bench 详情
     (output_dir / "eval_detail.json").write_text(
@@ -227,7 +238,7 @@ def run_eval(adapter_dir: Path, output_dir: Path) -> dict:
 
     return {
         "score": avg_score,
-        "metric_name": "math_avg_accuracy",
+        "metric_name": metric_name,
         "bad_cases": all_bad_cases,
     }
 
@@ -239,11 +250,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="LlamaFactory Math SFT + Eval")
     parser.add_argument("--dataset", required=True, help="输入数据集 JSONL 路径")
     parser.add_argument("--output", required=True, help="输出目录")
+    parser.add_argument(
+        "--mode", default="dev", choices=["dev", "test"],
+        help="dev=GSM8K train only（MCTS 迭代）；test=GSM8K test + MATH-500 + AIME（终评）",
+    )
     args = parser.parse_args()
 
     dataset_path = Path(args.dataset)
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
+    mode = args.mode
 
     try:
         # 1. 格式转换
@@ -254,13 +270,13 @@ def main() -> None:
         adapter_dir = run_sft(data_dir, output_dir)
 
         # 3. 评测
-        results = run_eval(adapter_dir, output_dir)
+        results = run_eval(adapter_dir, output_dir, mode=mode)
 
     except Exception as exc:
         logger.error("流程失败：%s", exc, exc_info=True)
         results = {
             "score": 0.0,
-            "metric_name": "math_avg_accuracy",
+            "metric_name": "gsm8k_train_accuracy" if mode == "dev" else "math_test_avg_accuracy",
             "bad_cases": [],
             "_error": str(exc),
         }

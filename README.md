@@ -159,15 +159,20 @@ pip install -e ".[train]"
 脚本遵循 Phase-2 契约，由框架自动调用（`trainer.dev_eval_cmd`）：
 
 ```bash
-# 框架自动执行（每轮 MCTS 迭代）：
-python scripts/llamafactory_math_sft_eval.py --dataset <ds.jsonl> --output <out_dir>
+# dev 模式（MCTS 迭代，框架自动调用）：只跑 GSM8K train split
+python scripts/llamafactory_math_sft_eval.py --mode dev --dataset <ds.jsonl> --output <out_dir>
+
+# test 模式（终评，手动调用一次）：跑 GSM8K test + MATH-500 + AIME 2024
+python scripts/llamafactory_math_sft_eval.py --mode test --dataset <ds.jsonl> --output <out_dir>
 ```
 
 内部流程：
 1. **格式转换**：DataFlow JSONL (`instruction` + `generated_cot`) → LlamaFactory alpaca 格式
 2. **LoRA SFT**：Qwen3-8B + DeepSpeed ZeRO-2（16 GPU），约 5-10 分钟
-3. **评测**：vLLM 加载 base+adapter，对 GSM8K / MATH-500 / AIME 2024 推理+判分
-4. **输出**：三个 bench 的平均 accuracy 作为 `score` 写入 `results.json`
+3. **评测**：vLLM 加载 base+adapter 推理+判分
+   - dev：GSM8K train split 全量（~7473 条）
+   - test：GSM8K test (1319) + MATH-500 (500) + AIME 2024 (30)
+4. **输出**：bench 平均 accuracy 作为 `score` 写入 `results.json`
 
 ### timeout_sec 说明
 
