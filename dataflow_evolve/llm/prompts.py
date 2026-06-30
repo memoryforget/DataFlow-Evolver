@@ -45,15 +45,17 @@ PIPELINE_AGENT_PROMPT = """使用 `generating-dataflow-pipeline` 技能，为下
 完整、可直接运行的 DataFlow 流水线。
 
 Target: {target}
-Sample file: {seed_path}
 Expected outputs: {expected_outputs}
+Entry file（空输入）: {entry_path}
 
 要求：
 1. 先按技能流程输出 Stage-1 算子决策摘要（JSON：{{"ops": [...], "field_flow": "...", "reason": "..."}}），\
 再生成完整流水线代码。
 2. 把最终流水线代码写入文件：`{node_dir}/pipeline.py`，并把 Stage-1 决策 JSON 写入 `{node_dir}/decision.json`。\
 直接用 Write 工具把这两个文件写到 `{node_dir}/` 下（这是相对 cwd 的路径，务必创建该目录）。
-3. 流水线的 `first_entry_file_name` 必须指向上面的 Sample file 路径。
+3. 这是【从零合成（from-scratch synthesis）】任务：流水线不依赖任何输入语料。\
+`first_entry_file_name` 必须指向上面的 Entry file（一个空 jsonl，仅为满足 DataFlow 的 first_entry 形参）；\
+请用**从零生成类算子**（如 CondorGenerator）凭模型知识合成数据，不要依赖读取输入数据。
 4. 目标 schema（下游期望字段及类型）：{target_schema}
 5. 流水线里的 LLM serving 必须用 `APILLMServing_request`，并严格使用下列参数（不要改成 openai.com/gpt-4o）：
 {llm_block}
@@ -77,7 +79,7 @@ PIPELINE_SELFCORRECT_PROMPT = """上一次生成的流水线 `{node_dir}/pipelin
 
 def build_pipeline_prompt(
     profile: TaskProfile,
-    seed_path: str,
+    entry_path: str,
     node_dir: str,
     diagnostic: DiagnosticReport | None = None,
     memory_summary: str | None = None,
@@ -126,7 +128,7 @@ def build_pipeline_prompt(
         memory_block = f"\n参考历史记忆：\n{memory_summary}\n"
     return PIPELINE_AGENT_PROMPT.format(
         target=profile.task_description,
-        seed_path=seed_path,
+        entry_path=entry_path,
         expected_outputs=list(profile.target_schema.keys()),
         node_dir=node_dir,
         target_schema=profile.target_schema,

@@ -114,11 +114,11 @@ def test_pipeline_prompt_injects_review_issues():
     from dataflow_evolve.llm.prompts import build_pipeline_prompt
 
     profile = TaskProfile("QA", {"q": "str", "a": "str"}, "general", [], "sft")
-    base = build_pipeline_prompt(profile, "seed.jsonl", "node_1")
+    base = build_pipeline_prompt(profile, "empty.jsonl", "node_1")
     assert "评审打回" not in base
 
     with_issues = build_pipeline_prompt(
-        profile, "seed.jsonl", "node_1", review_issues=["qa 字段为空", "与任务不相关"]
+        profile, "empty.jsonl", "node_1", review_issues=["qa 字段为空", "与任务不相关"]
     )
     assert "评审打回" in with_issues
     assert "qa 字段为空" in with_issues and "与任务不相关" in with_issues
@@ -130,10 +130,10 @@ def test_pipeline_prompt_injects_target_samples():
     from dataflow_evolve.llm.prompts import build_pipeline_prompt
 
     profile = TaskProfile("QA", {"instruction": "str", "output": "str"}, "math", [], "sft")
-    base = build_pipeline_prompt(profile, "seed.jsonl", "node_1")
+    base = build_pipeline_prompt(profile, "empty.jsonl", "node_1")
     assert "目标产出规模" not in base                      # 默认 0 → 不注入
 
-    sized = build_pipeline_prompt(profile, "seed.jsonl", "node_1", target_samples=1500)
+    sized = build_pipeline_prompt(profile, "empty.jsonl", "node_1", target_samples=1500)
     assert "目标产出规模" in sized and "1500" in sized
     assert "num_samples" in sized                          # 指导从零合成类算子
 

@@ -110,13 +110,19 @@ class Orchestrator:
             f"   说明：key_name_of_api_key 是【环境变量名】，运行时框架已在子进程注入该变量，"
             f"流水线只需引用此名字，切勿写死密钥明文。"
         )
+        # 从零合成设计：流水线不读输入语料，first_entry 指向一个共享的 0 字节 empty.jsonl
+        # （仅满足 DataFlow 的 first_entry 形参）；seed.jsonl 只供 TaskProfiler 建模，不进流水线。
+        self.empty_entry_path = self.agent_root / "empty.jsonl"
+        self.empty_entry_path.parent.mkdir(parents=True, exist_ok=True)
+        self.empty_entry_path.write_text("", encoding="utf-8")
+
         # 目标产出规模（注入生成 prompt 指导算子产出量；0 或缺省=不指定）
         gen_cfg = cfg.get("generation")
         target_samples = int(gen_cfg.get("target_samples", 0)) if gen_cfg else 0
         self.pipeline_agent = PipelineAgent(
             agent_cfg=cfg.agent_sdk,
             agent_root=str(self.agent_root),
-            seed_path=self.seed_path,
+            entry_path=str(self.empty_entry_path),
             llm_block=llm_block,
             target_samples=target_samples,
         )

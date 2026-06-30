@@ -30,13 +30,13 @@ class PipelineAgent:
         self,
         agent_cfg: Config,
         agent_root: str,
-        seed_path: str,
+        entry_path: str,
         llm_block: str = "",
         target_samples: int = 0,
     ) -> None:
         self.agent_cfg = agent_cfg
         self.agent_root = Path(agent_root).resolve()
-        self.seed_path = str(Path(seed_path).resolve())
+        self.entry_path = str(Path(entry_path).resolve())
         self.pipeline_filename = agent_cfg.get("pipeline_filename", "pipeline.py")
         self.llm_block = llm_block
         self.target_samples = target_samples
@@ -61,7 +61,7 @@ class PipelineAgent:
         node_dir_abs.mkdir(parents=True, exist_ok=True)
         prompt = build_pipeline_prompt(
             profile=profile,
-            seed_path=self.seed_path,
+            entry_path=self.entry_path,
             node_dir=node_dir_name,
             diagnostic=diagnostic,
             memory_summary=memory_summary,
