@@ -6,14 +6,18 @@ project:
   agent_root: ./workspace/_agent_root      # Agent SDK 的 cwd；内含 .claude/skills + dataflow 源码副本
   seed_data: ./data/seed.jsonl             # 种子样例数据（jsonl）
 
-# 非-SDK 模型后端：用于辅助 Agent（Profiler/Review/Diagnostic）与 DataFlow 流水线运行时
+# 非-SDK 模型后端
 llm:
   backend: api                             # api | vllm
-  api:
+  api:                                     # 辅助 Agent（Profiler/Review/Diagnostic）用；可上更强模型
     api_url: http://123.129.219.111:3000/v1/chat/completions   # 完整端点：DataFlow APILLMServing_request 逐字 POST（base /v1 是 404）；非-SDK serving 会自动剥成 base 再由 openai 客户端补回
     model_name: gpt-5.5
-    api_key: sk   # 明文密钥；或写 ${ENV_VAR} 由加载时展开（utils/config.py）
+    api_key: sk-                     # 明文密钥（committed 占位，本地工作区填真 key）；或写 ${ENV_VAR} 由加载时展开（utils/config.py）
     max_workers: 10
+  # 生成的 pipeline【算子运行时】LLM（数据合成用），与上面的辅助 Agent 解耦。
+  # 省略的字段逐字段回退到 api 段；整段删掉=行为与旧版一致（全部用 api）。算子合成可用便宜够用的模型。
+  # pipeline_llm:
+  #   model_name: gpt-4o                   # 只换模型，api_url/api_key/max_workers 继承 api
   vllm:
     hf_model_name_or_path: ${VLLM_MODEL:Qwen/Qwen2.5-7B-Instruct}
     tensor_parallel_size: 1

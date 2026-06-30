@@ -47,6 +47,31 @@ from dataflow_evolve.utils.logging import get_logger, setup_logging
 logger = get_logger("main")
 
 
+def _resolve_pipeline_llm(cfg_llm: Config) -> dict:
+    """解析【pipeline 算子运行时】LLM 配置：`pipeline_llm` 段逐字段回退到 `api` 段。
+
+    与辅助 Agent（Profiler/Review/Diagnostic，走 build_serving(cfg.llm) 用 `api` 段）解耦：
+    算子做海量数据合成可用便宜模型、辅助 Agent 可用更强模型。`pipeline_llm` 省略的字段
+    自动继承 `api`，所以只想换 model_name 时配置里只写一行即可；整段缺省则行为与旧版一致。
+    """
+    api = cfg_llm.api
+    pl = cfg_llm.get("pipeline_llm")  # Config | None（缺省回退 api）
+
+    def pick(key: str, default=None):
+        if pl is not None:
+            v = pl.get(key, None)
+            if v is not None:
+                return v
+        return api.get(key, default)
+
+    return {
+        "api_url": pick("api_url"),
+        "model_name": pick("model_name"),
+        "api_key": pick("api_key", ""),
+        "max_workers": pick("max_workers", 10),
+    }
+
+
 class Orchestrator:
     """组装所有组件并跑双反馈 MCTS 主循环。"""
 
@@ -72,15 +97,16 @@ class Orchestrator:
             serving, max_bad_cases=cfg.diagnostic.get("max_bad_cases", 30)
         )
 
-        # 构建者（Agent SDK 驱动）——把真实 API 配置注入生成的流水线
-        api_cfg = cfg.llm.api
-        self.api_cfg = api_cfg
+        # 构建者（Agent SDK 驱动）——把【pipeline 算子运行时】LLM 配置注入生成的流水线。
+        # 该 LLM 与辅助 Agent（Profiler/Review/Diagnostic，走上面 build_serving(cfg.llm) 的 api 段）
+        # 解耦：算子做海量合成可用便宜模型，辅助 Agent 可用更强模型。见 _resolve_pipeline_llm。
+        self.pipeline_llm = _resolve_pipeline_llm(cfg.llm)
         self.pipeline_env_key = "DF_PIPELINE_API_KEY"   # 流水线运行时从该环境变量取密钥
         llm_block = (
-            f"   - api_url: {api_cfg.api_url}\n"
-            f"   - model_name: {api_cfg.model_name}\n"
+            f"   - api_url: {self.pipeline_llm['api_url']}\n"
+            f"   - model_name: {self.pipeline_llm['model_name']}\n"
             f"   - key_name_of_api_key: {self.pipeline_env_key}\n"
-            f"   - max_workers: {api_cfg.get('max_workers', 10)}\n"
+            f"   - max_workers: {self.pipeline_llm['max_workers']}\n"
             f"   说明：key_name_of_api_key 是【环境变量名】，运行时框架已在子进程注入该变量，"
             f"流水线只需引用此名字，切勿写死密钥明文。"
         )
@@ -91,8 +117,8 @@ class Orchestrator:
             llm_block=llm_block,
         )
 
-        # 引擎——执行流水线的子进程里把真实 API 密钥注入约定的环境变量名（DF_PIPELINE_API_KEY）
-        self.pipeline_api_key = api_cfg.get("api_key", "")
+        # 引擎——执行流水线的子进程里把【pipeline 算子 LLM】密钥注入约定的环境变量名（DF_PIPELINE_API_KEY）
+        self.pipeline_api_key = self.pipeline_llm["api_key"]
         agent_pipeline_filename = cfg.agent_sdk.get("pipeline_filename", "pipeline.py")
         self.pipeline_filename = agent_pipeline_filename
         self.executor = SubprocessExecutionWrapper(
@@ -219,8 +245,8 @@ class Orchestrator:
 
         adapted = adapt_baseline_source(
             src_path.read_text(encoding="utf-8"),
-            api_url=self.api_cfg.api_url,
-            model_name=self.api_cfg.model_name,
+            api_url=self.pipeline_llm["api_url"],
+            model_name=self.pipeline_llm["model_name"],
             key_env=self.pipeline_env_key,
             empty_jsonl_path=str(empty_jsonl),
             cache_path=str(node_dir_abs / "cache"),

@@ -100,3 +100,23 @@ def test_event_loop_runs_and_picks_best(tmp_path, monkeypatch):
     assert abs(best.train_result.score - 1.0) < 1e-9
     # 跑了 3 次迭代，应有若干已评估节点
     assert len(orch.tree.all_nodes()) >= 1
+
+
+def test_resolve_pipeline_llm_fallback_and_override():
+    """pipeline_llm 段逐字段回退 api：缺省全继承；只写 model_name 则只覆盖模型。"""
+    from dataflow_evolve.main import _resolve_pipeline_llm
+
+    # 缺省 pipeline_llm → 全部回退 api（行为与旧版一致）
+    llm = Config({"api": {"api_url": "u", "model_name": "m", "api_key": "k", "max_workers": 7}})
+    assert _resolve_pipeline_llm(llm) == {
+        "api_url": "u", "model_name": "m", "api_key": "k", "max_workers": 7,
+    }
+
+    # 只写 model_name → 覆盖模型，其余继承 api（算子用便宜模型、辅助 Agent 用强模型的核心诉求）
+    llm2 = Config({
+        "api": {"api_url": "u", "model_name": "strong", "api_key": "k", "max_workers": 7},
+        "pipeline_llm": {"model_name": "cheap"},
+    })
+    r2 = _resolve_pipeline_llm(llm2)
+    assert r2["model_name"] == "cheap"
+    assert r2["api_url"] == "u" and r2["api_key"] == "k" and r2["max_workers"] == 7
