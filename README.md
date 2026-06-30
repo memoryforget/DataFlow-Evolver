@@ -152,6 +152,7 @@ pip install -e ".[train]"
 | `EVAL_TP_SIZE` | `16` | vLLM 推理 tensor parallel size |
 | `EVAL_MAX_MODEL_LEN` | `4096` | vLLM 最大序列长度 |
 | `EVAL_MAX_NEW_TOKENS` | `2048` | 评测推理最大生成 token 数 |
+| `MATH_TRAIN_PATH` | 自动检测 | dev 评测题库路径（Qwen2.5-Math 的 math/train.jsonl） |
 | `HF_CACHE_DIR` | `None` | HuggingFace datasets 缓存目录 |
 
 ### 运行方式
@@ -170,7 +171,7 @@ python scripts/llamafactory_math_sft_eval.py --mode test --dataset <ds.jsonl> --
 1. **格式转换**：DataFlow JSONL (`instruction` + `generated_cot`) → LlamaFactory alpaca 格式
 2. **LoRA SFT**：Qwen3-8B + DeepSpeed ZeRO-2（16 GPU），约 5-10 分钟
 3. **评测**：vLLM 加载 base+adapter 推理+判分
-   - dev：GSM8K train split 全量（~7473 条）
+   - dev：MATH train 全量（7500 条公开竞赛训练题，非 benchmark test set）
    - test：GSM8K test (1319) + MATH-500 (500) + AIME 2024 (30)
 4. **输出**：bench 平均 accuracy 作为 `score` 写入 `results.json`
 

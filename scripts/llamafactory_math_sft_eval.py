@@ -171,7 +171,11 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
 # 3. Math Benchmark 评测
 # ---------------------------------------------------------------------------
 def run_eval(adapter_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
-    """用 vLLM 加载 base+adapter 评测。mode='dev' 只跑 GSM8K train；mode='test' 跑完整套件。"""
+    """用 vLLM 加载 base+adapter 评测。
+
+    mode='dev': MATH train 全量 (7500 条公开训练题，非 benchmark test set) 驱动 MCTS 奖励。
+    mode='test': GSM8K test + MATH-500 + AIME 2024 完整套件，仅终评。
+    """
     from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
 
@@ -179,6 +183,7 @@ def run_eval(adapter_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
     from math_benchmarks import (
         load_gsm8k, gsm8k_prompt, gsm8k_score,
         load_math500, math500_prompt, math500_score,
+        load_math_train, math_train_prompt, math_train_score,
         load_aime2024, aime_prompt, aime_score,
     )
 
@@ -202,10 +207,11 @@ def run_eval(adapter_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
         ]
         metric_name = "math_test_avg_accuracy"
     else:
+        math_train_path = os.environ.get("MATH_TRAIN_PATH", None)
         benchmarks = [
-            ("GSM8K-train", lambda **kw: load_gsm8k(split="train", **kw), gsm8k_prompt, gsm8k_score),
+            ("MATH-train", lambda **kw: load_math_train(data_path=math_train_path, **kw), math_train_prompt, math_train_score),
         ]
-        metric_name = "gsm8k_train_accuracy"
+        metric_name = "math_train_accuracy"
 
     scores = []
     all_bad_cases: list[dict] = []
@@ -276,7 +282,7 @@ def main() -> None:
         logger.error("流程失败：%s", exc, exc_info=True)
         results = {
             "score": 0.0,
-            "metric_name": "gsm8k_train_accuracy" if mode == "dev" else "math_test_avg_accuracy",
+            "metric_name": "math_train_accuracy" if mode == "dev" else "math_test_avg_accuracy",
             "bad_cases": [],
             "_error": str(exc),
         }
