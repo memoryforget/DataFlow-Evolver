@@ -266,13 +266,16 @@ class Orchestrator:
 
         baseline_config = PipelineConfig(
             operators=[
-                {"name": "CondorGenerator", "params": {"num_samples": 3}},
-                {"name": "CondorRefiner", "params": {}},
-                {"name": "AlpagasusFilter", "params": {"min_score": 3, "max_score": 5}},
+                {"name": "CondorGenerator", "params": {"num_samples": 50, "prompt_template": "MathCondorPrompt"}},
+                {"name": "ReasoningQuestionFilter", "params": {}},
+                {"name": "ReasoningAnswerGenerator", "params": {}},
+                {"name": "ReasoningAnswerFormatterFilter", "params": {}},
+                {"name": "ReasoningAnswerTokenLengthFilter", "params": {"max_answer_token_length": 8192}},
+                {"name": "ReasoningAnswerNgramFilter", "params": {"min_score": 0.1, "max_score": 1.0, "ngrams": 5}},
             ],
-            field_flow="empty -> condor_generate -> refine -> alpagasus_filter",
+            field_flow="empty -> condor_generate(math) -> question_filter -> answer_generate(cot) -> format_filter -> token_filter -> ngram_filter",
             code=adapted,
-            rationale="DataFlow 自带强基线（Condor+Refiner+Alpagasus），seed 固定只跑一次",
+            rationale="数学推理基线：CondorGenerator(math prompt) 从零合成 + reasoning filters 保质量 + CoT 答案生成",
         )
 
         logger.info("跑强基线（seed=%d）：%s", self.baseline_seed, pipeline_path)
