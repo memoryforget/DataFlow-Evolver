@@ -15,10 +15,19 @@ from dataflow_evolve.utils.logging import get_logger
 logger = get_logger("llm.agent_sdk")
 
 _DEFAULT_SYSTEM_PROMPT_APPEND = (
-    "You write DataFlow pipelines. Use the generating-dataflow-pipeline skill to author "
-    "pipelines; consult dataflow-dev (knowledge_base / known_issues) for operators beyond "
-    "the core set and to fix execution errors. Do NOT run interactive (AskUserQuestion) or "
-    "git/gh repo-sync subflows — this is a headless automated run."
+    "You write DataFlow pipelines. Follow this workflow:\n"
+    "1. Use MCP tool recommend_operator_categories with the task description to "
+    "identify the top 2 relevant categories (respect the avoid list).\n"
+    "2. Use MCP tool list_operators for each recommended category to browse "
+    "available operators.\n"
+    "3. Use MCP tool get_operator_detail to inspect specific operators before "
+    "selecting them (check init/run params and allowed_prompts).\n"
+    "4. Use the generating-dataflow-pipeline skill to author the pipeline code "
+    "with the selected operators.\n"
+    "5. Consult dataflow-dev (knowledge_base / known_issues) to fix execution errors.\n"
+    "Do NOT browse more than 2 categories unless the first pass clearly fails.\n"
+    "Do NOT run interactive (AskUserQuestion) or git/gh repo-sync subflows — "
+    "this is a headless automated run."
 )
 
 
@@ -39,10 +48,13 @@ def _build_options(agent_cfg: Config, cwd: str) -> Any:
 
     - tools：用 claude_code 预设放开**全部内置工具**（不再用 allowed_tools 白名单限制）。
     - system_prompt：保留 claude_code 预设，仅 **append** 我们的 DataFlow 指令（不覆盖系统提示）。
+    - mcp_servers：挂载 dataflow-operators MCP server 供 agent 动态发现 operator。
     - max_turns：单次 SDK 运行的最大轮数（默认 10）；不设预算上限。
     SDK 鉴权（ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL）经环境变量传入，子进程默认继承 os.environ。
     """
     from claude_agent_sdk import ClaudeAgentOptions
+
+    from dataflow_evolve.llm.mcp_operators import operator_mcp_server
 
     append_text = agent_cfg.get("system_prompt_append", _DEFAULT_SYSTEM_PROMPT_APPEND)
     return ClaudeAgentOptions(
@@ -53,6 +65,7 @@ def _build_options(agent_cfg: Config, cwd: str) -> Any:
         permission_mode=agent_cfg.get("permission_mode", "bypassPermissions"),
         setting_sources=list(agent_cfg.get("setting_sources", ["project"])),
         max_turns=agent_cfg.get("max_turns", 10),
+        mcp_servers={"dataflow-operators": operator_mcp_server},
     )
 
 
