@@ -12,7 +12,7 @@ llm:
   api:                                     # 辅助 Agent（Profiler/Review/Diagnostic）用；可上更强模型
     api_url: http://123.129.219.111:3000/v1/chat/completions   # 完整端点：DataFlow APILLMServing_request 逐字 POST（base /v1 是 404）；非-SDK serving 会自动剥成 base 再由 openai 客户端补回
     model_name: gpt-5.5
-    api_key: sk-   # 明文密钥；或写 ${ENV_VAR} 由加载时展开（utils/config.py）
+    api_key: ${DF_API_KEY:}   # 通过环境变量注入；或直接写明文密钥（不推荐提交）
     max_workers: 10
   # 生成的 pipeline【算子运行时】LLM（数据合成用），与上面的辅助 Agent 解耦。
   # 省略的字段逐字段回退到 api 段；整段删掉=行为与旧版一致（全部用 api）。算子合成可用便宜够用的模型。
@@ -70,7 +70,7 @@ trainer:
   train_eval_cmd: python scripts/reference_train_eval.py   # 兼容旧入口（占位伪评测）
   # 防数据泄露纪律（见 docs/design-decisions.md §3）：
   #   dev：仅给 MCTS 当奖励信号，允许被「刷」；test：全程对 loop 不可见，仅终评一次。
-  dev_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode dev     # LoRA SFT + GSM8K train 评测
+  dev_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode dev     # Full SFT + MATH train 7500 题评测
   test_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode test   # 终评：GSM8K test + MATH-500 + AIME
   timeout_sec: 3600                                             # SFT + 三 bench 评测约 30-60 min
 

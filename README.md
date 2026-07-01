@@ -24,6 +24,7 @@ TaskProfiler ──> TaskProfile
 
 - **PipelineAgent** 不是普通的 chat API 调用，而是驱动 **Claude Agent SDK**（无头），
   让 SDK 内的 Claude 借助本地技能 `generating-dataflow-pipeline` / `dataflow-dev`
+  以及 **MCP 动态算子发现**（`dataflow-operators` in-process server）
   把完整可运行的 DataFlow 流水线 `.py` 写到节点工作目录。
 - **DownstreamTrainerWrapper** 是 **可插拔外部脚本桥接**：框架不内置训练逻辑，
   而是按 I/O 契约子进程调用你提供的"训练+评估"脚本。
@@ -51,19 +52,22 @@ pip install -e ".[dev]"   # 含 pytest
 ### 一次性准备 Agent 工作目录 `workspace/_agent_root/`
 
 Agent SDK 的 `cwd` 指向共享的 `workspace/_agent_root/`，其中需并存技能与 DataFlow 源码副本
-（`dataflow-dev` 技能假设 cwd 即 DataFlow 仓库根）。一次性拷贝：
+（`dataflow-dev` 技能假设 cwd 即 DataFlow 仓库根）。
+
+**技能文件已随仓库提交**（`workspace/_agent_root/.claude/skills/` 下），无需额外拷贝。
+
+**需要手动准备的只有 DataFlow 源码副本**：
 
 ```bash
-mkdir -p workspace/_agent_root/.claude/skills
-# 三个技能（generating-dataflow-pipeline / dataflow-dev / core_text，从 DataFlow-Skills 拷入）
-cp -r <DataFlow-Skills>/generating-dataflow-pipeline workspace/_agent_root/.claude/skills/
-cp -r <DataFlow-Skills>/dataflow-dev               workspace/_agent_root/.claude/skills/
-cp -r <DataFlow-Skills>/core_text                  workspace/_agent_root/.claude/skills/
-# DataFlow 源码完整副本（供 dataflow-dev 的 grep / registry 探测）
-cp -r <DataFlow>/dataflow                          workspace/_agent_root/dataflow
+# DataFlow 源码完整副本（供 MCP 动态 operator 发现 + 算子签名内省 + dataflow-dev 的 grep 探测）
+cp -r <DataFlow>/dataflow workspace/_agent_root/dataflow
+
+# 或通过 pip editable install（同时满足 import 和文件浏览需求）：
+# cd <DataFlow> && pip install -e .
 ```
 
 > `_agent_root/dataflow/` 是上游 DataFlow 的拷贝，会随上游更新而变旧，必要时手动重拷同步。
+> MCP server（`llm/mcp_operators.py`）启动时动态加载 registry，无需手动刷新静态目录。
 
 ---
 
@@ -236,7 +240,7 @@ dataflow_evolve/
 ├── agents/      # base / task_profiler / pipeline_agent(SDK 驱动) / review / diagnostic
 ├── core/        # schemas / tree_node / tree_manager / global_memory
 ├── engine/      # execution_wrapper / trainer_wrapper
-├── llm/         # serving(API/vLLM) / agent_sdk / prompts
+├── llm/         # serving(API/vLLM) / agent_sdk / mcp_operators / prompts
 ├── utils/       # config / logging / parsing
 └── main.py      # 双反馈事件环编排器
 configs/         # default.yaml

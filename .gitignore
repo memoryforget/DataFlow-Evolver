@@ -5,11 +5,18 @@ __pycache__/
 .pytest_cache/
 .env
 
-# 运行产物
-workspace/
+# 1. 忽略 workspace 下的所有内容（但保留目录结构，允许进入）
+workspace/*
 !workspace/.gitkeep
 
-# Agent SDK 拷入 _agent_root 的 DataFlow 源码副本（大、可重新拷贝）
+# 2. 放行 _agent_root 目录本身
+!workspace/_agent_root/
+workspace/_agent_root/*
+# 3. 现在可以忽略 dataflow 源码副本了
 workspace/_agent_root/dataflow/
 
-.claude
+# 4. 放行 _agent_root 下的 .claude 目录
+!workspace/_agent_root/.claude/
+# 5. 放行 skills 目录及其所有子内容
+!workspace/_agent_root/.claude/skills/
+!workspace/_agent_root/.claude/skills/**
