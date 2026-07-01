@@ -56,13 +56,14 @@ Agent SDK 的 `cwd` 指向共享的 `workspace/_agent_root/`，其中需并存�
 
 **技能文件已随仓库提交**（`workspace/_agent_root/.claude/skills/` 下），无需额外拷贝。
 
-**需要手动准备的只有 DataFlow 源码副本**：
+**需要手动准备的只有 DataFlow 源码副本**（二选一）：
 
 ```bash
-# DataFlow 源码完整副本（供 MCP 动态 operator 发现 + 算子签名内省 + dataflow-dev 的 grep 探测）
+# 方式 A（推荐）：直接拷贝源码目录到 _agent_root 下
+# MCP server 通过 sys.path 自动 import，无需额外安装
 cp -r <DataFlow>/dataflow workspace/_agent_root/dataflow
 
-# 或通过 pip editable install（同时满足 import 和文件浏览需求）：
+# 方式 B：editable install（同时满足 import 和文件浏览需求，但 agent 浏览源码路径不在 cwd 下）
 # cd <DataFlow> && pip install -e .
 ```
 
