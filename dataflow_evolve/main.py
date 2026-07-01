@@ -152,7 +152,7 @@ class Orchestrator:
         self.baseline_seed = int(baseline_cfg.get("seed", 42))
         self.baseline_pipeline_path = baseline_cfg.get(
             "baseline_pipeline",
-            "workspace/_agent_root/dataflow/statics/pipelines/api_pipelines/text_sft_synthesis_pipeline.py",
+            "workspace/_agent_root/dataflow/statics/pipelines/api_pipelines/reasoning_math_baseline_pipeline.py",
         )
         # 奖励策略：默认绝对分（冷启动）；暖启动跑完基线后切换为 Relative Gain。
         self.reward_policy = RewardPolicy(reward_mode=REWARD_ABSOLUTE)

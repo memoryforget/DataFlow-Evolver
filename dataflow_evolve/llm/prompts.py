@@ -63,7 +63,7 @@ Entry file（空输入）: {entry_path}
 确保流水线最终会在 `{node_dir}/` 下产出一个 jsonl 结果文件。
 {size_block}{parent_block}{diagnostic_block}{review_block}{memory_block}
 约束：这是无头自动化运行，禁止触发任何交互式询问（AskUserQuestion）或 git/gh 仓库同步子流程。\
-若需要超出 6 个核心算子的能力，可查阅 `dataflow-dev` 的 knowledge_base.md。"""
+生成流水线前，请先用 MCP 工具 recommend_operator_categories / list_operators / get_operator_detail 确认最优算子选择。"""
 
 PIPELINE_SELFCORRECT_PROMPT = """上一次生成的流水线 `{node_dir}/pipeline.py` 执行时崩溃了。\
 请用 `dataflow-dev` 的 `known_issues.md` 报错速查表匹配下面的错误并修复，然后\
