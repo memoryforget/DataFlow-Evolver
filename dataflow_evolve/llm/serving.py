@@ -59,12 +59,18 @@ class APILLMServing(LLMServingABC):
         logger.info("APILLMServing 就绪：model=%s base_url=%s", model_name, base_url)
 
     def _one(self, prompt: str, **kwargs: Any) -> str:
+        logger.debug(
+            "API 请求：model=%s, prompt_len=%d, temperature=%.2f",
+            self.model_name, len(prompt), kwargs.get("temperature", self.temperature),
+        )
         resp = self._client.chat.completions.create(
             model=self.model_name,
             messages=[{"role": "user", "content": prompt}],
             temperature=kwargs.get("temperature", self.temperature),
         )
-        return resp.choices[0].message.content or ""
+        result = resp.choices[0].message.content or ""
+        logger.debug("API 响应：len=%d, preview=%.200s", len(result), result)
+        return result
 
     def generate(self, prompts: list[str], **kwargs: Any) -> list[str]:
         if not prompts:
