@@ -15,19 +15,28 @@ from dataflow_evolve.utils.logging import get_logger
 logger = get_logger("llm.agent_sdk")
 
 _DEFAULT_SYSTEM_PROMPT_APPEND = (
-    "You write DataFlow pipelines. Follow this workflow:\n"
-    "1. Use MCP tool recommend_operator_categories with the task description to "
-    "identify the top 2 relevant categories (respect the avoid list).\n"
-    "2. Use MCP tool list_operators for each recommended category to browse "
-    "available operators.\n"
-    "3. Use MCP tool get_operator_detail to inspect specific operators before "
-    "selecting them (check init/run params and allowed_prompts).\n"
-    "4. Use the generating-dataflow-pipeline skill to author the pipeline code "
-    "with the selected operators.\n"
-    "5. Consult dataflow-dev (knowledge_base / known_issues) to fix execution errors.\n"
-    "Do NOT browse more than 2 categories unless the first pass clearly fails.\n"
-    "Do NOT run interactive (AskUserQuestion) or git/gh repo-sync subflows — "
-    "this is a headless automated run."
+    "You write DataFlow pipelines. Follow this MANDATORY workflow:\n\n"
+    "## MCP Tool Usage Rules (STRICT)\n"
+    "1. NEVER call list_operators without a category parameter — it returns ~90KB and pollutes context.\n"
+    "2. MANDATORY query sequence:\n"
+    "   a) recommend_operator_categories (with full task description)\n"
+    "   b) list_operators (only for the top 1-2 recommended categories)\n"
+    "   c) get_operator_detail (for specific operators before using them)\n"
+    "3. Max 2 list_operators calls per run. Do NOT browse additional categories.\n\n"
+    "## Operator Selection Priority (STRICT)\n"
+    "- If recommend_operator_categories returns a domain-specific category (reasoning, code, etc.),\n"
+    "  you MUST select operators from that category. Do NOT fall back to generic operators\n"
+    "  (CondorGenerator, PromptedGenerator) when specialized alternatives exist.\n"
+    "- CondorGenerator is a GENERIC multi-domain generator (covers 20+ unrelated domains like pets,\n"
+    "  real estate, entertainment). It is NOT suitable for math, reasoning, code, or any\n"
+    "  domain-specific from-scratch synthesis task.\n"
+    "- For math/reasoning tasks, use ReasoningQuestionGenerator + ReasoningAnswerGenerator.\n"
+    "- For code tasks, use CodeInstructionGenerator or CodeCodeToInstructionGenerator.\n"
+    "- CondorGenerator is ONLY appropriate when the task is explicitly domain-agnostic.\n\n"
+    "## Constraints\n"
+    "- Headless automation: no interactive prompts (AskUserQuestion), no git/gh subflows.\n"
+    "- Use the generating-dataflow-pipeline skill to author the final pipeline code.\n"
+    "- Consult dataflow-dev (knowledge_base / known_issues) to fix execution errors.\n"
 )
 
 
@@ -78,16 +87,23 @@ async def _run(prompt: str, options: Any) -> AgentRunResult:
         ProcessError,
         ResultMessage,
         TextBlock,
+        ToolUseBlock,
     )
 
     assistant_texts: list[str] = []
     result_text = ""
+    turn = 0
     try:
         async for msg in query(prompt=prompt, options=options):
             if isinstance(msg, AssistantMessage):
+                turn += 1
                 for block in msg.content:
                     if isinstance(block, TextBlock):
                         assistant_texts.append(block.text)
+                        preview = block.text[:120].replace("\n", " ")
+                        logger.debug("Agent SDK turn %d: %s", turn, preview)
+                    elif isinstance(block, ToolUseBlock):
+                        logger.debug("Agent SDK turn %d: tool_use %s", turn, block.name)
             elif isinstance(msg, ResultMessage):
                 result_text = msg.result or ""
     except CLINotFoundError as exc:

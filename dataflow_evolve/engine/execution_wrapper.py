@@ -85,6 +85,8 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
 
         if proc.returncode != 0:
             logger.error("流水线执行失败（exit=%d）：%s", proc.returncode, node_dir)
+            if proc.stderr:
+                logger.error("stderr:\n%s", proc.stderr[-2000:])
             return ExecutionResult(
                 False,
                 traceback=proc.stderr or f"non-zero exit code {proc.returncode}",
