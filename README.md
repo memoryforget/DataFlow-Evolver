@@ -33,21 +33,59 @@ TaskProfiler ──> TaskProfile
 
 ## 安装
 
+本项目将 **编排层（Agent）** 和 **训练层（Train）** 的依赖分离到不同的 optional extras，
+因为 `claude-agent-sdk` 依赖的 `pydantic>=2.11` 与 `llamafactory` 要求的 `pydantic<=2.10.6` 冲突，
+**不能共存于同一环境**。实际部署需要两个 conda 环境。
+
+### 前置：安装 uv（全局，一次性）
+
 ```bash
-# 1. 创建并激活 conda 环境（名字固定为 DataFlow-Evolve）
-conda create -n DataFlow-Evolve python=3.11 -y
-conda activate DataFlow-Evolve
-
-# 2. 安装本项目（含 claude-agent-sdk / openai / pyyaml / pydantic）
-pip install -e .
-pip install -e ".[dev]"   # 含 pytest
-
-# 3. 真正运行 DataFlow 流水线（Phase-2 之前）需另装 DataFlow 包（重依赖 torch/transformers）
-#    cd /path/to/DataFlow && pip install -e .
+# 推荐：独立安装（不污染任何 Python 环境）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# 或：pipx install uv
 ```
 
-> **Windows 提示**：用 `conda run` 跑会 spawn 子进程的命令（测试、主循环）可能崩溃；
-> 请直接用环境内解释器：`"<conda>/envs/DataFlow-Evolve/python.exe" -m pytest tests/ -q`。
+### 环境 1：Agent（编排主进程）
+
+```bash
+conda create -n df-agent python=3.11 -y
+conda activate df-agent
+
+uv pip install -e ".[agent]"     # openai / pyyaml / pydantic / claude-agent-sdk
+uv pip install -e ".[dev]"       # pytest（可选）
+```
+
+### 环境 2：Train（训练/推理子进程）
+
+```bash
+conda create -n df-train python=3.11 -y
+conda activate df-train
+
+uv pip install -e ".[train]" \
+  --extra-index-url https://download.pytorch.org/whl/cu121 \
+  --index-strategy unsafe-best-match
+```
+
+> **CUDA 兼容性**：`torch>=2.5,<2.6` 使用 cu121 wheel，兼容驱动 CUDA 12.1+（向下兼容）。
+> 若机器 CUDA < 12.1，切换到对应的 PyTorch index（如 `cu118`）。
+
+### 跨环境桥接
+
+训练子进程由主进程 `subprocess` 调用，通过配置指定 train 环境的 python 路径：
+
+```yaml
+# configs/default.yaml
+trainer:
+  train_python: /path/to/miniconda3/envs/df-train/bin/python
+```
+
+或通过环境变量：
+
+```bash
+export TRAIN_PYTHON=/path/to/miniconda3/envs/df-train/bin/python
+```
+
+留空则使用当前环境的 `python`（适用于单环境开发/测试场景）。
 
 ### 一次性准备 Agent 工作目录 `workspace/_agent_root/`
 
@@ -84,6 +122,7 @@ cp -r <DataFlow>/dataflow workspace/_agent_root/dataflow
 | `DF_API_KEY` | 辅助 Agent（Profiler/Review/Diagnostic）调用的 OpenAI-compatible API 密钥 |
 | `DF_API_URL` / `DF_MODEL` | 辅助 Agent 的 API 地址 / 模型名（可选，有默认值） |
 | `CLAUDE_MODEL` | Agent SDK 使用的 Claude 模型（默认 `claude-opus-4-6`） |
+| `TRAIN_PYTHON` | Train 环境的 python 路径（编排主进程用它 subprocess 调训练脚本） |
 
 ---
 
@@ -105,8 +144,11 @@ python -m dataflow_evolve.main \
 `DownstreamTrainerWrapper` 按如下契约子进程调用你的脚本：
 
 ```
-python <train_eval_cmd> --dataset <ds.jsonl> --output <out_dir>
+<train_python> <eval_cmd> --dataset <ds.jsonl> --output <out_dir>
 ```
+
+其中 `<train_python>` 由 `trainer.train_python` 配置（留空则用当前环境 python），
+`<eval_cmd>` 对应 `trainer.dev_eval_cmd`（MCTS 迭代）或 `trainer.test_eval_cmd`（终评）。
 
 脚本必须在 `<out_dir>/results.json` 回写：
 
@@ -125,7 +167,6 @@ python <train_eval_cmd> --dataset <ds.jsonl> --output <out_dir>
 - 超时 / 非零退出 / 缺 `results.json` 均被降级为 `TrainResult(failed=True)`，**不会拖垮主循环**。
 
 参考实现与最小可跑示例见 [`scripts/reference_train_eval.py`](./scripts/reference_train_eval.py)。
-把 `configs/default.yaml` 的 `trainer.train_eval_cmd` 指向它即可先验证管路。
 
 ---
 
@@ -136,10 +177,11 @@ python <train_eval_cmd> --dataset <ds.jsonl> --output <out_dir>
 ### 安装训练/评测依赖
 
 ```bash
-conda activate DataFlow-Evolve
-pip install -e ".[train]"
-# 或手动：
-# pip install llamafactory deepspeed vllm datasets torch transformers accelerate math-verify
+# 使用独立的 train 环境（见上方「安装」章节）
+conda activate df-train
+uv pip install -e ".[train]" \
+  --extra-index-url https://download.pytorch.org/whl/cu121 \
+  --index-strategy unsafe-best-match
 ```
 
 ### 环境变量
@@ -201,7 +243,7 @@ python scripts/llamafactory_math_sft_eval.py --mode test --dataset <ds.jsonl> --
 MCTS 反复用同一 benchmark 当奖励会**对它过拟合**；若再用同一 benchmark 报告结果，分数虚高、不可泛化。
 因此评测必须分两套（设计见 [`docs/design-decisions.md`](./docs/design-decisions.md) §3）：
 
-- **`dev`**（held-in）：**只**给 MCTS 当奖励信号，允许被「刷」——配 `trainer.dev_eval_cmd`（留空则回退 `train_eval_cmd`）。
+- **`dev`**（held-in）：**只**给 MCTS 当奖励信号，允许被「刷」——配 `trainer.dev_eval_cmd`。
 - **`test`**（held-out）：**全程对 loop 不可见**，仅在选出最优 recipe 后**手动跑一次**用于最终报告——配 `trainer.test_eval_cmd`。
 - **dev/test 切分由你的训练脚本内部负责**，框架把 benchmark 当黑箱、只决定调哪条命令（不传 split 路径、不介入切分）。
 - **去污染（decontamination）**：生成数据的种子/源语料须与 `test` 题目做 n-gram 重叠过滤，剔除重叠项（堵内容泄露）。
@@ -226,8 +268,13 @@ MCTS 反复用同一 benchmark 当奖励会**对它过拟合**；若再用同一
 ## 测试
 
 ```bash
-"<conda>/envs/DataFlow-Evolve/python.exe" -m pytest tests/ -q
+# 单元测试只需 agent 环境（不依赖 torch/llamafactory）
+conda activate df-agent
+python -m pytest tests/ -q
 ```
+
+> **Windows 提示**：用 `conda run` 跑会 spawn 子进程的命令可能崩溃；
+> 请直接用环境内解释器：`"<conda>/envs/df-agent/python.exe" -m pytest tests/ -q`。
 
 覆盖：配置/解析工具、UCB1 树搜索、辅助 Agent（桩后端）、执行与训练引擎、
 以及不依赖 API 密钥的主事件环集成冒烟测试。

@@ -35,8 +35,16 @@ class DownstreamTrainerWrapper(TrainerWrapperABC):
     TrainResult(failed=True, ...)，绝不把异常抛到主编排器。
     """
 
-    def __init__(self, train_eval_cmd: str, timeout_sec: int = 1800) -> None:
+    def __init__(
+        self,
+        train_eval_cmd: str,
+        timeout_sec: int = 1800,
+        python_path: str | None = None,
+    ) -> None:
         self.cmd_parts = _split_cmd(train_eval_cmd)
+        # 允许配置独立的 train 环境 python（解决 agent/train 依赖冲突）
+        if python_path and self.cmd_parts and self.cmd_parts[0] in ("python", "python3"):
+            self.cmd_parts[0] = python_path
         self.timeout_sec = timeout_sec
 
     def run(self, dataset_path: str, output_dir: str) -> TrainResult:

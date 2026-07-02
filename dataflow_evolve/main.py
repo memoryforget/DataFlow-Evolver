@@ -137,13 +137,24 @@ class Orchestrator:
             timeout_sec=cfg.trainer.get("timeout_sec", 1800),
             extra_env={self.pipeline_env_key: self.pipeline_api_key} if self.pipeline_api_key else None,
         )
-        # dev 评测驱动 MCTS：优先 trainer.dev_eval_cmd，留空则回退 train_eval_cmd（见设计文档 §3/§6）
-        dev_cmd = cfg.trainer.get("dev_eval_cmd", "") or cfg.trainer.train_eval_cmd
+        # dev 评测驱动 MCTS：trainer.dev_eval_cmd（见设计文档 §3/§6）
+        dev_cmd = cfg.trainer.dev_eval_cmd
+        train_python = cfg.trainer.get("train_python", None)
         logger.info("dev 评测命令：%s", dev_cmd)
+        if train_python:
+            logger.info("train 环境 python：%s", train_python)
         self.trainer = DownstreamTrainerWrapper(
             train_eval_cmd=dev_cmd,
             timeout_sec=cfg.trainer.get("timeout_sec", 1800),
+            python_path=train_python,
         )
+        # test 终评（全程对 MCTS loop 不可见，仅终评一次）
+        test_cmd = cfg.trainer.get("test_eval_cmd", "")
+        self.test_trainer = DownstreamTrainerWrapper(
+            train_eval_cmd=test_cmd,
+            timeout_sec=cfg.trainer.get("timeout_sec", 1800),
+            python_path=train_python,
+        ) if test_cmd else None
 
         # 强基线锚点（warm/cold 开关，见 docs/design-decisions.md §2）
         baseline_cfg = cfg.get("baseline") or Config({})

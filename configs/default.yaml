@@ -67,7 +67,9 @@ review:
 
 # Phase-2 真实训练：外部脚本桥接
 trainer:
-  train_eval_cmd: python scripts/reference_train_eval.py   # 兼容旧入口（占位伪评测）
+  # train 环境的 python 路径（与 agent 环境隔离，解决 pydantic 版本冲突）
+  # 留空则使用当前环境的 python
+  train_python: ${TRAIN_PYTHON:}
   # 防数据泄露纪律（见 docs/design-decisions.md §3）：
   #   dev：仅给 MCTS 当奖励信号，允许被「刷」；test：全程对 loop 不可见，仅终评一次。
   dev_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode dev     # Full SFT + MATH train 7500 题评测

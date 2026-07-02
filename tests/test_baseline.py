@@ -275,7 +275,7 @@ def _make_config(tmp_path: Path, *, baseline_enabled: bool, data_pool: bool = Fa
                    "max_children_per_node": 2, "self_correction_retries": 1,
                    "checkpoint": checkpoint or ""},
         "review": {"schema_threshold": 0.6, "relevance_threshold": 0.6, "sample_size": 5},
-        "trainer": {"train_eval_cmd": f'{sys.executable} "{ref_script}"', "timeout_sec": 60},
+        "trainer": {"dev_eval_cmd": f'{sys.executable} "{ref_script}"', "timeout_sec": 60},
         "diagnostic": {"max_bad_cases": 10},
     }
     if data_pool:
