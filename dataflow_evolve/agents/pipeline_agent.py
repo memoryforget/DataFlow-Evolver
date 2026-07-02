@@ -1,8 +1,8 @@
 """PipelineAgent：构建者/变异者，由 Claude Agent SDK 驱动。
 
-它不直接产出文本，而是启动一次无头 Agent SDK 运行，让 SDK 内的 Claude 借助本地技能
-（generating-dataflow-pipeline / dataflow-dev）把完整可运行的 DataFlow 流水线写到节点
-workspace，然后框架读取生成的 pipeline.py + decision.json 组装 PipelineConfig。
+它不直接产出文本，而是启动一次无头 Agent SDK 运行，让 SDK 内的 Claude 借助 MCP 算子发现、
+源码阅读、dataflow-dev 技能把完整可运行的 DataFlow 流水线写到节点 workspace 并自测通过，
+然后框架读取生成的 pipeline.py + decision.json 组装 PipelineConfig。
 
 注意：PipelineAgent 不继承 AgentABC（那是非-SDK 辅助 Agent 的基类）。
 """

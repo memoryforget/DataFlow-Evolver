@@ -1,6 +1,6 @@
 """各 Agent 的 prompt 模板集中管理。
 
-- PipelineAgent 的模板面向 Claude Agent SDK（指示其使用本地技能写流水线）。
+- PipelineAgent 的模板面向 Claude Agent SDK（指示其通过 MCP + 源码阅读 + compile 校验写流水线）。
 - Profiler / Review / Diagnostic 的模板面向 OpenAI-compatible API，强制 JSON 输出。
 """
 from __future__ import annotations
@@ -41,35 +41,38 @@ def build_profiler_prompt(task_description: str, sample_text: str | None = None)
 # ---------------------------------------------------------------------------
 # PipelineAgent（面向 Agent SDK）
 # ---------------------------------------------------------------------------
-PIPELINE_AGENT_PROMPT = """使用 `generating-dataflow-pipeline` 技能，为下述目标编写一条\
-完整、可直接运行的 DataFlow 流水线。
+PIPELINE_AGENT_PROMPT = """为下述目标编写一条完整、可直接运行的 DataFlow 流水线。
 
 Target: {target}
 Expected outputs: {expected_outputs}
 Entry file（空输入）: {entry_path}
 
 要求：
-1. 先按技能流程输出 Stage-1 算子决策摘要（JSON：{{"ops": [...], "field_flow": "...", "reason": "..."}}），\
+1. 先输出算子决策摘要（JSON：{{"ops": [...], "field_flow": "...", "reason": "..."}}），\
 再生成完整流水线代码。
-2. 把最终流水线代码写入文件：`{node_dir}/pipeline.py`，并把 Stage-1 决策 JSON 写入 `{node_dir}/decision.json`。\
+2. 把最终流水线代码写入文件：`{node_dir}/pipeline.py`，并把决策 JSON 写入 `{node_dir}/decision.json`。\
 直接用 Write 工具把这两个文件写到 `{node_dir}/` 下（这是相对 cwd 的路径，务必创建该目录）。
 3. 这是【从零合成（from-scratch synthesis）】任务：流水线不依赖任何输入语料。\
 `first_entry_file_name` 必须指向上面的 Entry file（一个空 jsonl，仅为满足 DataFlow 的 first_entry 形参）；\
-请用**领域对应的从零生成类算子**凭模型知识合成数据——必须先查 MCP 推荐的领域类别中是否有专用生成器\
-（如 reasoning 类的 ReasoningQuestionGenerator + ReasoningAnswerGenerator），\
-只有确认推荐类别中没有合适的从零生成算子时，才可回退到通用的 CondorGenerator。
+请用**领域对应的从零生成类算子**凭模型知识合成数据——必须先查 MCP 推荐的领域类别中是否有专用生成器。
 4. 目标 schema（下游期望字段及类型）：{target_schema}
 5. 流水线里的 LLM serving 必须用 `APILLMServing_request`，并严格使用下列参数（不要改成 openai.com/gpt-4o）：
 {llm_block}
 6. FileStorage 的 `cache_path` 设为 `{node_dir}/cache`，使产物落在本节点目录内。\
 确保流水线最终会在 `{node_dir}/` 下产出一个 jsonl 结果文件。
+7. 写完代码后，**必须执行 compile 校验**：在 `if __name__` 块中按此顺序编写：\
+`pipeline.compile()` → `if os.environ.get('DF_COMPILE_ONLY'): sys.exit(0)` → `pipeline.forward()`。\
+然后运行 `DF_COMPILE_ONLY=1 python {node_dir}/pipeline.py`。如果 compile() 报 KeyError/ImportError/TypeError，\
+查阅 dataflow-dev 的 known_issues.md 修复后重跑，直到 compile 通过。
 {recommendation_block}{size_block}{parent_block}{diagnostic_block}{review_block}{memory_block}
-约束：这是无头自动化运行，禁止触发任何交互式询问（AskUserQuestion）或 git/gh 仓库同步子流程。\
-生成流水线前，请先用 MCP 工具 recommend_operator_categories / list_operators / get_operator_detail 确认最优算子选择。"""
+约束：这是无头自动化运行，禁止触发任何交互式询问（AskUserQuestion）或 git/gh 子流程。\
+生成流水线前，请先用 MCP 工具发现算子，再用 Read 工具查看算子源码确认其真实 API 签名。"""
 
 PIPELINE_SELFCORRECT_PROMPT = """上一次生成的流水线 `{node_dir}/pipeline.py` 执行时崩溃了。\
-请用 `dataflow-dev` 的 `known_issues.md` 报错速查表匹配下面的错误并修复，然后\
-覆盖写回 `{node_dir}/pipeline.py`（保持同一文件名）。
+请用 `dataflow-dev` 的 `known_issues.md` 报错速查表匹配下面的错误并修复。\
+如有需要，用 Read 工具查看相关算子源码确认正确的 API 签名。\
+修复后覆盖写回 `{node_dir}/pipeline.py`（保持同一文件名），然后运行 \
+`DF_COMPILE_ONLY=1 python {node_dir}/pipeline.py` 验证 compile 通过。
 
 错误栈：
 ```
@@ -181,6 +184,9 @@ PIPELINE_REVIEW_SELFCORRECT_PROMPT = """上一次生成的流水线 `{node_dir}/
 `forward()` 的算子调用顺序）。请用 Glob / Read 工具**逐个查看这些中间文件里的实际数据**，\
 逐 step 追踪数据质量是从哪一步（哪个算子）开始变坏的——既包括行数骤减/变空，也包括行数没变但\
 **内容劣化**（某字段从有值变 null/空、schema 不符、跑题等）——据此判断是哪个算子的配置或用法有问题并修复它。
+
+如有需要，用 Read 工具查看相关算子源码确认正确的 API 签名和参数。\
+修复后运行 `DF_COMPILE_ONLY=1 python {node_dir}/pipeline.py` 验证 compile 通过。
 
 约束：无头运行，禁止交互式询问（AskUserQuestion）与 git/gh 子流程。只修复数据质量、保持目标不变。"""
 

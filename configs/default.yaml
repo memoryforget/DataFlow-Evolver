@@ -24,18 +24,18 @@ llm:
 
 # PipelineAgent 使用的 Claude Agent SDK
 agent_sdk:
-  model: claude-opus-4-8
+  model: claude-opus-4-7
   permission_mode: bypassPermissions       # 无头自动化
   setting_sources: [project]               # 从 cwd/.claude 加载技能
-  skills: [generating-dataflow-pipeline, dataflow-dev]   # 经 setting_sources(project)+.claude/skills 自动发现
-  max_turns: 10                            # 单次 SDK 运行最大轮数（透传 ClaudeAgentOptions；不设预算上限）
+  skills: [dataflow-dev]                    # 经 setting_sources(project)+.claude/skills 自动发现；generating-dataflow-pipeline 不再强制使用
+  max_turns: 50                            # 单次 SDK 运行最大轮数（MCP发现+读源码+写pipeline+自测修复，需要更多轮次）
   pipeline_filename: pipeline.py           # 约定：Agent 把流水线写到 <node_id>/pipeline.py
   # 工具：用 claude_code 预设放开全部内置工具（见 llm/agent_sdk.py），不再设白名单
   # 系统提示：保留 claude_code 预设，仅 append DataFlow 指令；可用 system_prompt_append 覆盖该 append 文本
 
 # 数据生成规模：注入生成 prompt，指导算子产出量（合成式据此设 num_samples，转换式控采样/过滤）
 generation:
-  target_samples: 1000                      # 目标产出条数（0=不指定）；按下游 SFT 需求调，Condor 建议 <5000
+  target_samples: 3000                      # 目标产出条数（0=不指定）；按下游 SFT 需求调，Condor 建议 <5000
 
 # 强基线锚点（相对增益奖励 / 池阈值；见 docs/design-decisions.md §2）
 # ✅ 已接入 main.py。锁定决策：Δ=0（node>baseline 即正向）、seed=42、只跑一次基线。
@@ -55,7 +55,7 @@ search:
   exploration_min: 0.0                      # 衰减下限，防 c 衰减到 0
   max_iterations: 20
   max_children_per_node: 4
-  self_correction_retries: 2               # 流水线执行崩溃后的自修正重试次数
+  self_correction_retries: 5               # 流水线执行崩溃后的自修正重试次数
   review_self_correction_retries: 5        # Phase-1 评审打回后的自修正重试次数（看中间 step 产物定位、修复、重审）
   checkpoint: ""                           # 断点续跑：非空=每轮落盘树状态到该路径，启动时存在则载入续跑；空=关闭
 
