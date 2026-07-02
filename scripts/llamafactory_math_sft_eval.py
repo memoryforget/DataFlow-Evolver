@@ -38,8 +38,9 @@ NUM_EPOCHS = float(os.environ.get("SFT_NUM_EPOCHS", "3"))
 LEARNING_RATE = float(os.environ.get("SFT_LEARNING_RATE", "2e-5"))
 BATCH_SIZE = int(os.environ.get("SFT_BATCH_SIZE", "4"))
 GRAD_ACCUM = int(os.environ.get("SFT_GRAD_ACCUM", "4"))
-NUM_GPUS = int(os.environ.get("SFT_NUM_GPUS", "16"))
-TP_SIZE = int(os.environ.get("EVAL_TP_SIZE", "16"))
+NUM_GPUS = int(os.environ.get("SFT_NUM_GPUS", "8"))
+TP_SIZE = int(os.environ.get("EVAL_TP_SIZE", "1"))
+DP_SIZE = int(os.environ.get("EVAL_DP_SIZE", "8"))
 MAX_MODEL_LEN = int(os.environ.get("EVAL_MAX_MODEL_LEN", "4096"))
 MAX_NEW_TOKENS = int(os.environ.get("EVAL_MAX_NEW_TOKENS", "2048"))
 HF_CACHE_DIR = os.environ.get("HF_CACHE_DIR", None)
@@ -183,10 +184,11 @@ def run_eval(model_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
         load_aime2024, aime_prompt, aime_score,
     )
 
-    logger.info("加载 vLLM 模型：%s (TP=%d)", model_dir, TP_SIZE)
+    logger.info("加载 vLLM 模型：%s (TP=%d, DP=%d)", model_dir, TP_SIZE, DP_SIZE)
     llm = LLM(
         model=str(model_dir),
         tensor_parallel_size=TP_SIZE,
+        data_parallel_size=DP_SIZE,
         max_model_len=MAX_MODEL_LEN,
         trust_remote_code=True,
     )
