@@ -66,7 +66,7 @@ Entry file（空输入）: {entry_path}
 查阅 dataflow-dev 的 known_issues.md 修复后重跑，直到 compile 通过。
 {recommendation_block}{size_block}{parent_block}{diagnostic_block}{review_block}{memory_block}
 约束：这是无头自动化运行，禁止触发任何交互式询问（AskUserQuestion）或 git/gh 子流程。\
-生成流水线前，请先用 MCP 工具发现算子，再用 Read 工具查看算子源码确认其真实 API 签名。"""
+生成流水线前，请先用 MCP 工具发现算子（get_operator_detail 获取完整 API 签名）。"""
 
 PIPELINE_SELFCORRECT_PROMPT = """上一次生成的流水线 `{node_dir}/pipeline.py` 执行时崩溃了。\
 请用 `dataflow-dev` 的 `known_issues.md` 报错速查表匹配下面的错误并修复。\

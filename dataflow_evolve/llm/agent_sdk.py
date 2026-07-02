@@ -20,19 +20,14 @@ _DEFAULT_SYSTEM_PROMPT_APPEND = (
     "1. NEVER call list_operators without a category parameter — it returns ~90KB.\n"
     "2. Call recommend_operator_categories with the full task description.\n"
     "3. Call list_operators for the top 1-2 recommended categories only.\n"
-    "4. Call get_operator_detail for operators you plan to use.\n"
+    "4. Call get_operator_detail for operators you plan to use — this gives you the\n"
+    "   exact constructor parameters, run() signature, and import path.\n"
     "5. Max 2 list_operators calls per run.\n\n"
-    "## Step 2: Read Operator Source Code\n"
-    "After identifying operators via MCP, READ their actual source code to confirm:\n"
-    "- Exact __init__ constructor parameters and defaults\n"
-    "- Exact run() signature (parameter names, required vs optional)\n"
-    "- Import path (use parent module, e.g. `from dataflow.operators.reasoning import X`)\n"
-    "Do NOT rely solely on MCP descriptions — they may omit details. The source is truth.\n\n"
-    "## Step 3: Write Pipeline\n"
+    "## Step 2: Write Pipeline\n"
     "- Consult the dataflow-dev skill (knowledge_base + templates) for pipeline structure.\n"
     "- Write pipeline.py and decision.json to the node directory specified in the task.\n"
     "- Pipeline must be a self-contained script with `if __name__ == '__main__':` entry.\n\n"
-    "## Step 4: Compile-Test (MANDATORY)\n"
+    "## Step 3: Compile-Test (MANDATORY)\n"
     "After writing pipeline.py, verify structural correctness via compile().\n"
     "The `if __name__ == '__main__':` block MUST follow this pattern:\n"
     "    pipeline = MyPipeline(...)\n"
@@ -45,6 +40,9 @@ _DEFAULT_SYSTEM_PROMPT_APPEND = (
     "## Constraints\n"
     "- Headless automation: no interactive prompts (AskUserQuestion), no git/gh subflows.\n"
     "- Consult dataflow-dev skill for knowledge_base, known_issues, and templates.\n"
+    "- If fixing errors and MCP detail is insufficient, you may Read operator source code\n"
+    "  to confirm exact API signatures (import from parent module, e.g.\n"
+    "  `from dataflow.operators.reasoning import X`).\n"
 )
 
 
@@ -67,7 +65,7 @@ def _build_options(agent_cfg: Config, cwd: str) -> Any:
     - tools：用 claude_code 预设放开**全部内置工具**（不再用 allowed_tools 白名单限制）。
     - system_prompt：保留 claude_code 预设，仅 **append** 我们的 DataFlow 指令（不覆盖系统提示）。
     - mcp_servers：挂载 dataflow-operators MCP server 供 agent 动态发现 operator。
-    - max_turns：单次 SDK 运行的最大轮数（默认 50）；不设预算上限。
+    - max_turns：单次 SDK 运行的最大轮数（默认 50）。
     SDK 鉴权（ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL）经环境变量传入，子进程默认继承 os.environ。
     """
     from claude_agent_sdk import ClaudeAgentOptions
