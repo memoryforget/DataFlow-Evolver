@@ -380,8 +380,21 @@ class Orchestrator:
                 break
             child.config = fixed
             exec_result = self.executor.run(fixed, node_dir)
+            # 评审自修正后执行崩溃：内嵌执行修复循环（复用 self_correction_retries 次数）
+            exec_fix_retries = 0
+            while not exec_result.success and exec_fix_retries < self.self_correction_retries:
+                exec_fix_retries += 1
+                logger.info(
+                    "评审自修正后执行崩溃，执行修复第 %d/%d 次。",
+                    exec_fix_retries, self.self_correction_retries,
+                )
+                exec_fixed = self.pipeline_agent.self_correct(node_dir, exec_result.traceback or "")
+                if exec_fixed is None:
+                    break
+                child.config = exec_fixed
+                exec_result = self.executor.run(exec_fixed, node_dir)
             if not exec_result.success or exec_result.dataset_path is None:
-                logger.warning("评审自修正后执行失败，停止重审。")
+                logger.warning("评审自修正后执行最终失败，停止重审。")
                 break
             review = self.reviewer.review(exec_result.dataset_path, profile)
             child.review_result = review

@@ -164,7 +164,11 @@ CATEGORY_GUIDE: dict[str, dict] = {
             "如果输入只是原始文档，应该先去 core_text（Text2QAGenerator）"
             "或 reasoning（ReasoningQuestionGenerator）生成训练样本，"
             "再回来走 text_sft 做质量评估。SFTGeneratorSeed 也不是『从文本生成 QA』，"
-            "它需要既有 SFT 种子。"
+            "它需要既有 SFT 种子。\n"
+            "【重要】CondorGenerator + CondorQuestionPrompt 是**通用多领域**生成器"
+            "（覆盖婚恋、娱乐、宠物、房产等 20+ 无关领域），不是数学/推理专用。"
+            "数学任务必须用 reasoning 类的 ReasoningQuestionGenerator / "
+            "ReasoningAnswerGenerator；代码任务必须用 code 类算子。"
         ),
         "examples": [
             "CondorGenerator", "CondorRefiner", "DeitaQualityFilter",

@@ -14,6 +14,7 @@ from typing import Any
 
 from dataflow_evolve.core.schemas import DiagnosticReport, PipelineConfig, TaskProfile
 from dataflow_evolve.llm.agent_sdk import run_pipeline_agent
+from dataflow_evolve.llm.mcp_operators import _recommend_categories
 from dataflow_evolve.llm.prompts import (
     build_pipeline_prompt,
     build_review_selfcorrect_prompt,
@@ -59,6 +60,8 @@ class PipelineAgent:
         """
         node_dir_abs = self.agent_root / node_dir_name
         node_dir_abs.mkdir(parents=True, exist_ok=True)
+        # 预调用推荐引擎，把结果直接注入 prompt 强制引导算子选择
+        recommended = _recommend_categories(profile.task_description)
         prompt = build_pipeline_prompt(
             profile=profile,
             entry_path=self.entry_path,
@@ -69,6 +72,7 @@ class PipelineAgent:
             review_issues=review_issues,
             parent_code=parent_code,
             target_samples=self.target_samples,
+            recommended_categories=recommended,
         )
         return self._run_and_assemble(prompt, node_dir_name)
 

@@ -55,13 +55,15 @@ Entry file（空输入）: {entry_path}
 直接用 Write 工具把这两个文件写到 `{node_dir}/` 下（这是相对 cwd 的路径，务必创建该目录）。
 3. 这是【从零合成（from-scratch synthesis）】任务：流水线不依赖任何输入语料。\
 `first_entry_file_name` 必须指向上面的 Entry file（一个空 jsonl，仅为满足 DataFlow 的 first_entry 形参）；\
-请用**从零生成类算子**（如 CondorGenerator）凭模型知识合成数据，不要依赖读取输入数据。
+请用**领域对应的从零生成类算子**凭模型知识合成数据——必须先查 MCP 推荐的领域类别中是否有专用生成器\
+（如 reasoning 类的 ReasoningQuestionGenerator + ReasoningAnswerGenerator），\
+只有确认推荐类别中没有合适的从零生成算子时，才可回退到通用的 CondorGenerator。
 4. 目标 schema（下游期望字段及类型）：{target_schema}
 5. 流水线里的 LLM serving 必须用 `APILLMServing_request`，并严格使用下列参数（不要改成 openai.com/gpt-4o）：
 {llm_block}
 6. FileStorage 的 `cache_path` 设为 `{node_dir}/cache`，使产物落在本节点目录内。\
 确保流水线最终会在 `{node_dir}/` 下产出一个 jsonl 结果文件。
-{size_block}{parent_block}{diagnostic_block}{review_block}{memory_block}
+{recommendation_block}{size_block}{parent_block}{diagnostic_block}{review_block}{memory_block}
 约束：这是无头自动化运行，禁止触发任何交互式询问（AskUserQuestion）或 git/gh 仓库同步子流程。\
 生成流水线前，请先用 MCP 工具 recommend_operator_categories / list_operators / get_operator_detail 确认最优算子选择。"""
 
@@ -87,6 +89,7 @@ def build_pipeline_prompt(
     review_issues: list[str] | None = None,
     parent_code: str | None = None,
     target_samples: int = 0,
+    recommended_categories: dict | None = None,
 ) -> str:
     # 目标产出规模：注入后让 Agent 据此设置算子参数（合成式调 num_samples / 转换式控采样过滤）。
     # 默认 0 = 不指定（避免 CondorGenerator 默认仅 3 条这种意外的小数据集，见 review）。
@@ -126,6 +129,26 @@ def build_pipeline_prompt(
     memory_block = ""
     if memory_summary:
         memory_block = f"\n参考历史记忆：\n{memory_summary}\n"
+    # 预注入 MCP 推荐结果：让 Agent 明确知道应从哪些类别中选算子
+    recommendation_block = ""
+    if recommended_categories:
+        rec_list = recommended_categories.get("recommended_categories", [])
+        avoid_list = recommended_categories.get("avoid_categories", [])
+        rec_text = "; ".join(
+            f"{r['category']}(score={r['score']}, reason: {r.get('reason', '')})"
+            for r in rec_list
+        )
+        avoid_text = "; ".join(
+            f"{a['category']}({a.get('reason', '')})"
+            for a in avoid_list
+        )
+        recommendation_block = (
+            f"\n【算子类别推荐（来自 MCP 预扫描，必须遵守）】\n"
+            f"   推荐类别：{rec_text}\n"
+            f"   回避类别：{avoid_text or '无'}\n"
+            f"   重要：你必须从上述推荐类别中选择算子。只有当推荐类别中确实没有合适算子时，"
+            f"才可回退到 core_text 的 6 个核心原语。\n"
+        )
     return PIPELINE_AGENT_PROMPT.format(
         target=profile.task_description,
         entry_path=entry_path,
@@ -133,6 +156,7 @@ def build_pipeline_prompt(
         node_dir=node_dir,
         target_schema=profile.target_schema,
         llm_block=llm_block or "   （未提供具体 API 参数，沿用技能默认。）",
+        recommendation_block=recommendation_block,
         size_block=size_block,
         parent_block=parent_block,
         diagnostic_block=diagnostic_block,

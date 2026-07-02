@@ -67,6 +67,22 @@ For example:
 - Code quality filtering → `CodeQualityScoreFilter` (NOT `PromptedFilter` with code prompt)
 - Question quality validation → `ReasoningQuestionFilter` (NOT `PromptedFilter`)
 
+## From-Scratch Synthesis Domain Routing (MANDATORY)
+
+When the task is **from-scratch synthesis** (no input corpus, generating data from model knowledge),
+the choice of generator depends on the **task domain**, not a one-size-fits-all default:
+
+| Domain (from task description) | Required Generator | Do NOT use |
+|---|---|---|
+| Math / Reasoning / CoT | `ReasoningQuestionGenerator` + `ReasoningAnswerGenerator` | `CondorGenerator` (generic multi-domain, covers 20+ unrelated topics) |
+| Code | `CodeInstructionGenerator` or `CodeCodeToInstructionGenerator` | `CondorGenerator` |
+| General QA (no specific domain) | `CondorGenerator` + appropriate prompt template | — |
+
+**Rule**: `CondorGenerator` + `CondorQuestionPrompt` generates questions across 20+ unrelated domains
+(pets, real estate, entertainment, military, etc.). It is ONLY appropriate when the task is explicitly
+domain-agnostic or general-purpose. For any domain-specific from-scratch task, use the domain's
+native generator from the recommended MCP category.
+
 ## Operator Selection Priority Rule (MANDATORY)
 
 When a specialized operator exists for the task, it MUST be used over generic operators. Do NOT use `PromptedGenerator` to replicate functionality that a dedicated operator already provides.
