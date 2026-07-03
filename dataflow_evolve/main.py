@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import uuid
 from pathlib import Path
 
 from dataflow_evolve.agents.diagnostic_agent import DiagnosticAgent
@@ -40,7 +39,7 @@ from dataflow_evolve.core.schemas import PipelineConfig
 from dataflow_evolve.core.tree_manager import TreeManager
 from dataflow_evolve.core.tree_node import PipelineNode
 from dataflow_evolve.engine.execution_wrapper import SubprocessExecutionWrapper
-from dataflow_evolve.engine.trainer_wrapper import DownstreamTrainerWrapper, QueuedTrainerWrapper
+from dataflow_evolve.engine.trainer_wrapper import DownstreamTrainerWrapper, SSHTrainerWrapper
 from dataflow_evolve.llm.serving import build_serving
 from dataflow_evolve.utils.config import Config, load_config
 from dataflow_evolve.utils.logging import get_logger, setup_logging
@@ -166,10 +165,9 @@ class Orchestrator:
         dev_cmd = cfg.trainer.dev_eval_cmd
         train_python = cfg.trainer.get("train_python", None)
         train_timeout = cfg.trainer.train_timeout_sec
-        # 训练调度：local=本机拉起子进程；queue=投递共享 FS 队列由双机 worker 拉起（见 README）
+        # 训练调度：local=本机拉起子进程（单机）；ssh=本机 rank0 + SSH 到 node1 拉起 rank1（双机）
         dispatch = cfg.trainer.get("dispatch", "local")
-        queue_dir = cfg.trainer.get("queue_dir", "./workspace/train_queue")
-        run_token = uuid.uuid4().hex  # 本轮 run 唯一标识，区分队列里的陈旧任务
+        ssh_cfg = cfg.trainer.get("ssh") if dispatch == "ssh" else None
         logger.info("dev 评测命令：%s（超时 %ds，dispatch=%s）", dev_cmd, train_timeout, dispatch)
         if train_python:
             logger.info("train 环境 python：%s", train_python)
@@ -177,13 +175,18 @@ class Orchestrator:
         def _make_trainer(cmd: str):
             if not cmd:
                 return None
-            if dispatch == "queue":
-                return QueuedTrainerWrapper(
+            if dispatch == "ssh":
+                return SSHTrainerWrapper(
                     train_eval_cmd=cmd,
-                    queue_dir=queue_dir,
+                    node1_host=ssh_cfg.node1_host,
+                    master_addr=ssh_cfg.master_addr,
+                    gpus_per_node=int(ssh_cfg.get("gpus_per_node", 8)),
+                    nnodes=int(ssh_cfg.get("nnodes", 2)),
+                    master_port=int(ssh_cfg.get("master_port", 29500)),
+                    remote_cwd=ssh_cfg.get("remote_cwd", None) or None,
+                    ssh_opts=ssh_cfg.get("ssh_opts", ""),
                     timeout_sec=train_timeout,
                     python_path=train_python,
-                    run_token=run_token,
                 )
             return DownstreamTrainerWrapper(
                 train_eval_cmd=cmd,

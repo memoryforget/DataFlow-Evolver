@@ -126,54 +126,37 @@ def test_execution_picks_max_step_over_mtime(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# QueuedTrainerWrapper：文件队列 + 常驻 worker 端到端（stub 训练命令，无需 GPU）
+# SSHTrainerWrapper：双机训练（本机 rank0 + SSH 拉起 rank1）。stub 训练命令，无需 GPU。
 # ---------------------------------------------------------------------------
 import subprocess  # noqa: E402
 import time  # noqa: E402
 
-from dataflow_evolve.engine.trainer_wrapper import QueuedTrainerWrapper  # noqa: E402
-
-WORKER_SCRIPT = ROOT / "scripts" / "dual_node_worker.py"
+from dataflow_evolve.engine.trainer_wrapper import SSHTrainerWrapper  # noqa: E402
 
 
-def _start_stub_worker(queue_dir: Path):
-    """起一个 rank0 单机 worker 子进程（--nnodes 1 --gpus 0），验证队列机制不涉及真 torchrun。"""
-    cmd = [
-        sys.executable, str(WORKER_SCRIPT),
-        "--rank", "0", "--nnodes", "1", "--gpus", "0",
-        "--queue-dir", str(queue_dir),
-        "--python", sys.executable,
-        "--poll-interval", "0.5",
-        "--job-timeout", "120",
-    ]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+def _ssh_wrapper(cmd: str, *, nnodes: int, timeout_sec: int, node1_host: str = "node1") -> SSHTrainerWrapper:
+    return SSHTrainerWrapper(
+        cmd,
+        node1_host=node1_host,
+        master_addr="127.0.0.1",
+        gpus_per_node=0,
+        nnodes=nnodes,
+        timeout_sec=timeout_sec,
+        python_path=sys.executable,
+    )
 
 
-def test_queued_trainer_end_to_end(tmp_path):
-    """投递任务 → worker 拉起 reference_train_eval.py → 写 done → 解析 TrainResult。"""
+def test_ssh_trainer_single_node_end_to_end(tmp_path):
+    """nnodes=1：跳过 SSH，仅本机 rank0 拉起 reference_train_eval.py → 解析 TrainResult。"""
     ds = tmp_path / "ds.jsonl"
     ds.write_text(
         '{"instruction":"q1","answer":"a1"}\n'
         '{"instruction":"q2","answer":""}\n',
         encoding="utf-8",
     )
-    queue_dir = tmp_path / "queue"
-    # reference 脚本无 --mode，作为通用 stub 训练命令
     cmd = f'{sys.executable} "{REF_SCRIPT}"'
-    worker = _start_stub_worker(queue_dir)
-    try:
-        wrapper = QueuedTrainerWrapper(
-            cmd, queue_dir=str(queue_dir), timeout_sec=60,
-            python_path=sys.executable, poll_interval=0.5,
-        )
-        result = wrapper.run(str(ds), str(tmp_path / "out"))
-    finally:
-        worker.terminate()
-        try:
-            worker.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            worker.kill()
-
+    wrapper = _ssh_wrapper(cmd, nnodes=1, timeout_sec=60)
+    result = wrapper.run(str(ds), str(tmp_path / "out"))
     assert result.failed is False
     assert result.metric_name == "non_empty_ratio"
     assert abs(result.score - 0.5) < 1e-9
@@ -181,19 +164,74 @@ def test_queued_trainer_end_to_end(tmp_path):
     assert result.bad_cases[0].error_type == "empty_answer"
 
 
-def test_queued_trainer_times_out_without_worker(tmp_path):
-    """无 worker 拉起 → 短超时后降级为 failed（不抛出）。"""
+def test_ssh_trainer_missing_script_degrades(tmp_path):
+    """rank0 命令不可执行 → 降级 failed（不抛出）。"""
+    ds = tmp_path / "ds.jsonl"
+    ds.write_text('{"answer":"x"}\n', encoding="utf-8")
+    wrapper = SSHTrainerWrapper(
+        "nonexistent_cmd_xyz --flag", node1_host="node1", master_addr="127.0.0.1",
+        gpus_per_node=0, nnodes=1, timeout_sec=10, python_path=None,
+    )
+    result = wrapper.run(str(ds), str(tmp_path / "out"))
+    assert result.failed is True
+    assert result.error_msg is not None
+
+
+def test_ssh_trainer_builds_remote_command(tmp_path, monkeypatch):
+    """nnodes=2：验证 SSH 命令构造正确（rank1 带 NODE_RANK=1 等分布式 env），不真连 node1。"""
     ds = tmp_path / "ds.jsonl"
     ds.write_text('{"instruction":"q","answer":"a"}\n', encoding="utf-8")
-    queue_dir = tmp_path / "queue"
+    out = tmp_path / "out"
+    captured = {}
+
+    real_popen = subprocess.Popen
+
+    class _FakeRemote:
+        pid = -1
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(cmd, *args, **kwargs):
+        # SSH 远端拉起：命令首 token 是 "ssh"
+        if isinstance(cmd, list) and cmd and cmd[0] == "ssh":
+            captured["ssh_cmd"] = cmd
+            fr = _FakeRemote()
+            # _launch_remote 会给 proc 挂 _logfile；这里补一个可关闭对象
+            fr._logfile = kwargs.get("stdout")
+            return fr
+        # rank0 本机：让 reference 脚本真跑，产出 results.json
+        return real_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
     cmd = f'{sys.executable} "{REF_SCRIPT}"'
-    wrapper = QueuedTrainerWrapper(
-        cmd, queue_dir=str(queue_dir), timeout_sec=2,
-        python_path=sys.executable, poll_interval=0.5,
-    )
+    wrapper = _ssh_wrapper(cmd, nnodes=2, timeout_sec=60, node1_host="user@10.0.0.2")
+    result = wrapper.run(str(ds), str(out))
+
+    assert result.failed is False           # rank0 本机跑通
+    ssh_cmd = captured.get("ssh_cmd")
+    assert ssh_cmd is not None, "应经 SSH 拉起 rank1"
+    assert ssh_cmd[0] == "ssh"
+    assert "user@10.0.0.2" in ssh_cmd
+    remote_str = ssh_cmd[-1]
+    assert "NODE_RANK=1" in remote_str
+    assert "MASTER_ADDR=127.0.0.1" in remote_str
+    assert "NNODES=2" in remote_str
+    assert "--dataset" in remote_str and "--output" in remote_str
+
+
+def test_ssh_trainer_times_out(tmp_path):
+    """rank0 训练超时 → 短超时后降级 failed（不抛出）。"""
+    ds = tmp_path / "ds.jsonl"
+    ds.write_text('{"instruction":"q","answer":"a"}\n', encoding="utf-8")
+    # 用一个会睡很久的命令模拟长训练
+    slow = tmp_path / "slow.py"
+    slow.write_text("import time; time.sleep(30)\n", encoding="utf-8")
+    cmd = f'{sys.executable} "{slow}"'
+    wrapper = _ssh_wrapper(cmd, nnodes=1, timeout_sec=2)
     t0 = time.time()
     result = wrapper.run(str(ds), str(tmp_path / "out"))
     elapsed = time.time() - t0
     assert result.failed is True
     assert result.error_msg is not None
-    assert elapsed >= 2  # 确实等到超时才返回
+    assert elapsed < 20  # 超时后应及时返回，而非等满 30s

@@ -83,10 +83,18 @@ trainer:
   train_timeout_sec: 25200                                      # dev/test 评测（含内层 Full SFT 训练 6h + 三 bench 评测）超时=7h
   # 训练调度方式：
   #   local（默认）：编排器在本机拉起训练子进程，阻塞等待（单机）。
-  #   queue：编排器把训练任务投递到共享 FS 队列，由两机各自的常驻 worker
-  #          （scripts/dual_node_worker.py）拉起双机 torchrun 训练（见 README 双机部署）。
+  #   ssh：编排器每轮训练时本机拉起 rank0，同时经免密 SSH 到 node1 拉起 rank1，
+  #        torchrun 会合完成双机训练（前提：两机共享文件系统 + 免密 SSH）。见 README 双机部署。
   dispatch: local
-  queue_dir: ./workspace/train_queue                            # dispatch=queue 时的共享队列根目录（须在共享 FS 上）
+  # dispatch=ssh 时的双机参数：
+  ssh:
+    node1_host: ${NODE1_HOST:}          # node1 的 SSH 目标（如 user@10.0.0.2 或 ~/.ssh/config 里的别名）
+    master_addr: ${MASTER_ADDR:}        # node0 对 node1 可路由的 IP（torchrun rendezvous 主地址）
+    master_port: 29500
+    nnodes: 2
+    gpus_per_node: 8                    # 每机 GPU 数（脚本内 NPROC_PER_NODE=gpus_per_node*nnodes//nnodes）
+    remote_cwd: ${REMOTE_CWD:}          # node1 上项目根目录（共享 FS 通常与本机同路径）；留空=编排器 cwd
+    ssh_opts: ""                        # 额外 ssh 选项，如 "-i ~/.ssh/id_rsa -p 22"
 
 # Phase-2 慢反馈：诊断
 diagnostic:

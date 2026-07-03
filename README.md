@@ -191,18 +191,22 @@ uv pip install -e ".[train]" \
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `SFT_BASE_MODEL` | `Qwen/Qwen3.5-9B` | 基座模型（HuggingFace ID 或本地路径） |
-| `SFT_NUM_EPOCHS` | `3` | 训练 epoch 数 |
-| `SFT_LEARNING_RATE` | `2e-5` | 学习率 |
-| `SFT_BATCH_SIZE` | `4` | per-device batch size |
+| `SFT_BASE_MODEL` | `Qwen/Qwen2.5-32B-Instruct` | 基座模型（HuggingFace ID 或本地路径） |
+| `SFT_NUM_EPOCHS` | `15` | 训练 epoch 数（LIMO 配置） |
+| `SFT_LEARNING_RATE` | `5e-6` | 学习率（LIMO：极低、无 warmup） |
+| `SFT_BATCH_SIZE` | `1` | per-device batch size |
 | `SFT_GRAD_ACCUM` | `4` | 梯度累积步数 |
-| `SFT_NUM_GPUS` | `8` | 训练 GPU 数（torchrun nproc） |
-| `EVAL_TP_SIZE` | `1` | vLLM 推理 tensor parallel size |
-| `EVAL_DP_SIZE` | `8` | vLLM 推理 data parallel size |
-| `EVAL_MAX_MODEL_LEN` | `4096` | vLLM 最大序列长度 |
-| `EVAL_MAX_NEW_TOKENS` | `2048` | 评测推理最大生成 token 数 |
+| `SFT_NUM_GPUS` | `16` | 训练**集群总卡数**（torchrun；双机每机 8 卡）；`NPROC_PER_NODE = SFT_NUM_GPUS // NNODES` |
+| `EVAL_TP_SIZE` | `2` | vLLM 推理 tensor parallel size |
+| `EVAL_DP_SIZE` | `4` | vLLM 推理 data parallel size（eval 只在 rank0 单机跑，`TP×DP=8`=本机卡数） |
+| `EVAL_MAX_MODEL_LEN` | `131072` | vLLM 最大序列长度（Qwen2.5-32B 上下文窗口） |
+| `EVAL_MAX_NEW_TOKENS` | `32768` | 评测推理最大生成 token 数（LIMO 硬截断） |
 | `MATH_TRAIN_PATH` | `data/math_train.jsonl` | dev 评测题库路径（MATH competition train 7500 条） |
 | `HF_CACHE_DIR` | `None` | HuggingFace datasets 缓存目录 |
+
+> **双机执行模型**：`run_sft` 是 torchrun 分布式作业，两机(rank0/rank1)都参与；`convert_dataset` 与
+> `run_eval` 只在 **rank0** 执行——rank1 训练完即退出，不重复评测、不竞态写 `results.json`。eval 的 vLLM
+> 推理在 rank0 **单机 8 卡**跑（32B bf16 权重≈64GB，单机 640GB 显存放得下，训练才需双机 ZeRO-3）。
 
 ### 运行方式
 
@@ -224,49 +228,44 @@ python scripts/llamafactory_math_sft_eval.py --mode test --dataset <ds.jsonl> --
    - test：GSM8K test (1319) + MATH-500 (500) + AIME 2024 (30)
 4. **输出**：bench 平均 accuracy 作为 `score` 写入 `results.json`
 
-### 双机训练部署（`dispatch: queue`）
+### 双机训练部署（`dispatch: ssh`）
 
 LIMO 配置的 Qwen2.5-32B Full SFT 需**双机 16 卡**。但 MCTS 编排器是 node0 上的单进程，
 无法直接驱动双机 torchrun（node1 上没有进程会合，会卡在 rendezvous 直到超时）。
 
-解决方式：**文件队列 + 常驻 worker 解耦**。两机各起一个常驻 worker 守护进程，轮询共享 FS 上的
-队列目录；编排器只把训练任务投递到队列并轮询结果。要求两机之间有**共享文件系统**（NFS/Lustre/GPFS
-等），`workspace` 对两机可见。
+解决方式：**免密 SSH 拉起**。编排器每轮训练时本机拉起 rank0，同时经免密 SSH 到 node1 后台拉起
+rank1，两边靠 torchrun rendezvous 会合完成双机训练。要求两机之间有**共享文件系统**
+（NFS/Lustre/GPFS 等，dataset/output 路径两机一致）+ **免密 SSH**。
 
-**1. 打开 queue 调度**（`configs/default.yaml`）：
+**1. 打开 ssh 调度**（`configs/default.yaml`）：
 
 ```yaml
 trainer:
-  dispatch: queue                      # 默认 local（单机）；改为 queue 启用双机解耦
-  queue_dir: ./workspace/train_queue   # 须在共享 FS 上，对两机可见
+  dispatch: ssh                        # 默认 local（单机）；改为 ssh 启用双机
+  ssh:
+    node1_host: user@10.0.0.2          # node1 的 SSH 目标（或 ~/.ssh/config 别名）
+    master_addr: 10.0.0.1              # node0 对 node1 可路由的 IP（rendezvous 主地址）
+    master_port: 29500
+    nnodes: 2
+    gpus_per_node: 8                   # 每机 GPU 数
+    remote_cwd: /shared/DataFlow-Evolve  # node1 上项目根（共享 FS 通常同路径）；留空=编排器 cwd
+    ssh_opts: ""                       # 额外 ssh 选项，如 "-i ~/.ssh/id_rsa -p 22"
 ```
 
-**2. 两机各起一个 worker**（`MASTER_ADDR` 填 node0 对 node1 可路由的 IP）：
+也可用环境变量注入：`NODE1_HOST` / `MASTER_ADDR` / `REMOTE_CWD`。
 
-```bash
-# node0（主，rank0：负责认领任务 + 写完成标记）
-python scripts/dual_node_worker.py --rank 0 --nnodes 2 \
-    --master-addr <IP0> --master-port 29500 --gpus 8 \
-    --queue-dir <shared>/workspace/train_queue --python <train_env_python>
+**2. 在 node0 起编排器**（照常，`python -m dataflow_evolve.main ...`）。node1 上**无需**起任何常驻进程
+——编排器会在每轮训练时自动 SSH 到 node1 拉起 rank1。
 
-# node1（从，rank1：等 running 标记出现即启动同一命令，靠 torchrun 会合）
-python scripts/dual_node_worker.py --rank 1 --nnodes 2 \
-    --master-addr <IP0> --master-port 29500 --gpus 8 \
-    --queue-dir <shared>/workspace/train_queue --python <train_env_python>
-```
-
-`--gpus` 是**本机**卡数（如 8）；worker 内部换算 `SFT_NUM_GPUS = gpus × nnodes`（=16 集群总卡数），
-并为训练子进程设好 `NODE_RANK` / `MASTER_ADDR` / `NNODES` 等分布式 env（修掉了 eval 脚本原本
-`NODE_RANK`/`MASTER_ADDR` 缺失的问题）。
-
-**3. 在 node0 起编排器**（照常，`python -m dataflow_evolve.main ...`）。编排器投递任务后阻塞轮询
-`queue_dir/done/`；两 worker 拉起双机训练，rank0 训练结束写 done，编排器读回 `results.json`。
+编排器内部为两侧训练子进程设好 `NODE_RANK`（rank0=0 / rank1=1）、`MASTER_ADDR` / `MASTER_PORT` /
+`NNODES` / `SFT_NUM_GPUS`（=gpus_per_node×nnodes 集群总卡数）等分布式 env，修掉了 eval 脚本原本
+`NODE_RANK`/`MASTER_ADDR` 缺失的问题。node1 侧日志落 `<output>/train_node1.log`（共享 FS 可见）。
 
 要点与容错：
 - 双机需 100G+ RoCE/InfiniBand 互连，否则 ZeRO-3 通信成瓶颈（脚本 docstring 已注明）。
-- 编排器超时会写 `cancel` 标记，worker 检测后杀训练进程树，避免僵尸 GPU 进程。
-- worker 重启后读 `queue_dir/worker_state/<rank>.seen` 跳过已完成任务。
-- `dispatch: local`（默认）时行为与旧版完全一致，单机直接拉起训练子进程。
+- rank0 超时或结束时会一并终止 node1 侧 SSH 进程树，避免僵尸 GPU 进程。
+- SSH 拉起失败 / rank0 非零退出 / 缺 `results.json` 均降级为 `TrainResult(failed=True)`，不阻塞主循环。
+- `dispatch: local`（默认）时行为与旧版完全一致，单机直接拉起训练子进程；`nnodes: 1` 时 ssh 模式也会跳过远端拉起，退化为单机。
 
 ### timeout 说明
 

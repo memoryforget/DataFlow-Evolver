@@ -13,12 +13,10 @@ import signal
 import subprocess
 import sys
 import time
-import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
 
 from dataflow_evolve.core.schemas import BadCase, TrainResult
-from dataflow_evolve.engine import train_queue
 from dataflow_evolve.utils.logging import get_logger
 
 logger = get_logger("engine.trainer")
@@ -124,100 +122,180 @@ class DownstreamTrainerWrapper(TrainerWrapperABC):
         return _parse_results(results_path, log_path)
 
 
-class QueuedTrainerWrapper(TrainerWrapperABC):
-    """把训练任务投递到共享 FS 文件队列，由两机常驻 worker 拉起双机 torchrun 训练。
+class SSHTrainerWrapper(TrainerWrapperABC):
+    """双机训练：node0 本机拉起 rank0，同时经免密 SSH 到 node1 拉起 rank1，torchrun 会合。
 
-    编排器（node0 单进程）不再本机拉起训练，而是：投递 job spec → 轮询 done 标记 →
-    读 results.json 组装 TrainResult。与 DownstreamTrainerWrapper 契约一致：任何系统级
-    失败降级为 TrainResult(failed=True)，绝不抛出。协议见 engine/train_queue.py。
+    前提：两机共享文件系统（dataset/output 路径两机一致）+ 免密 SSH。编排器每轮训练时：
+      1. 经 SSH 在 node1 后台拉起同一命令（NODE_RANK=1）；
+      2. 本机拉起 rank0（NODE_RANK=0），阻塞等待；
+      3. 两边结束后读共享 FS 上的 <output>/results.json 组装 TrainResult。
+
+    与 DownstreamTrainerWrapper 契约一致：任何系统级失败降级为 TrainResult(failed=True)，
+    绝不抛到编排器。修掉了 eval 脚本原本 NODE_RANK/MASTER_ADDR 缺失的问题。
     """
 
     def __init__(
         self,
         train_eval_cmd: str,
-        queue_dir: str,
+        *,
+        node1_host: str,
+        master_addr: str,
+        gpus_per_node: int,
+        nnodes: int = 2,
+        master_port: int = 29500,
+        remote_cwd: str | None = None,
+        ssh_opts: str = "",
         timeout_sec: int = 25200,
         python_path: str | None = None,
-        poll_interval: float = 5.0,
-        run_token: str | None = None,
     ) -> None:
-        # 保留基础命令 token（含 --mode 等），但 python 前缀交由 worker 侧解释器决定，故剥掉。
-        # 兼容 "python"/"python3" 以及解释器绝对路径（如 sys.executable、.../python.exe）。
-        parts = _split_cmd(train_eval_cmd)
-        if parts and _looks_like_python(parts[0]):
-            parts = parts[1:]
-        self.base_cmd = parts
-        self.queue_root = train_queue.ensure_queue_dirs(queue_dir)
+        self.cmd_parts = _split_cmd(train_eval_cmd)
+        # rank1 远端解释器与 rank0 一致（默认沿用 python_path 或本机 python）
+        self.python_exe = python_path or sys.executable
+        if self.cmd_parts and _looks_like_python(self.cmd_parts[0]):
+            self.cmd_parts[0] = self.python_exe
+        self.node1_host = node1_host
+        self.master_addr = master_addr
+        self.gpus_per_node = gpus_per_node
+        self.nnodes = nnodes
+        self.master_port = master_port
+        self.remote_cwd = remote_cwd or os.getcwd()
+        self.ssh_opts = ssh_opts
         self.timeout_sec = timeout_sec
-        self.python_path = python_path
-        self.poll_interval = poll_interval
-        # 本轮编排器唯一标识：区分本轮任务与上一轮遗留的陈旧任务
-        self.run_token = run_token or uuid.uuid4().hex
+
+    def _dist_env(self, node_rank: int) -> dict[str, str]:
+        """构造分布式 env。SFT_NUM_GPUS 须为集群总卡数（脚本内 NPROC_PER_NODE=总卡数//NNODES）。"""
+        return {
+            "NNODES": str(self.nnodes),
+            "NODE_RANK": str(node_rank),
+            "MASTER_ADDR": self.master_addr,
+            "MASTER_PORT": str(self.master_port),
+            "SFT_NUM_GPUS": str(self.gpus_per_node * self.nnodes),
+            "FORCE_TORCHRUN": "1",
+        }
 
     def run(self, dataset_path: str, output_dir: str) -> TrainResult:
         out_dir = Path(output_dir).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
         results_path = out_dir / "results.json"
         log_path = out_dir / "train.log"
+        ds_abs = str(Path(dataset_path).resolve())
+        tail = ["--dataset", ds_abs, "--output", str(out_dir)]
 
+        # rank1：经 SSH 在 node1 后台拉起（非阻塞）；stdout/stderr 落远端日志由共享 FS 可见。
+        # nnodes<=1（单机）时无需 SSH，直接跳过远端拉起。
+        remote_procs: list[subprocess.Popen] = []
+        if self.nnodes > 1:
+            try:
+                remote_procs.append(self._launch_remote(tail, out_dir))
+            except Exception as exc:  # noqa: BLE001 — SSH 拉起失败降级，不抛出
+                msg = f"SSH 拉起 node1（rank1）失败：{exc}"
+                logger.error(msg)
+                return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
+
+        # rank0：本机拉起，阻塞等待
         try:
-            return self._dispatch_and_wait(dataset_path, out_dir, results_path, log_path)
-        except Exception as exc:  # noqa: BLE001 — 契约要求绝不抛到编排器
-            msg = f"队列训练异常：{exc}"
-            logger.error(msg, exc_info=True)
+            rc, stdout, stderr, timed_out = self._run_local(tail, timeout=self.timeout_sec)
+        except FileNotFoundError as exc:
+            self._kill_all(remote_procs)
+            msg = f"训练脚本不可执行：{exc}"
+            logger.error(msg)
             return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
 
-    def _dispatch_and_wait(
-        self, dataset_path: str, out_dir: Path, results_path: Path, log_path: Path
-    ) -> TrainResult:
-        # 命令末尾由 worker append --dataset/--output；这里只带基础命令（脚本路径 + --mode）
-        job_id = train_queue.new_job_id(f"{out_dir.parent.name}")
-        spec = train_queue.job_spec(
-            job_id=job_id,
-            cmd=self.base_cmd,
-            dataset_path=dataset_path,
-            output_dir=str(out_dir),
-            run_token=self.run_token,
+        # 无论 rank0 结果如何，等/收 rank1（SSH 阻塞子进程）；超时则杀掉
+        self._reap_remote(remote_procs, timed_out)
+
+        log_path.write_text(
+            (stdout or "") + "\n--- STDERR ---\n" + (stderr or ""), encoding="utf-8"
         )
-        pending_path = self.queue_root / train_queue.PENDING / f"{job_id}.json"
-        done_path = self.queue_root / train_queue.DONE / f"{job_id}.json"
-        running_path = self.queue_root / train_queue.RUNNING / f"{job_id}.json"
-        cancel_path = self.queue_root / train_queue.RUNNING / f"{job_id}.cancel"
 
-        train_queue.atomic_write_json(pending_path, spec)
-        logger.info("已投递训练任务到队列：%s（等待 worker 拉起）", job_id)
+        if timed_out:
+            msg = f"训练超时（>{self.timeout_sec}s）"
+            logger.error(msg)
+            return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
+        if rc != 0:
+            msg = f"rank0 训练非零退出（{rc}）"
+            logger.error("%s；详见 %s", msg, log_path)
+            return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
+        if not results_path.exists():
+            msg = f"训练脚本未回写 results.json：{results_path}"
+            logger.error(msg)
+            return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
+        return _parse_results(results_path, log_path)
 
-        deadline = time.time() + self.timeout_sec
-        while time.time() < deadline:
-            done = train_queue.read_json(done_path)
-            if done is not None:
-                return self._from_done(done, results_path, log_path)
-            time.sleep(self.poll_interval)
+    def _launch_remote(self, tail: list[str], out_dir: Path) -> subprocess.Popen:
+        """经 SSH 在 node1 后台拉起 rank1；返回本地 ssh 子进程句柄（阻塞至远端结束）。"""
+        env = self._dist_env(node_rank=1)
+        env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+        remote_inner = " ".join(shlex.quote(t) for t in [*self.cmd_parts, *tail])
+        remote_cmd = f"cd {shlex.quote(self.remote_cwd)} && {env_prefix} {remote_inner}"
+        remote_log = out_dir / "train_node1.log"
+        ssh_cmd = ["ssh"]
+        if self.ssh_opts:
+            ssh_cmd += shlex.split(self.ssh_opts)
+        ssh_cmd += [self.node1_host, remote_cmd]
+        logger.info("SSH 拉起 node1（rank1）：%s", " ".join(ssh_cmd))
+        logf = open(remote_log, "w", encoding="utf-8")  # noqa: SIM115 — 交由 _reap 关闭
+        proc = subprocess.Popen(ssh_cmd, stdout=logf, stderr=subprocess.STDOUT, text=True)
+        proc._logfile = logf  # type: ignore[attr-defined]
+        return proc
 
-        # 超时：写 cancel 标记让 worker 杀训练进程树，避免僵尸 GPU 进程
-        msg = f"队列训练超时（>{self.timeout_sec}s），已请求取消：{job_id}"
-        logger.error(msg)
+    def _run_local(self, tail: list[str], timeout: int) -> tuple[int, str, str, bool]:
+        """本机拉起 rank0，阻塞等待。返回 (returncode, stdout, stderr, timed_out)。"""
+        env = {**os.environ, **self._dist_env(node_rank=0)}
+        cmd = [*self.cmd_parts, *tail]
+        logger.info("本机拉起训练（rank0）：%s", " ".join(cmd))
+        if sys.platform == "win32":
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, env=env,
+                                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        else:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, env=env, preexec_fn=os.setsid)
         try:
-            train_queue.atomic_write_json(cancel_path, {"job_id": job_id, "at": time.time()})
-        except OSError:
-            pass
-        return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return proc.returncode, stdout, stderr, False
+        except subprocess.TimeoutExpired:
+            logger.warning("rank0 训练超时（>%ds），终止进程树...", timeout)
+            _kill_process_tree(proc.pid)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+            return proc.returncode, stdout, stderr, True
 
-    def _from_done(
-        self, done: dict, results_path: Path, log_path: Path
-    ) -> TrainResult:
-        status = done.get("status")
-        if status != "ok":
-            msg = f"worker 报告训练失败：{done.get('error', '(无详情)')}"
-            logger.error(msg)
-            return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
-        rp = Path(done.get("results_path") or results_path)
-        if not rp.exists():
-            msg = f"worker 报告完成但缺失 results.json：{rp}"
-            logger.error(msg)
-            return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
-        logger.info("队列训练完成，解析结果：%s", rp)
-        return _parse_results(rp, log_path)
+    def _reap_remote(self, procs: list[subprocess.Popen], timed_out: bool) -> None:
+        """等 SSH 子进程收尾；rank0 超时则一并杀掉 node1 侧。"""
+        grace = 5 if timed_out else max(60, self.timeout_sec // 100)
+        for p in procs:
+            if timed_out:
+                self._kill_all([p])
+                continue
+            try:
+                p.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                logger.warning("node1（rank1）SSH 未在 %ds 内收尾，终止。", grace)
+                self._kill_all([p])
+            finally:
+                lf = getattr(p, "_logfile", None)
+                if lf is not None:
+                    try:
+                        lf.close()
+                    except OSError:
+                        pass
+
+    def _kill_all(self, procs: list[subprocess.Popen]) -> None:
+        for p in procs:
+            try:
+                _kill_process_tree(p.pid)
+            except Exception:  # noqa: BLE001
+                pass
+            lf = getattr(p, "_logfile", None)
+            if lf is not None:
+                try:
+                    lf.close()
+                except OSError:
+                    pass
 
 
 def _looks_like_python(token: str) -> bool:

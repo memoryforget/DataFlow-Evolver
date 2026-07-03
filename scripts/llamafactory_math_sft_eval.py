@@ -68,15 +68,25 @@ NUM_EPOCHS = float(os.environ.get("SFT_NUM_EPOCHS", "15"))
 LEARNING_RATE = float(os.environ.get("SFT_LEARNING_RATE", "5.0e-6"))
 BATCH_SIZE = int(os.environ.get("SFT_BATCH_SIZE", "1"))
 GRAD_ACCUM = int(os.environ.get("SFT_GRAD_ACCUM", "4"))
-NUM_GPUS = int(os.environ.get("SFT_NUM_GPUS", "16"))  # 双机16卡
+NUM_GPUS = int(os.environ.get("SFT_NUM_GPUS", "16"))  # 训练：双机总卡数（torchrun 分布式）
 CUTOFF_LEN = int(os.environ.get("SFT_CUTOFF_LEN", "16384"))  # LIMO 序列长度
 WARMUP_STEPS = int(os.environ.get("SFT_WARMUP_STEPS", "5"))  # 论文无 warmup，保留5步防初期震荡
-TP_SIZE = int(os.environ.get("EVAL_TP_SIZE", "2"))  # 评测时32B需要更大TP
-DP_SIZE = int(os.environ.get("EVAL_DP_SIZE", "8"))
+# 评测：仅在 rank0 单机跑（vLLM 非 torchrun 分布式）。32B 权重 bf16≈64GB，单机 8×A100 80G
+# 用 TP=2 每卡放 32GB 足够，故默认 TP=2 × DP=4 = 8（本机卡数），不再假设跨机 16 卡。
+TP_SIZE = int(os.environ.get("EVAL_TP_SIZE", "2"))
+DP_SIZE = int(os.environ.get("EVAL_DP_SIZE", "4"))
 MAX_MODEL_LEN = int(os.environ.get("EVAL_MAX_MODEL_LEN", "131072"))  # Qwen2.5-32B 上下文窗口
 MAX_NEW_TOKENS = int(os.environ.get("EVAL_MAX_NEW_TOKENS", "32768"))  # LIMO 论文：硬截断于32768
 HF_CACHE_DIR = os.environ.get("HF_CACHE_DIR", None)
 MAX_BAD_CASES_PER_BENCH = 10
+
+
+def _node_rank() -> int:
+    """本进程的节点 rank（NODE_RANK；单机/未设时为 0）。用于双机下只让 rank0 做评测。"""
+    try:
+        return int(os.environ.get("NODE_RANK", "0"))
+    except ValueError:
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -470,20 +480,28 @@ def main() -> None:
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
     mode = args.mode
+    rank = _node_rank()
 
     try:
-        # 1. 格式转换
+        # 1. 格式转换（仅 rank0 写，避免双机竞态写同一共享 FS 文件）
         data_dir = output_dir / "sft_data"
-        convert_dataset(dataset_path, data_dir)
+        if rank == 0:
+            convert_dataset(dataset_path, data_dir)
 
-        # 2. Full SFT
+        # 2. Full SFT：torchrun 在两机间协调的分布式作业，所有 rank 都要进入
         model_dir = run_sft(data_dir, output_dir)
 
-        # 3. 评测
+        # 3. 评测：vLLM 非 torchrun 分布式，只在 rank0 单机跑一次并回写 results.json；
+        #    非 rank0 训练完即退出，不重复评测、不竞态写 results.json。
+        if rank != 0:
+            logger.info("rank=%d 训练完成，非 rank0 不参与评测，退出。", rank)
+            return
         results = run_eval(model_dir, output_dir, mode=mode)
 
     except Exception as exc:
         logger.error("流程失败：%s", exc, exc_info=True)
+        if rank != 0:
+            return  # 非 rank0 失败不写 results.json（由 rank0 统一裁决）
         results = {
             "score": 0.0,
             "metric_name": "math_train_accuracy" if mode == "dev" else "math_test_avg_accuracy",
@@ -491,7 +509,7 @@ def main() -> None:
             "_error": str(exc),
         }
 
-    # 4. 输出
+    # 4. 输出（仅 rank0 到达此处）
     results_path = output_dir / "results.json"
     results_path.write_text(
         json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
