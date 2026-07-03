@@ -1,4 +1,4 @@
-"""LlamaFactory Full SFT + Math Benchmark 评测脚本。
+"""LlamaFactory Full SFT + Math Benchmark 评测脚本（LIMO 配置：Qwen2.5-32B 双机16卡）。
 
 契约：
     python scripts/llamafactory_math_sft_eval.py --dataset <ds.jsonl> --output <out_dir> [--mode dev|test]
@@ -8,10 +8,41 @@
     test：GSM8K test + MATH-500 + AIME 2024 完整套件，仅终评用。
 
 流程：
-    1. 数据格式转换（DataFlow JSONL → LlamaFactory alpaca 格式）
-    2. LlamaFactory Full SFT（Qwen3-8B, DeepSpeed ZeRO-2, 16 GPU）
+    1. 数据格式转换（DataFlow JSONL → LlamaFactory sharegpt 格式）
+    2. LlamaFactory Full SFT（Qwen2.5-32B, DeepSpeed ZeRO-3, 双机16卡 A100 80G）
     3. vLLM 推理（直接加载 fine-tuned 模型）对选定 bench 评测
     4. bench 取平均 accuracy → results.json
+
+LIMO 论文核心配置（2502.03387）：
+    - 基础模型: Qwen2.5-32B-Instruct
+    - 序列长度: 16384 (所有样本均低于此长度)
+    - 学习率: 5e-6 (极低，论文无 warmup)
+    - 训练轮数: 15 epochs
+    - 全局批次大小: 64 (16卡 × batch_size=1 × grad_accum=4)
+    - DeepSpeed ZeRO-3 + FlashAttention-2
+    - 数据: 800 条高质量推理样本
+
+双机启动（16卡 A100 80G）：
+    硬件要求：双机必须有 100G+ 网络互连（RoCE/InfiniBand），否则通信成为严重瓶颈。
+
+    主节点 (Node 0):
+        export NNODES=2
+        export NODE_RANK=0
+        export MASTER_ADDR=<主节点IP>
+        export MASTER_PORT=29500
+        python scripts/llamafactory_math_sft_eval.py --dataset data.jsonl --output output/
+
+    从节点 (Node 1):
+        export NNODES=2
+        export NODE_RANK=1
+        export MASTER_ADDR=<主节点IP>
+        export MASTER_PORT=29500
+        python scripts/llamafactory_math_sft_eval.py --dataset data.jsonl --output output/
+
+    注意：
+    1. 两个节点必须使用相同的 --dataset 和 --output 路径（共享文件系统或手动同步）
+    2. 显存占用估算：ZeRO-3 将 32B 模型状态均摊至 ~32GB/卡，激活值约 20-25GB，总占用 55-65GB
+    3. 全局批次大小 = NNODES × (NUM_GPUS/NNODES) × BATCH_SIZE × GRAD_ACCUM = 2 × 8 × 1 × 4 = 64
 
 输出：<out_dir>/results.json
     {"score": float, "metric_name": "math_avg_accuracy", "bad_cases": [...]}
@@ -24,34 +55,38 @@ import logging
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 配置常量（可通过环境变量覆盖）
+# 配置常量（可通过环境变量覆盖）— LIMO 论文配置
 # ---------------------------------------------------------------------------
-BASE_MODEL = os.environ.get("SFT_BASE_MODEL", "Qwen/Qwen3.5-9B")
-NUM_EPOCHS = float(os.environ.get("SFT_NUM_EPOCHS", "3"))
-LEARNING_RATE = float(os.environ.get("SFT_LEARNING_RATE", "2e-5"))
-BATCH_SIZE = int(os.environ.get("SFT_BATCH_SIZE", "4"))
+BASE_MODEL = os.environ.get("SFT_BASE_MODEL", "Qwen/Qwen2.5-32B-Instruct")
+NUM_EPOCHS = float(os.environ.get("SFT_NUM_EPOCHS", "15"))
+LEARNING_RATE = float(os.environ.get("SFT_LEARNING_RATE", "5.0e-6"))
+BATCH_SIZE = int(os.environ.get("SFT_BATCH_SIZE", "1"))
 GRAD_ACCUM = int(os.environ.get("SFT_GRAD_ACCUM", "4"))
-NUM_GPUS = int(os.environ.get("SFT_NUM_GPUS", "8"))
-TP_SIZE = int(os.environ.get("EVAL_TP_SIZE", "1"))
+NUM_GPUS = int(os.environ.get("SFT_NUM_GPUS", "16"))  # 双机16卡
+CUTOFF_LEN = int(os.environ.get("SFT_CUTOFF_LEN", "16384"))  # LIMO 序列长度
+WARMUP_STEPS = int(os.environ.get("SFT_WARMUP_STEPS", "5"))  # 论文无 warmup，保留5步防初期震荡
+TP_SIZE = int(os.environ.get("EVAL_TP_SIZE", "2"))  # 评测时32B需要更大TP
 DP_SIZE = int(os.environ.get("EVAL_DP_SIZE", "8"))
-MAX_MODEL_LEN = int(os.environ.get("EVAL_MAX_MODEL_LEN", "4096"))
+MAX_MODEL_LEN = int(os.environ.get("EVAL_MAX_MODEL_LEN", "16384"))
 MAX_NEW_TOKENS = int(os.environ.get("EVAL_MAX_NEW_TOKENS", "2048"))
 HF_CACHE_DIR = os.environ.get("HF_CACHE_DIR", None)
 MAX_BAD_CASES_PER_BENCH = 10
 
 
 # ---------------------------------------------------------------------------
-# 1. 数据格式转换
+# 1. 数据格式转换 (DataFlow JSONL → LlamaFactory ShareGPT)
 # ---------------------------------------------------------------------------
 def convert_dataset(src_path: Path, dst_dir: Path) -> Path:
-    """将 DataFlow JSONL 转为 LlamaFactory alpaca 格式的 JSON 文件。"""
+    """将 DataFlow JSONL 转为 LlamaFactory sharegpt 格式的 JSON 文件。
+
+    ShareGPT 格式支持多轮对话，每条样本含 conversations: [{from, value}, ...]
+    """
     rows = []
     with src_path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -62,10 +97,17 @@ def convert_dataset(src_path: Path, dst_dir: Path) -> Path:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            # 提取 instruction/question 和 output/answer
             instruction = obj.get("instruction", obj.get("question", obj.get("input", "")))
             output = obj.get("generated_cot", obj.get("output", obj.get("answer", "")))
             if instruction and output:
-                rows.append({"instruction": instruction, "input": "", "output": output})
+                # ShareGPT 格式：system prompt + user + assistant
+                conversation = [
+                    {"from": "system", "value": "Please reason step by step, and put your final answer within \\boxed{}"},
+                    {"from": "human", "value": instruction},
+                    {"from": "gpt", "value": output},
+                ]
+                rows.append({"conversations": conversation})
 
     if not rows:
         raise ValueError(f"数据集为空或字段不匹配：{src_path}")
@@ -75,19 +117,25 @@ def convert_dataset(src_path: Path, dst_dir: Path) -> Path:
     train_file.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # dataset_info.json 供 LlamaFactory 识别
-    info = {"train": {"file_name": "train.json"}}
+    info = {
+        "train": {
+            "file_name": "train.json",
+            "formatting": "sharegpt",
+            "columns": {"messages": "conversations"},
+        }
+    }
     (dst_dir / "dataset_info.json").write_text(
         json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    logger.info("格式转换完成：%d 条训练样本 → %s", len(rows), train_file)
+    logger.info("格式转换完成：%d 条训练样本 → %s (sharegpt)", len(rows), train_file)
     return train_file
 
 
 # ---------------------------------------------------------------------------
-# 2. LlamaFactory Full SFT
+# 2. LlamaFactory Full SFT (LIMO 配置: Qwen2.5-32B + ZeRO-3)
 # ---------------------------------------------------------------------------
 def run_sft(data_dir: Path, output_dir: Path) -> Path:
-    """调用 LlamaFactory CLI 执行全量 SFT 训练。返回模型输出目录。"""
+    """调用 LlamaFactory CLI 执行全量 SFT 训练（LIMO 论文配置）。返回模型输出目录。"""
     model_dir = output_dir / "sft_model"
     model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -98,33 +146,65 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
         "finetuning_type": "full",
         "dataset_dir": str(data_dir),
         "dataset": "train",
-        "template": "qwen3",
+        "template": "qwen",
+        "cutoff_len": CUTOFF_LEN,
         "output_dir": str(model_dir),
         "num_train_epochs": NUM_EPOCHS,
         "learning_rate": LEARNING_RATE,
         "per_device_train_batch_size": BATCH_SIZE,
         "gradient_accumulation_steps": GRAD_ACCUM,
+        "lr_scheduler_type": "cosine",
+        "warmup_steps": WARMUP_STEPS,
         "bf16": True,
+        "flash_attn": "fa2",
+        "optim": "adamw_torch",
+        "max_grad_norm": 1.0,
         "logging_steps": 10,
         "save_strategy": "no",
         "report_to": "none",
         "overwrite_output_dir": True,
+        "dataloader_pin_memory": False,
     }
 
-    # DeepSpeed ZeRO-2 配置
+    # DeepSpeed ZeRO-3 配置 (LIMO 论文)
     ds_config = {
         "train_batch_size": "auto",
         "train_micro_batch_size_per_gpu": "auto",
         "gradient_accumulation_steps": "auto",
-        "bf16": {"enabled": True},
         "zero_optimization": {
-            "stage": 2,
-            "offload_optimizer": {"device": "none"},
-            "allgather_partitions": True,
-            "allgather_bucket_size": 5e8,
+            "stage": 3,
+            "stage3_max_live_parameters": 1e9,
+            "stage3_max_reuse_distance": 1e9,
+            "stage3_prefetch_bucket_size": 5e8,
+            "stage3_param_persistence_threshold": 1e4,
+            "contiguous_gradients": True,
+            "overlap_comm": True,
             "reduce_scatter": True,
             "reduce_bucket_size": 5e8,
-            "overlap_comm": True,
+            "allgather_bucket_size": 5e8,
+        },
+        "activation_checkpointing": {
+            "partition_activations": False,
+            "cpu_checkpointing": False,
+        },
+        "bf16": {"enabled": True},
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "lr": "auto",
+                "betas": "auto",
+                "eps": "auto",
+                "weight_decay": "auto",
+            },
+        },
+        "scheduler": {
+            "type": "WarmupDecayLR",
+            "params": {
+                "warmup_min_lr": "auto",
+                "warmup_max_lr": "auto",
+                "warmup_num_steps": "auto",
+                "total_num_steps": "auto",
+            },
         },
     }
 
@@ -132,7 +212,7 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
     config_dir = output_dir / "sft_configs"
     config_dir.mkdir(parents=True, exist_ok=True)
 
-    ds_config_path = config_dir / "ds_z2.json"
+    ds_config_path = config_dir / "ds_z3.json"
     ds_config_path.write_text(json.dumps(ds_config, indent=2), encoding="utf-8")
     sft_config["deepspeed"] = str(ds_config_path)
 
@@ -140,9 +220,8 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
     import yaml
     sft_yaml_path.write_text(yaml.dump(sft_config, default_flow_style=False), encoding="utf-8")
 
-    # 执行训练：让 LlamaFactory 自己管理分布式启动（内部会调 torchrun）。
-    # 把当前解释器所在 bin 目录放到 PATH 最前面，确保 LlamaFactory 内部
-    # subprocess 调用的 torchrun 解析到同一环境。
+    # 执行训练：LlamaFactory 内部调用 torchrun 管理分布式。
+    # 双机配置通过环境变量传递（NNODES, NODE_RANK, MASTER_ADDR, MASTER_PORT）
     cmd = [
         sys.executable, "-m", "llamafactory.cli", "train",
         str(sft_yaml_path),
@@ -150,12 +229,18 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
     env = os.environ.copy()
     env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
     env["FORCE_TORCHRUN"] = "1"
-    env["NNODES"] = "1"
-    env["NPROC_PER_NODE"] = str(NUM_GPUS)
-    env["MASTER_PORT"] = "29500"
-    logger.info("开始 Full SFT 训练：%s", " ".join(cmd))
+    # 双机配置：需在启动脚本外设置 NNODES=2, NODE_RANK=0/1, MASTER_ADDR, MASTER_PORT
+    env.setdefault("NNODES", "1")  # 单机默认，双机需外部设置为 2
+    env["NPROC_PER_NODE"] = str(NUM_GPUS // int(env.get("NNODES", "1")))  # 每机GPU数
+    env.setdefault("MASTER_PORT", "29500")
+
+    logger.info("开始 Full SFT 训练 (LIMO 配置): %s", " ".join(cmd))
+    logger.info("分布式配置: NNODES=%s, NPROC_PER_NODE=%s, MASTER_ADDR=%s, MASTER_PORT=%s",
+                env.get("NNODES"), env["NPROC_PER_NODE"],
+                env.get("MASTER_ADDR", "localhost"), env.get("MASTER_PORT"))
+
     result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=3600, cwd=str(output_dir), env=env
+        cmd, capture_output=True, text=True, timeout=7200, cwd=str(output_dir), env=env
     )
     log_path = output_dir / "sft_train.log"
     log_path.write_text(result.stdout + "\n" + result.stderr, encoding="utf-8")
