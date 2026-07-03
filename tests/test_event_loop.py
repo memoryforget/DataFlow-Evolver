@@ -45,7 +45,7 @@ def _make_config(tmp_path: Path) -> Config:
         "search": {"exploration_constant": 1.414, "max_iterations": 3,
                    "max_children_per_node": 2, "self_correction_retries": 1},
         "review": {"schema_threshold": 0.6, "relevance_threshold": 0.6, "sample_size": 5},
-        "trainer": {"dev_eval_cmd": f'{sys.executable} "{ref_script}"', "timeout_sec": 60},
+        "trainer": {"dev_eval_cmd": f'{sys.executable} "{ref_script}"', "timeout_sec": 60, "train_timeout_sec": 60},
         "diagnostic": {"max_bad_cases": 10},
     }
     return Config(raw)

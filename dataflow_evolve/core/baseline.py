@@ -116,9 +116,8 @@ def adapt_baseline_source(
         n_url, n_model, n_entry, n_cache,
     )
     if n_url == 0 or n_entry == 0:
-        logger.warning(
-            "基线源码适配可能不完整（api_url 替换 %d 次、first_entry 替换 %d 次）——"
-            "请核对基线流水线是否仍使用 APILLMServing_request 与 first_entry_file_name。",
-            n_url, n_entry,
+        raise ValueError(
+            f"基线源码适配失败：api_url 替换 {n_url} 次、first_entry 替换 {n_entry} 次。"
+            "基线流水线格式可能已变更，请核对是否仍使用 APILLMServing_request 与 first_entry_file_name。"
         )
     return out

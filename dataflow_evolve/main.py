@@ -158,25 +158,26 @@ class Orchestrator:
         self.executor = SubprocessExecutionWrapper(
             agent_root=str(self.agent_root),
             pipeline_filename=agent_pipeline_filename,
-            timeout_sec=cfg.trainer.get("timeout_sec", 1800),
+            timeout_sec=cfg.trainer.timeout_sec,
             extra_env=self.pipeline_extra_env or None,
         )
         # dev 评测驱动 MCTS：trainer.dev_eval_cmd（见设计文档 §3/§6）
         dev_cmd = cfg.trainer.dev_eval_cmd
         train_python = cfg.trainer.get("train_python", None)
-        logger.info("dev 评测命令：%s", dev_cmd)
+        train_timeout = cfg.trainer.train_timeout_sec
+        logger.info("dev 评测命令：%s（超时 %ds）", dev_cmd, train_timeout)
         if train_python:
             logger.info("train 环境 python：%s", train_python)
         self.trainer = DownstreamTrainerWrapper(
             train_eval_cmd=dev_cmd,
-            timeout_sec=cfg.trainer.get("timeout_sec", 1800),
+            timeout_sec=train_timeout,
             python_path=train_python,
         )
         # test 终评（全程对 MCTS loop 不可见，仅终评一次）
         test_cmd = cfg.trainer.get("test_eval_cmd", "")
         self.test_trainer = DownstreamTrainerWrapper(
             train_eval_cmd=test_cmd,
-            timeout_sec=cfg.trainer.get("timeout_sec", 1800),
+            timeout_sec=train_timeout,
             python_path=train_python,
         ) if test_cmd else None
 

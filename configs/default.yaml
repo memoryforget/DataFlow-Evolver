@@ -79,7 +79,8 @@ trainer:
   #   dev：仅给 MCTS 当奖励信号，允许被「刷」；test：全程对 loop 不可见，仅终评一次。
   dev_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode dev     # Full SFT + MATH train 7500 题评测
   test_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode test   # 终评：GSM8K test + MATH-500 + AIME
-  timeout_sec: 3600                                             # SFT + 三 bench 评测约 30-60 min
+  timeout_sec: 3600                                             # 流水线执行（纯数据合成）超时；约几分钟完成，1h 足够
+  train_timeout_sec: 25200                                      # dev/test 评测（含内层 Full SFT 训练 6h + 三 bench 评测）超时=7h
 
 # Phase-2 慢反馈：诊断
 diagnostic:

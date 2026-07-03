@@ -9,7 +9,10 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import signal
 import subprocess
+import sys
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -59,21 +62,50 @@ class DownstreamTrainerWrapper(TrainerWrapperABC):
             "--output", str(out_dir),
         ]
         logger.info("启动下游训练：%s", " ".join(cmd))
+
+        # 使用 Popen 以便在超时时杀死整个进程树（包括孙进程）
         try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=self.timeout_sec
-            )
-        except subprocess.TimeoutExpired:
-            msg = f"训练脚本超时（>{self.timeout_sec}s）"
-            logger.error(msg)
-            return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
+            if sys.platform == "win32":
+                # Windows: 创建新进程组
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                )
+            else:
+                # Unix: 使用 setsid 创建新会话
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    preexec_fn=os.setsid,
+                )
         except FileNotFoundError as exc:
             msg = f"训练脚本不可执行：{exc}"
             logger.error(msg)
             return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
 
+        # 等待进程完成或超时
+        try:
+            stdout, stderr = proc.communicate(timeout=self.timeout_sec)
+        except subprocess.TimeoutExpired:
+            logger.warning("训练脚本超时（>%ds），正在终止进程树...", self.timeout_sec)
+            # 杀死整个进程树
+            _kill_process_tree(proc.pid)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+            msg = f"训练脚本超时（>{self.timeout_sec}s）"
+            logger.error(msg)
+            return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
+
         log_path.write_text(
-            (proc.stdout or "") + "\n--- STDERR ---\n" + (proc.stderr or ""),
+            (stdout or "") + "\n--- STDERR ---\n" + (stderr or ""),
             encoding="utf-8",
         )
 
@@ -132,3 +164,31 @@ def _parse_results(results_path: Path, log_path: Path) -> TrainResult:
     )
     logger.info("训练完成：%s=%.4f，bad_cases=%d", result.metric_name, result.score, len(bad_cases))
     return result
+
+
+def _kill_process_tree(pid: int) -> None:
+    """跨平台地杀死进程及其所有子孙进程。"""
+    if sys.platform == "win32":
+        # Windows: 使用 taskkill /T 杀死进程树
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
+            )
+        except Exception as e:
+            logger.warning("无法杀死 Windows 进程树 PID=%d: %s", pid, e)
+    else:
+        # Unix: 杀死整个进程组
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            time.sleep(2)
+            # 如果进程仍存活，发送 SIGKILL
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # 进程已终止
+        except ProcessLookupError:
+            pass  # 进程已不存在
+        except Exception as e:
+            logger.warning("无法杀死 Unix 进程组 PID=%d: %s", pid, e)
