@@ -362,7 +362,7 @@ def run_eval(model_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
         # 计算无偏 pass@1
         correct_count = 0
         bad_cases = []
-        for i, (out, ex) in enumerate(zip(outputs, examples)):
+        for out, ex in zip(outputs, examples):
             # 获取该问题的 4 个样本
             samples = [o.text for o in out.outputs]
             # 逐个判断是否正确
@@ -382,7 +382,7 @@ def run_eval(model_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
                 bad_cases.append({
                     "input": ex["question"],
                     "prediction": samples[0],
-                    "ground_truth": ex["answer"],
+                    "ground_truth": ex["gold_answer"],
                     "error_type": "wrong_answer",
                 })
             else:
