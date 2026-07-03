@@ -73,8 +73,8 @@ CUTOFF_LEN = int(os.environ.get("SFT_CUTOFF_LEN", "16384"))  # LIMO 序列长度
 WARMUP_STEPS = int(os.environ.get("SFT_WARMUP_STEPS", "5"))  # 论文无 warmup，保留5步防初期震荡
 TP_SIZE = int(os.environ.get("EVAL_TP_SIZE", "2"))  # 评测时32B需要更大TP
 DP_SIZE = int(os.environ.get("EVAL_DP_SIZE", "8"))
-MAX_MODEL_LEN = int(os.environ.get("EVAL_MAX_MODEL_LEN", "16384"))
-MAX_NEW_TOKENS = int(os.environ.get("EVAL_MAX_NEW_TOKENS", "2048"))
+MAX_MODEL_LEN = int(os.environ.get("EVAL_MAX_MODEL_LEN", "131072"))  # Qwen2.5-32B 上下文窗口
+MAX_NEW_TOKENS = int(os.environ.get("EVAL_MAX_NEW_TOKENS", "32768"))  # LIMO 论文：硬截断于32768
 HF_CACHE_DIR = os.environ.get("HF_CACHE_DIR", None)
 MAX_BAD_CASES_PER_BENCH = 10
 
@@ -240,7 +240,7 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
                 env.get("MASTER_ADDR", "localhost"), env.get("MASTER_PORT"))
 
     result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=7200, cwd=str(output_dir), env=env
+        cmd, capture_output=True, text=True, timeout=21600, cwd=str(output_dir), env=env
     )
     log_path = output_dir / "sft_train.log"
     log_path.write_text(result.stdout + "\n" + result.stderr, encoding="utf-8")
@@ -262,9 +262,10 @@ def run_eval(model_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
     """用 vLLM 加载 fine-tuned 模型评测。
 
     mode='dev': MATH train 全量 (7500 条公开训练题，非 benchmark test set) 驱动 MCTS 奖励。
-    mode='test': GSM8K test + MATH-500 + AIME 2024 完整套件，仅终评。
+    mode='test': 完整测试套件，区分小基准（多样本 pass@1）和大基准（单样本贪心）。
     """
     from vllm import LLM, SamplingParams
+    import math
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from math_benchmarks import (
@@ -272,6 +273,14 @@ def run_eval(model_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
         load_math500, math500_prompt, math500_score,
         load_math_train, math_train_prompt, math_train_score,
         load_aime2024, aime_prompt, aime_score,
+        load_amc23, amc23_prompt, amc23_score,
+        load_chmath, chmath_prompt, chmath_score,
+        load_olympiadbench, olympiadbench_prompt, olympiadbench_score,
+        load_gaokao, gaokao_prompt, gaokao_score,
+        load_kaoyan, kaoyan_prompt, kaoyan_score,
+        load_gradeschool, gradeschool_prompt, gradeschool_score,
+        load_minervamath, minervamath_prompt, minervamath_score,
+        load_gpqa, gpqa_prompt, gpqa_score,
     )
 
     logger.info("加载 vLLM 模型：%s (TP=%d, DP=%d)", model_dir, TP_SIZE, DP_SIZE)
@@ -281,19 +290,34 @@ def run_eval(model_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
         data_parallel_size=DP_SIZE,
         max_model_len=MAX_MODEL_LEN,
         trust_remote_code=True,
+        enable_prefix_caching=True,
     )
-    params = SamplingParams(temperature=0, max_tokens=MAX_NEW_TOKENS)
+
+    tokenizer = llm.get_tokenizer()
 
     if mode == "test":
-        benchmarks = [
-            ("GSM8K-test", lambda **kw: load_gsm8k(split="test", **kw), gsm8k_prompt, gsm8k_score),
-            ("MATH-500", load_math500, math500_prompt, math500_score),
-            ("AIME-2024", load_aime2024, aime_prompt, aime_score),
+        # 小基准（<50题）：生成 4 个样本，temperature=0.6，计算无偏 pass@1
+        small_benchmarks = [
+            ("AIME24", load_aime2024, aime_prompt, aime_score),
+            ("AMC23", load_amc23, amc23_prompt, amc23_score),
+            ("CHMath", load_chmath, chmath_prompt, chmath_score),
+        ]
+        # 大基准（≥50题）：单次贪心，temperature=0
+        large_benchmarks = [
+            ("MATH500", load_math500, math500_prompt, math500_score),
+            ("OlympiadBench", load_olympiadbench, olympiadbench_prompt, olympiadbench_score),
+            ("Gaokao", load_gaokao, gaokao_prompt, gaokao_score),
+            ("Kaoyan", load_kaoyan, kaoyan_prompt, kaoyan_score),
+            ("GradeSchool", load_gradeschool, gradeschool_prompt, gradeschool_score),
+            ("MinervaMath", load_minervamath, minervamath_prompt, minervamath_score),
+            ("GPQA", load_gpqa, gpqa_prompt, gpqa_score),
         ]
         metric_name = "math_test_avg_accuracy"
     else:
+        # dev mode: MATH train 全量，单样本贪心
         math_train_path = os.environ.get("MATH_TRAIN_PATH", None)
-        benchmarks = [
+        small_benchmarks = []
+        large_benchmarks = [
             ("MATH-train", lambda **kw: load_math_train(data_path=math_train_path, **kw), math_train_prompt, math_train_score),
         ]
         metric_name = "math_train_accuracy"
@@ -302,13 +326,15 @@ def run_eval(model_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
     all_bad_cases: list[dict] = []
     detail = {}
 
-    tokenizer = llm.get_tokenizer()
-
-    for bench_name, load_fn, prompt_fn, score_fn in benchmarks:
-        logger.info("评测 %s ...", bench_name)
+    # 处理小基准：多样本 pass@1
+    for bench_name, load_fn, prompt_fn, score_fn in small_benchmarks:
+        logger.info("评测 %s (多样本 pass@1) ...", bench_name)
         examples = load_fn(cache_dir=HF_CACHE_DIR)
+        if not examples:
+            logger.warning("%s 数据集为空，跳过", bench_name)
+            continue
 
-        # 使用 chat template 构造含 system prompt 的完整输入
+        # 构造 prompts
         prompts = []
         for ex in examples:
             user_msg = prompt_fn(ex["question"])
@@ -321,7 +347,87 @@ def run_eval(model_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
             )
             prompts.append(prompt_text)
 
-        outputs = llm.generate(prompts, params)
+        # 生成 4 个样本（temperature=0.6）
+        params_multi = SamplingParams(
+            n=4,  # 每个 prompt 生成 4 个样本
+            temperature=0.6,
+            top_p=0.95,
+            top_k=20,
+            presence_penalty=1.5,
+            max_tokens=MAX_NEW_TOKENS,
+            stop_token_ids=[151643, 151645],
+        )
+        outputs = llm.generate(prompts, params_multi)
+
+        # 计算无偏 pass@1
+        correct_count = 0
+        bad_cases = []
+        for i, (out, ex) in enumerate(zip(outputs, examples)):
+            # 获取该问题的 4 个样本
+            samples = [o.text for o in out.outputs]
+            # 逐个判断是否正确
+            correctness = []
+            for sample in samples:
+                acc, _ = score_fn([sample], [ex])
+                correctness.append(acc > 0.5)  # acc=1.0 表示正确
+
+            # 无偏 pass@1 估计：1 - C(n-c, k) / C(n, k)
+            # 其中 n=4（总样本数），c=sum(correctness)（正确样本数），k=1
+            c = sum(correctness)
+            n = len(correctness)
+            k = 1
+            if c == 0:
+                pass_at_1 = 0.0
+                # 记录 bad case（取第一个样本）
+                bad_cases.append({
+                    "input": ex["question"],
+                    "prediction": samples[0],
+                    "ground_truth": ex["answer"],
+                    "error_type": "wrong_answer",
+                })
+            else:
+                # pass@1 = 1 - C(n-c, k) / C(n, k)
+                pass_at_1 = 1.0 - (math.comb(n - c, k) / math.comb(n, k))
+
+            correct_count += pass_at_1
+
+        accuracy = correct_count / len(examples) if examples else 0.0
+        scores.append(accuracy)
+        for bc in bad_cases[:MAX_BAD_CASES_PER_BENCH]:
+            bc["error_type"] = f"{bench_name}:{bc.get('error_type', 'wrong_answer')}"
+            all_bad_cases.append(bc)
+        detail[bench_name] = {"accuracy": accuracy, "total": len(examples), "method": "pass@1"}
+        logger.info("%s pass@1: %.4f (%d 条)", bench_name, accuracy, len(examples))
+
+    # 处理大基准：单样本贪心
+    params_single = SamplingParams(
+        temperature=0,
+        max_tokens=MAX_NEW_TOKENS,
+        stop_token_ids=[151643, 151645],
+    )
+
+    for bench_name, load_fn, prompt_fn, score_fn in large_benchmarks:
+        logger.info("评测 %s (单样本贪心) ...", bench_name)
+        examples = load_fn(cache_dir=HF_CACHE_DIR)
+        if not examples:
+            logger.warning("%s 数据集为空，跳过", bench_name)
+            continue
+
+        # 构造 prompts
+        prompts = []
+        for ex in examples:
+            user_msg = prompt_fn(ex["question"])
+            conversation = [
+                {"role": "system", "content": EVAL_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ]
+            prompt_text = tokenizer.apply_chat_template(
+                conversation, tokenize=False, add_generation_prompt=True
+            )
+            prompts.append(prompt_text)
+
+        # 单次生成（temperature=0）
+        outputs = llm.generate(prompts, params_single)
         predictions = [out.outputs[0].text for out in outputs]
 
         accuracy, bad_cases = score_fn(predictions, examples)
@@ -329,7 +435,7 @@ def run_eval(model_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
         for bc in bad_cases[:MAX_BAD_CASES_PER_BENCH]:
             bc["error_type"] = f"{bench_name}:{bc.get('error_type', 'wrong_answer')}"
             all_bad_cases.append(bc)
-        detail[bench_name] = {"accuracy": accuracy, "total": len(examples)}
+        detail[bench_name] = {"accuracy": accuracy, "total": len(examples), "method": "greedy"}
         logger.info("%s accuracy: %.4f (%d 条)", bench_name, accuracy, len(examples))
 
     avg_score = sum(scores) / len(scores) if scores else 0.0
