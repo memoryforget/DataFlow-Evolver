@@ -281,19 +281,39 @@ def _quantile(sorted_vals: list[float], q: float) -> float:
 
 
 def _water_fill_cap(counts: dict[int, int], f: float) -> dict[int, int]:
-    """迭代把超过 f×总量的来源裁到 f×总量，直到稳定（max-min 公平）。"""
+    """水填充：把各来源裁到每源占比 ≤ f（max-min 公平），解析求平衡水位。
+
+    正确性依据：设裁剪 top-k 个高产源到统一水位 L，其余 (n-k) 个源不动。
+    平衡点须满足 L = f × 总量，而总量 = (未裁源之和 U) + k×L：
+        L = f × (U + k×L)  ⟹  L = f×U / (1 − f×k)
+    合法当且仅当第 k 个源 ≥ L ≥ 第 (k+1) 个源。从 k=1 递增试探即得唯一解。
+
+    k 最多到 n−1（至少留一个未裁源作平衡基准，否则 U=0 会把全部裁成 0）。
+    若源数不足以让任一单源 ≤ f（如 3 源要求 ≤30% 不可行），走均分兜底，
+    绝不螺旋至零。注意：调用方有 `n_sources ≥ ceil(1/f)` 守卫，兜底通常不触发。
+    """
+    if not counts or f <= 0 or f >= 1:
+        return counts
+
     counts = dict(counts)
-    for _ in range(10000):  # 收敛保险丝
-        total = sum(counts.values())
-        if total == 0:
-            break
-        cap = math.floor(f * total)
-        over = [nid for nid, c in counts.items() if c > cap]
-        if not over:
-            break
-        for nid in over:
-            counts[nid] = cap
-    return counts
+    vals = sorted(counts.values(), reverse=True)
+    n = len(vals)
+
+    # k = 被裁的高产源数，从 1 递增试探平衡水位
+    for k in range(1, n):
+        if 1 - f * k <= 0:
+            break  # 源数不足，约束在此 k 起不可行
+        U = sum(vals[k:])                     # 未裁源之和
+        L = f * U / (1 - f * k)               # 平衡水位
+        upper = vals[k - 1]                   # 第 k 个（被裁）源，须 ≥ L
+        lower = vals[k]                       # 第 k+1 个（未裁）源，须 ≤ L
+        if lower <= L <= upper:
+            cap = int(L)
+            return {nid: min(c, cap) for nid, c in counts.items()}
+
+    # 不可行（源数 < ceil(1/f)）：均分兜底，避免螺旋至零
+    share = max(int(f * sum(vals)), 1)
+    return {nid: min(c, share) for nid, c in counts.items()}
 
 
 def _group_by_source(entries: list[PoolEntry]) -> dict[int, list[PoolEntry]]:

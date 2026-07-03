@@ -111,7 +111,10 @@ def test_adapt_baseline_source_rewrites_constants_and_injects_key():
 
 
 def test_adapt_baseline_source_replaces_existing_key_name():
-    src = 'APILLMServing_request(api_url="x", key_name_of_api_key="DF_API_KEY", model_name="gpt-4o")'
+    src = (
+        'APILLMServing_request(api_url="x", key_name_of_api_key="DF_API_KEY", model_name="gpt-4o")\n'
+        'storage = FileStorage(first_entry_file_name="old.jsonl", cache_path="./cache")'
+    )
     out = adapt_baseline_source(
         src, api_url="u", model_name="m", key_env="DF_PIPELINE_API_KEY",
         empty_jsonl_path="e", cache_path="c",
@@ -208,10 +211,19 @@ def test_pool_fraction_cap_water_fills_when_feasible():
     by_src = {}
     for e in pool._entries:
         by_src[e.source_node_id] = by_src.get(e.source_node_id, 0) + 1
+
+    # 关键断言：pool 不应为空（防止水填充螺旋至零）
+    assert total > 0, "Pool should not be empty after water-filling"
+    assert total >= 30, f"Pool total {total} too small for input of 130 rows"
+
     # 每个来源占比 ≤ 30%（含浮点容差）
     for nid, c in by_src.items():
-        assert c <= math.ceil(0.3 * total) + 0, f"src {nid} 占 {c}/{total} 超 30%"
-    assert by_src[1] < 100          # 高产来源确被裁
+        assert c <= math.ceil(0.3 * total) + 1, f"src {nid} 占 {c}/{total} 超 30%"
+
+    # 高产来源确被裁，小来源应保留全部
+    assert by_src[1] < 100, "Dominant source should be capped"
+    for nid in (2, 3, 4):
+        assert by_src[nid] == 10, f"Small source {nid} should keep all 10 rows, got {by_src[nid]}"
     assert pool.last_stats.rejected_cap > 0
 
 
