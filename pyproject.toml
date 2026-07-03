@@ -22,12 +22,9 @@ agent = [
 train = [
     # --- 核心：先 pin torch，其他围绕它选 ---
     "torch>=2.5.0,<2.6",
-    "transformers>=4.49.0,<4.53",
-    "accelerate>=1.2.0,<1.8",
-    "datasets>=2.21.0,<3.7",
-    "tokenizers>=0.21.0,<0.22",
-    # --- 训练框架（trl/peft 由 llamafactory 管理） ---
-    "llamafactory>=0.9.3,<0.9.4",
+    "torchaudio>=2.5.0,<2.6",
+    # --- 训练框架（transformers/tokenizers/accelerate/datasets 由 llamafactory 管理） ---
+    "llamafactory>=0.9.5,<0.10",
     "deepspeed>=0.15.0,<0.17",
     # --- 推理 ---
     "vllm>=0.6.6,<0.7",

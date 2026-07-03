@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # 配置常量（可通过环境变量覆盖）
 # ---------------------------------------------------------------------------
-BASE_MODEL = os.environ.get("SFT_BASE_MODEL", "Qwen/Qwen3-8B")
+BASE_MODEL = os.environ.get("SFT_BASE_MODEL", "Qwen/Qwen3.5-9B")
 NUM_EPOCHS = float(os.environ.get("SFT_NUM_EPOCHS", "3"))
 LEARNING_RATE = float(os.environ.get("SFT_LEARNING_RATE", "2e-5"))
 BATCH_SIZE = int(os.environ.get("SFT_BATCH_SIZE", "4"))
@@ -140,17 +140,22 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
     import yaml
     sft_yaml_path.write_text(yaml.dump(sft_config, default_flow_style=False), encoding="utf-8")
 
-    # 执行训练
+    # 执行训练：让 LlamaFactory 自己管理分布式启动（内部会调 torchrun）。
+    # 把当前解释器所在 bin 目录放到 PATH 最前面，确保 LlamaFactory 内部
+    # subprocess 调用的 torchrun 解析到同一环境。
     cmd = [
-        "torchrun",
-        f"--nproc_per_node={NUM_GPUS}",
-        "--master_port=29500",
-        "-m", "llamafactory.cli", "train",
+        sys.executable, "-m", "llamafactory.cli", "train",
         str(sft_yaml_path),
     ]
+    env = os.environ.copy()
+    env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
+    env["FORCE_TORCHRUN"] = "1"
+    env["NNODES"] = "1"
+    env["NPROC_PER_NODE"] = str(NUM_GPUS)
+    env["MASTER_PORT"] = "29500"
     logger.info("开始 Full SFT 训练：%s", " ".join(cmd))
     result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=3600, cwd=str(output_dir)
+        cmd, capture_output=True, text=True, timeout=3600, cwd=str(output_dir), env=env
     )
     log_path = output_dir / "sft_train.log"
     log_path.write_text(result.stdout + "\n" + result.stderr, encoding="utf-8")

@@ -188,13 +188,14 @@ uv pip install -e ".[train]" \
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `SFT_BASE_MODEL` | `Qwen/Qwen3-8B` | 基座模型（HuggingFace ID 或本地路径） |
+| `SFT_BASE_MODEL` | `Qwen/Qwen3.5-9B` | 基座模型（HuggingFace ID 或本地路径） |
 | `SFT_NUM_EPOCHS` | `3` | 训练 epoch 数 |
 | `SFT_LEARNING_RATE` | `2e-5` | 学习率 |
 | `SFT_BATCH_SIZE` | `4` | per-device batch size |
 | `SFT_GRAD_ACCUM` | `4` | 梯度累积步数 |
-| `SFT_NUM_GPUS` | `16` | 训练 GPU 数（torchrun nproc） |
-| `EVAL_TP_SIZE` | `16` | vLLM 推理 tensor parallel size |
+| `SFT_NUM_GPUS` | `8` | 训练 GPU 数（torchrun nproc） |
+| `EVAL_TP_SIZE` | `1` | vLLM 推理 tensor parallel size |
+| `EVAL_DP_SIZE` | `8` | vLLM 推理 data parallel size |
 | `EVAL_MAX_MODEL_LEN` | `4096` | vLLM 最大序列长度 |
 | `EVAL_MAX_NEW_TOKENS` | `2048` | 评测推理最大生成 token 数 |
 | `MATH_TRAIN_PATH` | `data/math_train.jsonl` | dev 评测题库路径（MATH competition train 7500 条） |
@@ -214,7 +215,7 @@ python scripts/llamafactory_math_sft_eval.py --mode test --dataset <ds.jsonl> --
 
 内部流程：
 1. **格式转换**：DataFlow JSONL (`instruction` + `generated_cot`) → LlamaFactory alpaca 格式
-2. **Full SFT**：Qwen3-8B + DeepSpeed ZeRO-2（16 GPU），全量微调
+2. **Full SFT**：Qwen3.5-9B + DeepSpeed ZeRO-2（8 GPU），全量微调
 3. **评测**：vLLM 加载 fine-tuned 模型推理+判分（Qwen2.5-Math prompt 格式）
    - dev：MATH train 全量（7500 条公开竞赛训练题，非 benchmark test set）
    - test：GSM8K test (1319) + MATH-500 (500) + AIME 2024 (30)

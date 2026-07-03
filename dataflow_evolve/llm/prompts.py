@@ -56,7 +56,7 @@ Entry file（空输入）: {entry_path}
 `first_entry_file_name` 必须指向上面的 Entry file（一个空 jsonl，仅为满足 DataFlow 的 first_entry 形参）；\
 请用**领域对应的从零生成类算子**凭模型知识合成数据——必须先查 MCP 推荐的领域类别中是否有专用生成器。
 4. 目标 schema（下游期望字段及类型）：{target_schema}
-5. 流水线里的 LLM serving 必须用 `APILLMServing_request`，并严格使用下列参数（不要改成 openai.com/gpt-4o）：
+5. 流水线里的 LLM serving 必须用 `APILLMServing_request`，并严格使用下列参数：
 {llm_block}
 6. FileStorage 的 `cache_path` 设为 `{node_dir}/cache`，使产物落在本节点目录内。\
 确保流水线最终会在 `{node_dir}/` 下产出一个 jsonl 结果文件。

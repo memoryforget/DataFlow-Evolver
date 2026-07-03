@@ -23,6 +23,14 @@ _DEFAULT_SYSTEM_PROMPT_APPEND = (
     "4. Call get_operator_detail for operators you plan to use — this gives you the\n"
     "   exact constructor parameters, run() signature, and import path.\n"
     "5. Max 2 list_operators calls per run.\n\n"
+    "## Operator Selection Priority (STRICT — MUST OBEY)\n"
+    "- If recommend_operator_categories returns a domain-specific category (reasoning,\n"
+    "  code, etc.), you MUST select operators from that category.\n"
+    "- Do NOT fall back to generic core_text operators (RandomDomainKnowledgeRowGenerator,\n"
+    "  CondorGenerator, PromptedGenerator) when specialized alternatives exist.\n"
+    "- Math/Reasoning tasks → ReasoningQuestionGenerator + ReasoningAnswerGenerator\n"
+    "- Code tasks → CodeInstructionGenerator or CodeCodeToInstructionGenerator\n"
+    "- Generic core_text operators are ONLY for explicitly domain-agnostic tasks.\n\n"
     "## Step 2: Write Pipeline\n"
     "- Consult the dataflow-dev skill (knowledge_base + templates) for pipeline structure.\n"
     "- Write pipeline.py and decision.json to the node directory specified in the task.\n"
@@ -124,6 +132,8 @@ async def _run(prompt: str, options: Any) -> AgentRunResult:
         return AgentRunResult(False, error=str(exc), error_type="CLIJSONDecodeError")
     except CLIConnectionError as exc:
         return AgentRunResult(False, error=str(exc), error_type="CLIConnectionError")
+    except Exception as exc:
+        return AgentRunResult(False, error=str(exc), error_type=type(exc).__name__)
 
     return AgentRunResult(
         success=True,
