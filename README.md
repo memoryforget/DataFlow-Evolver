@@ -102,7 +102,7 @@ Agent SDK 的 `cwd` 指向共享的 `workspace/_agent_root/`，其中需并存�
 cp -r <DataFlow>/dataflow workspace/_agent_root/dataflow
 
 # 方式 B：editable install（同时满足 import 和文件浏览需求，但 agent 浏览源码路径不在 cwd 下）
-# cd <DataFlow> && pip install -e .
+cd <DataFlow> && pip install -e .
 ```
 
 > `_agent_root/dataflow/` 是上游 DataFlow 的拷贝，会随上游更新而变旧，必要时手动重拷同步。
@@ -127,7 +127,10 @@ cp -r <DataFlow>/dataflow workspace/_agent_root/dataflow
 ---
 
 ## 运行
-
+export IS_SANDBOX=1
+export ANTHROPIC_BASE_URL=
+export ANTHROPIC_API_KEY=
+export DF_API_KEY=
 ```bash
 python -m dataflow_evolve.main \
   --config configs/default.yaml \
@@ -221,11 +224,58 @@ python scripts/llamafactory_math_sft_eval.py --mode test --dataset <ds.jsonl> --
    - test：GSM8K test (1319) + MATH-500 (500) + AIME 2024 (30)
 4. **输出**：bench 平均 accuracy 作为 `score` 写入 `results.json`
 
-### timeout_sec 说明
+### 双机训练部署（`dispatch: queue`）
 
-`configs/default.yaml` 中的 `trainer.timeout_sec: 3600`（1 小时）是**单次训练+评测脚本**的超时上限。
-每轮 MCTS 迭代调用一次 `dev_eval_cmd`（含 SFT 训练 + 三 bench 推理评测），预计耗时 30-60 分钟。
-若超过 `timeout_sec` 则强制终止并标记该节点为 `failed`，不阻塞主循环。
+LIMO 配置的 Qwen2.5-32B Full SFT 需**双机 16 卡**。但 MCTS 编排器是 node0 上的单进程，
+无法直接驱动双机 torchrun（node1 上没有进程会合，会卡在 rendezvous 直到超时）。
+
+解决方式：**文件队列 + 常驻 worker 解耦**。两机各起一个常驻 worker 守护进程，轮询共享 FS 上的
+队列目录；编排器只把训练任务投递到队列并轮询结果。要求两机之间有**共享文件系统**（NFS/Lustre/GPFS
+等），`workspace` 对两机可见。
+
+**1. 打开 queue 调度**（`configs/default.yaml`）：
+
+```yaml
+trainer:
+  dispatch: queue                      # 默认 local（单机）；改为 queue 启用双机解耦
+  queue_dir: ./workspace/train_queue   # 须在共享 FS 上，对两机可见
+```
+
+**2. 两机各起一个 worker**（`MASTER_ADDR` 填 node0 对 node1 可路由的 IP）：
+
+```bash
+# node0（主，rank0：负责认领任务 + 写完成标记）
+python scripts/dual_node_worker.py --rank 0 --nnodes 2 \
+    --master-addr <IP0> --master-port 29500 --gpus 8 \
+    --queue-dir <shared>/workspace/train_queue --python <train_env_python>
+
+# node1（从，rank1：等 running 标记出现即启动同一命令，靠 torchrun 会合）
+python scripts/dual_node_worker.py --rank 1 --nnodes 2 \
+    --master-addr <IP0> --master-port 29500 --gpus 8 \
+    --queue-dir <shared>/workspace/train_queue --python <train_env_python>
+```
+
+`--gpus` 是**本机**卡数（如 8）；worker 内部换算 `SFT_NUM_GPUS = gpus × nnodes`（=16 集群总卡数），
+并为训练子进程设好 `NODE_RANK` / `MASTER_ADDR` / `NNODES` 等分布式 env（修掉了 eval 脚本原本
+`NODE_RANK`/`MASTER_ADDR` 缺失的问题）。
+
+**3. 在 node0 起编排器**（照常，`python -m dataflow_evolve.main ...`）。编排器投递任务后阻塞轮询
+`queue_dir/done/`；两 worker 拉起双机训练，rank0 训练结束写 done，编排器读回 `results.json`。
+
+要点与容错：
+- 双机需 100G+ RoCE/InfiniBand 互连，否则 ZeRO-3 通信成瓶颈（脚本 docstring 已注明）。
+- 编排器超时会写 `cancel` 标记，worker 检测后杀训练进程树，避免僵尸 GPU 进程。
+- worker 重启后读 `queue_dir/worker_state/<rank>.seen` 跳过已完成任务。
+- `dispatch: local`（默认）时行为与旧版完全一致，单机直接拉起训练子进程。
+
+### timeout 说明
+
+`configs/default.yaml` 的 trainer 块有两个独立超时：
+
+- `timeout_sec: 3600`（1h）——**流水线执行**（纯数据合成）超时，由执行器使用；数据合成通常几分钟完成。
+- `train_timeout_sec: 25200`（7h）——**dev/test 评测**（含内层 Full SFT 训练 + 三 bench 推理）超时。
+
+内层 `llamafactory_math_sft_eval.py` 的 SFT 训练子进程有 6h 超时（脚本内 `torchrun`），故外层 7h > 内层 6h + 评测，训练能完整跑完。每轮 MCTS 迭代调用一次 `dev_eval_cmd`；超过 `train_timeout_sec` 则强制终止进程树并标记该节点 `failed`，不阻塞主循环。
 
 ### 评测 Benchmark 详情
 

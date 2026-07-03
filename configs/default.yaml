@@ -81,6 +81,12 @@ trainer:
   test_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode test   # 终评：GSM8K test + MATH-500 + AIME
   timeout_sec: 3600                                             # 流水线执行（纯数据合成）超时；约几分钟完成，1h 足够
   train_timeout_sec: 25200                                      # dev/test 评测（含内层 Full SFT 训练 6h + 三 bench 评测）超时=7h
+  # 训练调度方式：
+  #   local（默认）：编排器在本机拉起训练子进程，阻塞等待（单机）。
+  #   queue：编排器把训练任务投递到共享 FS 队列，由两机各自的常驻 worker
+  #          （scripts/dual_node_worker.py）拉起双机 torchrun 训练（见 README 双机部署）。
+  dispatch: local
+  queue_dir: ./workspace/train_queue                            # dispatch=queue 时的共享队列根目录（须在共享 FS 上）
 
 # Phase-2 慢反馈：诊断
 diagnostic:

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import uuid
 from pathlib import Path
 
 from dataflow_evolve.agents.diagnostic_agent import DiagnosticAgent
@@ -39,7 +40,7 @@ from dataflow_evolve.core.schemas import PipelineConfig
 from dataflow_evolve.core.tree_manager import TreeManager
 from dataflow_evolve.core.tree_node import PipelineNode
 from dataflow_evolve.engine.execution_wrapper import SubprocessExecutionWrapper
-from dataflow_evolve.engine.trainer_wrapper import DownstreamTrainerWrapper
+from dataflow_evolve.engine.trainer_wrapper import DownstreamTrainerWrapper, QueuedTrainerWrapper
 from dataflow_evolve.llm.serving import build_serving
 from dataflow_evolve.utils.config import Config, load_config
 from dataflow_evolve.utils.logging import get_logger, setup_logging
@@ -165,21 +166,35 @@ class Orchestrator:
         dev_cmd = cfg.trainer.dev_eval_cmd
         train_python = cfg.trainer.get("train_python", None)
         train_timeout = cfg.trainer.train_timeout_sec
-        logger.info("dev 评测命令：%s（超时 %ds）", dev_cmd, train_timeout)
+        # 训练调度：local=本机拉起子进程；queue=投递共享 FS 队列由双机 worker 拉起（见 README）
+        dispatch = cfg.trainer.get("dispatch", "local")
+        queue_dir = cfg.trainer.get("queue_dir", "./workspace/train_queue")
+        run_token = uuid.uuid4().hex  # 本轮 run 唯一标识，区分队列里的陈旧任务
+        logger.info("dev 评测命令：%s（超时 %ds，dispatch=%s）", dev_cmd, train_timeout, dispatch)
         if train_python:
             logger.info("train 环境 python：%s", train_python)
-        self.trainer = DownstreamTrainerWrapper(
-            train_eval_cmd=dev_cmd,
-            timeout_sec=train_timeout,
-            python_path=train_python,
-        )
+
+        def _make_trainer(cmd: str):
+            if not cmd:
+                return None
+            if dispatch == "queue":
+                return QueuedTrainerWrapper(
+                    train_eval_cmd=cmd,
+                    queue_dir=queue_dir,
+                    timeout_sec=train_timeout,
+                    python_path=train_python,
+                    run_token=run_token,
+                )
+            return DownstreamTrainerWrapper(
+                train_eval_cmd=cmd,
+                timeout_sec=train_timeout,
+                python_path=train_python,
+            )
+
+        self.trainer = _make_trainer(dev_cmd)
         # test 终评（全程对 MCTS loop 不可见，仅终评一次）
         test_cmd = cfg.trainer.get("test_eval_cmd", "")
-        self.test_trainer = DownstreamTrainerWrapper(
-            train_eval_cmd=test_cmd,
-            timeout_sec=train_timeout,
-            python_path=train_python,
-        ) if test_cmd else None
+        self.test_trainer = _make_trainer(test_cmd)
 
         # 强基线锚点（warm/cold 开关，见 docs/design-decisions.md §2）
         baseline_cfg = cfg.get("baseline") or Config({})

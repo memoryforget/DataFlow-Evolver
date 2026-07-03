@@ -13,10 +13,12 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
 
 from dataflow_evolve.core.schemas import BadCase, TrainResult
+from dataflow_evolve.engine import train_queue
 from dataflow_evolve.utils.logging import get_logger
 
 logger = get_logger("engine.trainer")
@@ -120,6 +122,108 @@ class DownstreamTrainerWrapper(TrainerWrapperABC):
             return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
 
         return _parse_results(results_path, log_path)
+
+
+class QueuedTrainerWrapper(TrainerWrapperABC):
+    """把训练任务投递到共享 FS 文件队列，由两机常驻 worker 拉起双机 torchrun 训练。
+
+    编排器（node0 单进程）不再本机拉起训练，而是：投递 job spec → 轮询 done 标记 →
+    读 results.json 组装 TrainResult。与 DownstreamTrainerWrapper 契约一致：任何系统级
+    失败降级为 TrainResult(failed=True)，绝不抛出。协议见 engine/train_queue.py。
+    """
+
+    def __init__(
+        self,
+        train_eval_cmd: str,
+        queue_dir: str,
+        timeout_sec: int = 25200,
+        python_path: str | None = None,
+        poll_interval: float = 5.0,
+        run_token: str | None = None,
+    ) -> None:
+        # 保留基础命令 token（含 --mode 等），但 python 前缀交由 worker 侧解释器决定，故剥掉。
+        # 兼容 "python"/"python3" 以及解释器绝对路径（如 sys.executable、.../python.exe）。
+        parts = _split_cmd(train_eval_cmd)
+        if parts and _looks_like_python(parts[0]):
+            parts = parts[1:]
+        self.base_cmd = parts
+        self.queue_root = train_queue.ensure_queue_dirs(queue_dir)
+        self.timeout_sec = timeout_sec
+        self.python_path = python_path
+        self.poll_interval = poll_interval
+        # 本轮编排器唯一标识：区分本轮任务与上一轮遗留的陈旧任务
+        self.run_token = run_token or uuid.uuid4().hex
+
+    def run(self, dataset_path: str, output_dir: str) -> TrainResult:
+        out_dir = Path(output_dir).resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        results_path = out_dir / "results.json"
+        log_path = out_dir / "train.log"
+
+        try:
+            return self._dispatch_and_wait(dataset_path, out_dir, results_path, log_path)
+        except Exception as exc:  # noqa: BLE001 — 契约要求绝不抛到编排器
+            msg = f"队列训练异常：{exc}"
+            logger.error(msg, exc_info=True)
+            return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
+
+    def _dispatch_and_wait(
+        self, dataset_path: str, out_dir: Path, results_path: Path, log_path: Path
+    ) -> TrainResult:
+        # 命令末尾由 worker append --dataset/--output；这里只带基础命令（脚本路径 + --mode）
+        job_id = train_queue.new_job_id(f"{out_dir.parent.name}")
+        spec = train_queue.job_spec(
+            job_id=job_id,
+            cmd=self.base_cmd,
+            dataset_path=dataset_path,
+            output_dir=str(out_dir),
+            run_token=self.run_token,
+        )
+        pending_path = self.queue_root / train_queue.PENDING / f"{job_id}.json"
+        done_path = self.queue_root / train_queue.DONE / f"{job_id}.json"
+        running_path = self.queue_root / train_queue.RUNNING / f"{job_id}.json"
+        cancel_path = self.queue_root / train_queue.RUNNING / f"{job_id}.cancel"
+
+        train_queue.atomic_write_json(pending_path, spec)
+        logger.info("已投递训练任务到队列：%s（等待 worker 拉起）", job_id)
+
+        deadline = time.time() + self.timeout_sec
+        while time.time() < deadline:
+            done = train_queue.read_json(done_path)
+            if done is not None:
+                return self._from_done(done, results_path, log_path)
+            time.sleep(self.poll_interval)
+
+        # 超时：写 cancel 标记让 worker 杀训练进程树，避免僵尸 GPU 进程
+        msg = f"队列训练超时（>{self.timeout_sec}s），已请求取消：{job_id}"
+        logger.error(msg)
+        try:
+            train_queue.atomic_write_json(cancel_path, {"job_id": job_id, "at": time.time()})
+        except OSError:
+            pass
+        return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
+
+    def _from_done(
+        self, done: dict, results_path: Path, log_path: Path
+    ) -> TrainResult:
+        status = done.get("status")
+        if status != "ok":
+            msg = f"worker 报告训练失败：{done.get('error', '(无详情)')}"
+            logger.error(msg)
+            return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
+        rp = Path(done.get("results_path") or results_path)
+        if not rp.exists():
+            msg = f"worker 报告完成但缺失 results.json：{rp}"
+            logger.error(msg)
+            return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
+        logger.info("队列训练完成，解析结果：%s", rp)
+        return _parse_results(rp, log_path)
+
+
+def _looks_like_python(token: str) -> bool:
+    """判断命令首 token 是否为 python 解释器（"python"/"python3" 或解释器路径）。"""
+    base = Path(token).name.lower()
+    return base in ("python", "python3") or base.startswith("python")
 
 
 def _split_cmd(cmd: str) -> list[str]:

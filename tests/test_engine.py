@@ -123,3 +123,77 @@ def test_execution_picks_max_step_over_mtime(tmp_path):
     result = wrapper.run(cfg, "node_1")
     assert result.success is True
     assert result.dataset_path.endswith("s_step2.jsonl")
+
+
+# ---------------------------------------------------------------------------
+# QueuedTrainerWrapper：文件队列 + 常驻 worker 端到端（stub 训练命令，无需 GPU）
+# ---------------------------------------------------------------------------
+import subprocess  # noqa: E402
+import time  # noqa: E402
+
+from dataflow_evolve.engine.trainer_wrapper import QueuedTrainerWrapper  # noqa: E402
+
+WORKER_SCRIPT = ROOT / "scripts" / "dual_node_worker.py"
+
+
+def _start_stub_worker(queue_dir: Path):
+    """起一个 rank0 单机 worker 子进程（--nnodes 1 --gpus 0），验证队列机制不涉及真 torchrun。"""
+    cmd = [
+        sys.executable, str(WORKER_SCRIPT),
+        "--rank", "0", "--nnodes", "1", "--gpus", "0",
+        "--queue-dir", str(queue_dir),
+        "--python", sys.executable,
+        "--poll-interval", "0.5",
+        "--job-timeout", "120",
+    ]
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def test_queued_trainer_end_to_end(tmp_path):
+    """投递任务 → worker 拉起 reference_train_eval.py → 写 done → 解析 TrainResult。"""
+    ds = tmp_path / "ds.jsonl"
+    ds.write_text(
+        '{"instruction":"q1","answer":"a1"}\n'
+        '{"instruction":"q2","answer":""}\n',
+        encoding="utf-8",
+    )
+    queue_dir = tmp_path / "queue"
+    # reference 脚本无 --mode，作为通用 stub 训练命令
+    cmd = f'{sys.executable} "{REF_SCRIPT}"'
+    worker = _start_stub_worker(queue_dir)
+    try:
+        wrapper = QueuedTrainerWrapper(
+            cmd, queue_dir=str(queue_dir), timeout_sec=60,
+            python_path=sys.executable, poll_interval=0.5,
+        )
+        result = wrapper.run(str(ds), str(tmp_path / "out"))
+    finally:
+        worker.terminate()
+        try:
+            worker.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            worker.kill()
+
+    assert result.failed is False
+    assert result.metric_name == "non_empty_ratio"
+    assert abs(result.score - 0.5) < 1e-9
+    assert len(result.bad_cases) == 1
+    assert result.bad_cases[0].error_type == "empty_answer"
+
+
+def test_queued_trainer_times_out_without_worker(tmp_path):
+    """无 worker 拉起 → 短超时后降级为 failed（不抛出）。"""
+    ds = tmp_path / "ds.jsonl"
+    ds.write_text('{"instruction":"q","answer":"a"}\n', encoding="utf-8")
+    queue_dir = tmp_path / "queue"
+    cmd = f'{sys.executable} "{REF_SCRIPT}"'
+    wrapper = QueuedTrainerWrapper(
+        cmd, queue_dir=str(queue_dir), timeout_sec=2,
+        python_path=sys.executable, poll_interval=0.5,
+    )
+    t0 = time.time()
+    result = wrapper.run(str(ds), str(tmp_path / "out"))
+    elapsed = time.time() - t0
+    assert result.failed is True
+    assert result.error_msg is not None
+    assert elapsed >= 2  # 确实等到超时才返回
