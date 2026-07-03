@@ -41,7 +41,7 @@ def build_profiler_prompt(task_description: str, sample_text: str | None = None)
 # ---------------------------------------------------------------------------
 # PipelineAgent（面向 Agent SDK）
 # ---------------------------------------------------------------------------
-PIPELINE_AGENT_PROMPT = """为下述目标编写一条完整、可直接运行的 DataFlow 流水线。
+PIPELINE_AGENT_PROMPT = """为下述目标编写一条完整、可直接运行的 DataFlow 流水线（含自定义算子）。
 
 Target: {target}
 Expected outputs: {expected_outputs}
@@ -50,11 +50,12 @@ Entry file（空输入）: {entry_path}
 要求：
 1. 先输出算子决策摘要（JSON：{{"ops": [...], "field_flow": "...", "reason": "..."}}），\
 再生成完整流水线代码。
-2. 把最终流水线代码写入文件：`{node_dir}/pipeline.py`，并把决策 JSON 写入 `{node_dir}/decision.json`。\
-直接用 Write 工具把这两个文件写到 `{node_dir}/` 下（这是相对 cwd 的路径，务必创建该目录）。
+2. 在 `{node_dir}/operators/` 目录下为每个处理步骤编写独立的自定义算子文件（每个算子一个 .py）。\
+算子必须继承 OperatorABC（`from dataflow.core import OperatorABC`），实现 run() 方法。\
+然后把流水线主文件写入 `{node_dir}/pipeline.py`，决策 JSON 写入 `{node_dir}/decision.json`。
 3. 这是【从零合成（from-scratch synthesis）】任务：流水线不依赖任何输入语料。\
 `first_entry_file_name` 必须指向上面的 Entry file（一个空 jsonl，仅为满足 DataFlow 的 first_entry 形参）；\
-请用**领域对应的从零生成类算子**凭模型知识合成数据——必须先查 MCP 推荐的领域类别中是否有专用生成器。
+请用自定义的**生成类算子**凭模型知识合成数据。
 4. 目标 schema（下游期望字段及类型）：{target_schema}
 5. 流水线里的 LLM serving 必须用 `APILLMServing_request`，并严格使用下列参数：
 {llm_block}
@@ -63,15 +64,15 @@ Entry file（空输入）: {entry_path}
 7. 写完代码后，**必须执行 compile 校验**：在 `if __name__` 块中按此顺序编写：\
 `pipeline.compile()` → `if os.environ.get('DF_COMPILE_ONLY'): sys.exit(0)` → `pipeline.forward()`。\
 然后运行 `DF_COMPILE_ONLY=1 python {node_dir}/pipeline.py`。如果 compile() 报 KeyError/ImportError/TypeError，\
-查阅 dataflow-dev 的 known_issues.md 修复后重跑，直到 compile 通过。
+修复后重跑，直到 compile 通过。
 {recommendation_block}{size_block}{parent_block}{diagnostic_block}{review_block}{memory_block}
 约束：这是无头自动化运行，禁止触发任何交互式询问（AskUserQuestion）或 git/gh 子流程。\
-生成流水线前，请先用 MCP 工具发现算子（get_operator_detail 获取完整 API 签名）。"""
+写自定义算子时，可用 MCP get_operator_detail 查看 reasoning 类别的已有算子源码作为编码风格参考。"""
 
 PIPELINE_SELFCORRECT_PROMPT = """上一次生成的流水线 `{node_dir}/pipeline.py` 执行时崩溃了。\
 请用 `dataflow-dev` 的 `known_issues.md` 报错速查表匹配下面的错误并修复。\
-如有需要，用 Read 工具查看相关算子源码确认正确的 API 签名。\
-修复后覆盖写回 `{node_dir}/pipeline.py`（保持同一文件名），然后运行 \
+如有需要，用 Read 工具查看 `{node_dir}/operators/` 下的自定义算子源码确认 API 签名。\
+修复后覆盖写回对应文件（pipeline.py 或 operators/ 下的算子文件），然后运行 \
 `DF_COMPILE_ONLY=1 python {node_dir}/pipeline.py` 验证 compile 通过。
 
 错误栈：
@@ -100,8 +101,8 @@ def build_pipeline_prompt(
     if target_samples and target_samples > 0:
         size_block = (
             f"\n【目标产出规模】最终数据集约需 {target_samples} 条。请据此设置算子参数：\n"
-            f"   - 若用从零合成类算子（如 CondorGenerator），把其 `num_samples` 设到约 {target_samples}；\n"
-            f"   - 若是转换/过滤类流水线，确保读入足够源数据并避免过度过滤，使最终产出接近该规模。\n"
+            f"   - 生成类算子：设置 num_samples 或循环次数使产出接近 {target_samples} 条；\n"
+            f"   - 过滤/验证类算子：确保不会过度过滤导致最终产出远低于该规模。\n"
         )
     # 父节点（暖启动时首层父为基线）pipeline.py 代码作为变异起点：
     # 让 Agent「在父节点基础上做有的放矢的变异」，而非每次从零冷启动（见 docs/design-decisions.md §2.4）。
@@ -109,7 +110,7 @@ def build_pipeline_prompt(
     if parent_code:
         parent_block = (
             f"\n【变异起点】下面是父节点（或强基线）已验证可运行的流水线代码。请在它的基础上做"
-            f"**针对性变异**（增删/替换算子、调参、改 prompt 等），目标是产出比它更优的数据；"
+            f"**针对性变异**（改进算子逻辑、调整 prompt、增删处理步骤、改参数等），目标是产出比它更优的数据；"
             f"不要原样照抄，也不要无依据地大改：\n```python\n{parent_code}\n```\n"
         )
     diagnostic_block = ""
@@ -132,25 +133,19 @@ def build_pipeline_prompt(
     memory_block = ""
     if memory_summary:
         memory_block = f"\n参考历史记忆：\n{memory_summary}\n"
-    # 预注入 MCP 推荐结果：让 Agent 明确知道应从哪些类别中选算子
+    # 预注入 MCP 推荐结果：指引 Agent 可参考哪些类别的算子源码作为编码风格参考
     recommendation_block = ""
     if recommended_categories:
         rec_list = recommended_categories.get("recommended_categories", [])
-        avoid_list = recommended_categories.get("avoid_categories", [])
         rec_text = "; ".join(
-            f"{r['category']}(score={r['score']}, reason: {r.get('reason', '')})"
+            f"{r['category']}(reason: {r.get('reason', '')})"
             for r in rec_list
         )
-        avoid_text = "; ".join(
-            f"{a['category']}({a.get('reason', '')})"
-            for a in avoid_list
-        )
         recommendation_block = (
-            f"\n【算子类别推荐（来自 MCP 预扫描，必须遵守）】\n"
-            f"   推荐类别：{rec_text}\n"
-            f"   回避类别：{avoid_text or '无'}\n"
-            f"   重要：你必须从上述推荐类别中选择算子。只有当推荐类别中确实没有合适算子时，"
-            f"才可回退到 core_text 的 6 个核心原语。\n"
+            f"\n【参考算子类别（仅供编码风格参考，不要直接复用）】\n"
+            f"   相关类别：{rec_text}\n"
+            f"   用法：可通过 MCP get_operator_detail 查看这些类别中算子的源码，\n"
+            f"   学习其 prompt 构造、LLM 调用模式、响应解析方式，然后写自己的算子。\n"
         )
     return PIPELINE_AGENT_PROMPT.format(
         target=profile.task_description,
@@ -174,7 +169,7 @@ def build_selfcorrect_prompt(node_dir: str, traceback: str) -> str:
 
 PIPELINE_REVIEW_SELFCORRECT_PROMPT = """上一次生成的流水线 `{node_dir}/pipeline.py` 能跑通，\
 但产出的数据被 Phase-1 评审判定【不达标】（未进入训练）。请修复数据质量问题，然后覆盖写回 \
-`{node_dir}/pipeline.py`（保持同一文件名与流水线目标不变）。
+`{node_dir}/pipeline.py` 或 `{node_dir}/operators/` 下的算子文件（保持流水线目标不变）。
 
 评审反馈的问题：
 {issues}
@@ -183,9 +178,9 @@ PIPELINE_REVIEW_SELFCORRECT_PROMPT = """上一次生成的流水线 `{node_dir}/
 中间 jsonl（step1 = 第 1 个算子产出，step2 = 第 2 个算子产出，依此类推；可对照 `pipeline.py` 里 \
 `forward()` 的算子调用顺序）。请用 Glob / Read 工具**逐个查看这些中间文件里的实际数据**，\
 逐 step 追踪数据质量是从哪一步（哪个算子）开始变坏的——既包括行数骤减/变空，也包括行数没变但\
-**内容劣化**（某字段从有值变 null/空、schema 不符、跑题等）——据此判断是哪个算子的配置或用法有问题并修复它。
+**内容劣化**（某字段从有值变 null/空、schema 不符、跑题等）——据此判断是哪个算子的逻辑或 prompt 有问题并修复它。
 
-如有需要，用 Read 工具查看相关算子源码确认正确的 API 签名和参数。\
+如有需要，用 Read 工具查看 `{node_dir}/operators/` 下的自定义算子源码。\
 修复后运行 `DF_COMPILE_ONLY=1 python {node_dir}/pipeline.py` 验证 compile 通过。
 
 约束：无头运行，禁止交互式询问（AskUserQuestion）与 git/gh 子流程。只修复数据质量、保持目标不变。"""

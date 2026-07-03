@@ -103,20 +103,22 @@ def test_event_loop_runs_and_picks_best(tmp_path, monkeypatch):
 
 
 def test_resolve_pipeline_llm_fallback_and_override():
-    """pipeline_llm 段逐字段回退 api：缺省全继承；只写 model_name 则只覆盖模型。"""
+    """pipeline_llm 段按用途区分多 serving，逐字段回退 api。"""
     from dataflow_evolve.main import _resolve_pipeline_llm
 
-    # 缺省 pipeline_llm → 全部回退 api（行为与旧版一致）
+    # 缺省 pipeline_llm → 返回 {"default": ...}，全部回退 api
     llm = Config({"api": {"api_url": "u", "model_name": "m", "api_key": "k", "max_workers": 7}})
     assert _resolve_pipeline_llm(llm) == {
-        "api_url": "u", "model_name": "m", "api_key": "k", "max_workers": 7,
+        "default": {"api_url": "u", "model_name": "m", "api_key": "k", "max_workers": 7},
     }
 
-    # 只写 model_name → 覆盖模型，其余继承 api（算子用便宜模型、辅助 Agent 用强模型的核心诉求）
+    # 多用途格式：generation 只写 model_name → 覆盖模型，其余继承 api
     llm2 = Config({
         "api": {"api_url": "u", "model_name": "strong", "api_key": "k", "max_workers": 7},
-        "pipeline_llm": {"model_name": "cheap"},
+        "pipeline_llm": {"generation": {"model_name": "cheap"}, "reasoning": {"model_name": "deep"}},
     })
     r2 = _resolve_pipeline_llm(llm2)
-    assert r2["model_name"] == "cheap"
-    assert r2["api_url"] == "u" and r2["api_key"] == "k" and r2["max_workers"] == 7
+    assert r2["generation"]["model_name"] == "cheap"
+    assert r2["generation"]["api_url"] == "u" and r2["generation"]["api_key"] == "k"
+    assert r2["reasoning"]["model_name"] == "deep"
+    assert r2["reasoning"]["max_workers"] == 7

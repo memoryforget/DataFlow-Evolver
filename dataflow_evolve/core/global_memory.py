@@ -14,7 +14,7 @@ from dataflow_evolve.core.tree_node import PipelineNode
 class MemoryEntry:
     node_id: int
     field_flow: str
-    operators: list[str]
+    operators: list[dict[str, str]]   # [{"name": ..., "purpose": ...}, ...]
     score: float | None
     review_passed: bool | None
     diagnostic_summary: str | None
@@ -31,14 +31,17 @@ class GlobalMemory:
         """从一个节点的当前状态抽取摘要写入记忆。"""
         if node.config is None:
             return
-        op_names = [op.get("name", "?") for op in node.config.operators]
+        op_entries = [
+            {"name": op.get("name", "?"), "purpose": op.get("purpose", "")}
+            for op in node.config.operators
+        ]
         score = node.train_result.score if node.train_result else None
         review_passed = node.review_result.passed if node.review_result else None
         diag = node.diagnostic_report.summary if node.diagnostic_report else None
         self._entries[node.id] = MemoryEntry(
             node_id=node.id,
             field_flow=node.config.field_flow,
-            operators=op_names,
+            operators=op_entries,
             score=score,
             review_passed=review_passed,
             diagnostic_summary=diag,
@@ -60,8 +63,12 @@ class GlobalMemory:
         lines = ["历史已评估流水线（按下游得分降序，供参考与避免重复）："]
         for e in entries:
             score_str = f"{e.score:.3f}" if e.score is not None else "未训练"
+            ops_desc = ", ".join(
+                f"{op['name']}({op['purpose']})" if op.get("purpose") else op["name"]
+                for op in e.operators
+            )
             line = (
-                f"- [node {e.node_id}] flow={e.field_flow} | ops={e.operators} "
+                f"- [node {e.node_id}] flow={e.field_flow} | ops=[{ops_desc}] "
                 f"| score={score_str}"
             )
             if e.diagnostic_summary:

@@ -1,7 +1,9 @@
-"""In-process MCP server for DataFlow operator discovery (claude_agent_sdk).
+"""In-process MCP server for DataFlow operator source-code reference (claude_agent_sdk).
 
-Uses the live OPERATOR_REGISTRY to dynamically discover all operators at import
-time. Operator parameters are extracted via `inspect` (not static AST parsing).
+Exposes existing operators from the live OPERATOR_REGISTRY as coding-style references.
+PipelineAgent uses this OPTIONALLY to study prompt patterns, LLM call conventions, and
+response parsing from reasoning/math category operators — but writes custom operators
+rather than reusing existing ones directly.
 
 Exposes 4 tools for hierarchical operator browsing:
   - list_operator_categories

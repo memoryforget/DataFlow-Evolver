@@ -92,7 +92,7 @@ if __name__ == "__main__":
 # Style A 参考（继承 PipelineABC，支持 compile() / DAG 执行）
 # 适用场景：需要可视化 DAG、断点续传（BatchedPipelineABC）的场景
 #
-# from dataflow.pipeline.base import PipelineABC
+# from dataflow.pipeline import PipelineABC
 #
 # class MyPipeline(PipelineABC):
 #     def __init__(self):

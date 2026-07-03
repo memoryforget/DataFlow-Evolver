@@ -1,8 +1,14 @@
 # DataFlow-Evolve —— 整体设计方案与 TODO 文档
 
 > 状态：**M0–M5 已实现并实测打通；M7 奖励锚点 / baseline 作 root / Relative Gain / 数据池准入已接线（默认关闭，受 `baseline.enabled` 开关控制）；M6 健壮性、M7 剩余实测项为后续**
-> 最后更新：2026-06-26
+> 最后更新：2026-07-03
 > 本文档是总体蓝图 + 里程碑清单。设计层面的取舍（交付物定位、奖励、数据池、防泄露）见 [`docs/design-decisions.md`](./docs/design-decisions.md)。
+
+**架构演进说明（2026-07-03）**：
+- PipelineAgent 已从"选择已有算子"模式演进为"**编写自定义算子**"模式。Agent SDK 现在为每个节点在 `operators/` 目录下编写继承 `OperatorABC` 的自定义算子，仅将已有算子作为编码风格参考（通过 MCP 查看源码）。
+- 原 `generating-dataflow-pipeline` 技能已弃用，当前仅使用 `dataflow-dev` 技能（含算子/Pipeline 模板、知识库、已知问题诊断）。
+- 多模型 serving 支持：`pipeline_llm` 配置段现按用途区分（如 `generation` 用 GPT-5.5，`reasoning` 用 DeepSeek-V4-Pro），每个算子根据功能绑定对应 serving 实例。
+- 下文中提及旧技能/旧选择模式的段落为历史设计记录，实际实现以上述演进为准。
 
 ---
 

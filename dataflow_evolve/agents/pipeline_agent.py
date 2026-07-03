@@ -126,16 +126,18 @@ def _read_decision(path: Path) -> dict[str, Any]:
 def _parse_decision(decision: dict[str, Any]) -> tuple[list[dict[str, Any]], str, str]:
     """把 Stage-1 决策 JSON 归一化为 (operators, field_flow, rationale)。
 
-    ops 可能是字符串列表或对象列表，统一成 [{"name", "params"}]。
+    ops 可能是字符串列表或对象列表，统一成 [{"name", "custom", "purpose", "params"}]。
     """
     raw_ops = decision.get("ops", [])
     operators: list[dict[str, Any]] = []
     for op in raw_ops:
         if isinstance(op, str):
-            operators.append({"name": op, "params": {}})
+            operators.append({"name": op, "custom": True, "purpose": "", "params": {}})
         elif isinstance(op, dict):
             operators.append({
                 "name": op.get("name", op.get("operator", "?")),
+                "custom": op.get("custom", True),
+                "purpose": op.get("purpose", ""),
                 "params": op.get("params", {}),
             })
     field_flow = decision.get("field_flow", "")

@@ -15,9 +15,13 @@ llm:
     api_key: ${DF_API_KEY:}   # 通过环境变量注入；或直接写明文密钥（不推荐提交）
     max_workers: 100
   # 生成的 pipeline【算子运行时】LLM（数据合成用），与上面的辅助 Agent 解耦。
-  # 省略的字段逐字段回退到 api 段；整段删掉=行为与旧版一致（全部用 api）。算子合成可用便宜够用的模型。
+  # 按用途区分多个 serving：每个算子根据自身功能绑定对应 serving。
+  # 省略的字段逐字段回退到 api 段；整段删掉=行为与旧版一致（全部用 api）。
   pipeline_llm:
-    model_name: gpt-4o                   # 只换模型，api_url/api_key/max_workers 继承 api
+    generation:                              # 题目/数据生成类算子
+      model_name: gpt-5.5
+    reasoning:                               # 推理/解题/CoT 类算子
+      model_name: deepseek-v4-pro
   vllm:
     hf_model_name_or_path: ${VLLM_MODEL:Qwen/Qwen2.5-7B-Instruct}
     tensor_parallel_size: 1

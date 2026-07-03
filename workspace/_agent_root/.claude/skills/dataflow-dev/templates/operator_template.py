@@ -8,7 +8,7 @@ DataFlow 算子骨架模板
 from typing import TYPE_CHECKING
 
 from dataflow.utils.registry import OPERATOR_REGISTRY
-from dataflow.operators.base import OperatorABC
+from dataflow.core import OperatorABC
 
 # 仅 LLM 驱动算子需要：
 # from dataflow.serving import LLMServingABC
@@ -16,7 +16,7 @@ from dataflow.operators.base import OperatorABC
 
 # ─── 如果算子需要自定义 Prompt，在此定义或 import ───────────────────────────
 # from dataflow.prompts.base import PromptABC, DIYPromptABC, PROMPT_REGISTRY
-# from dataflow.operators.base import prompt_restrict
+# from dataflow.core.prompt import prompt_restrict
 #
 # @PROMPT_REGISTRY.register()
 # class <ClassName>Prompt(DIYPromptABC):

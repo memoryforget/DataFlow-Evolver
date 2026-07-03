@@ -47,29 +47,39 @@ from dataflow_evolve.utils.logging import get_logger, setup_logging
 logger = get_logger("main")
 
 
-def _resolve_pipeline_llm(cfg_llm: Config) -> dict:
-    """解析【pipeline 算子运行时】LLM 配置：`pipeline_llm` 段逐字段回退到 `api` 段。
+def _resolve_pipeline_llm(cfg_llm: Config) -> dict[str, dict]:
+    """解析【pipeline 算子运行时】LLM 配置：`pipeline_llm` 段按用途区分多个 serving。
 
-    与辅助 Agent（Profiler/Review/Diagnostic，走 build_serving(cfg.llm) 用 `api` 段）解耦：
-    算子做海量数据合成可用便宜模型、辅助 Agent 可用更强模型。`pipeline_llm` 省略的字段
-    自动继承 `api`，所以只想换 model_name 时配置里只写一行即可；整段缺省则行为与旧版一致。
+    格式：pipeline_llm.<purpose> 子段（如 generation / reasoning），
+    每个用途省略的字段逐字段回退到 `api` 段。
+    返回 {"purpose": {api_url, model_name, api_key, max_workers}}。
     """
     api = cfg_llm.api
-    pl = cfg_llm.get("pipeline_llm")  # Config | None（缺省回退 api）
+    pl = cfg_llm.get("pipeline_llm")
 
-    def pick(key: str, default=None):
-        if pl is not None:
-            v = pl.get(key, None)
-            if v is not None:
-                return v
-        return api.get(key, default)
+    def _resolve_one(section) -> dict:
+        def pick(key: str, default=None):
+            if section is not None:
+                v = section.get(key, None) if hasattr(section, "get") else None
+                if v is not None:
+                    return v
+            return api.get(key, default)
+        return {
+            "api_url": pick("api_url"),
+            "model_name": pick("model_name"),
+            "api_key": pick("api_key", ""),
+            "max_workers": pick("max_workers", 100),
+        }
 
-    return {
-        "api_url": pick("api_url"),
-        "model_name": pick("model_name"),
-        "api_key": pick("api_key", ""),
-        "max_workers": pick("max_workers", 10),
-    }
+    if pl is None:
+        return {"default": _resolve_one(None)}
+
+    result = {}
+    pl_data = pl._data if hasattr(pl, "_data") else pl
+    for purpose, section_data in pl_data.items():
+        section = Config(section_data) if isinstance(section_data, dict) else None
+        result[purpose] = _resolve_one(section)
+    return result
 
 
 class Orchestrator:
@@ -101,15 +111,25 @@ class Orchestrator:
         # 该 LLM 与辅助 Agent（Profiler/Review/Diagnostic，走上面 build_serving(cfg.llm) 的 api 段）
         # 解耦：算子做海量合成可用便宜模型，辅助 Agent 可用更强模型。见 _resolve_pipeline_llm。
         self.pipeline_llm = _resolve_pipeline_llm(cfg.llm)
-        self.pipeline_env_key = "DF_PIPELINE_API_KEY"   # 流水线运行时从该环境变量取密钥
-        llm_block = (
-            f"   - api_url: {self.pipeline_llm['api_url']}\n"
-            f"   - model_name: {self.pipeline_llm['model_name']}\n"
-            f"   - key_name_of_api_key: {self.pipeline_env_key}\n"
-            f"   - max_workers: {self.pipeline_llm['max_workers']}\n"
-            f"   说明：key_name_of_api_key 是【环境变量名】，运行时框架已在子进程注入该变量，"
-            f"流水线只需引用此名字，切勿写死密钥明文。"
+        # 为每个用途分配独立的环境变量名注入密钥
+        self.pipeline_env_keys: dict[str, str] = {}
+        for purpose in self.pipeline_llm:
+            self.pipeline_env_keys[purpose] = f"DF_PIPELINE_API_KEY_{purpose.upper()}"
+        llm_block_lines = ["   按用途区分的 LLM Serving 配置（pipeline 中声明多个 serving 实例）："]
+        for purpose, llm_cfg in self.pipeline_llm.items():
+            env_key = self.pipeline_env_keys[purpose]
+            llm_block_lines.append(
+                f"   [{purpose}] model={llm_cfg['model_name']}, "
+                f"api_url={llm_cfg['api_url']}, "
+                f"key_name_of_api_key={env_key}, "
+                f"max_workers={llm_cfg['max_workers']}"
+            )
+        llm_block_lines.append(
+            "   说明：key_name_of_api_key 是【环境变量名】，运行时框架已在子进程注入该变量，"
+            "流水线只需引用此名字，切勿写死密钥明文。"
+            "每个算子根据功能绑定对应用途的 serving 实例。"
         )
+        llm_block = "\n".join(llm_block_lines)
         # 从零合成设计：流水线不读输入语料，first_entry 指向一个共享的 0 字节 empty.jsonl
         # （仅满足 DataFlow 的 first_entry 形参）；seed.jsonl 只供 TaskProfiler 建模，不进流水线。
         self.empty_entry_path = self.agent_root / "empty.jsonl"
@@ -127,15 +147,19 @@ class Orchestrator:
             target_samples=target_samples,
         )
 
-        # 引擎——执行流水线的子进程里把【pipeline 算子 LLM】密钥注入约定的环境变量名（DF_PIPELINE_API_KEY）
-        self.pipeline_api_key = self.pipeline_llm["api_key"]
+        # 引擎——执行流水线的子进程里把【pipeline 算子 LLM】密钥注入约定的环境变量名
+        self.pipeline_extra_env: dict[str, str] = {}
+        for purpose, llm_cfg in self.pipeline_llm.items():
+            env_key = self.pipeline_env_keys[purpose]
+            if llm_cfg["api_key"]:
+                self.pipeline_extra_env[env_key] = llm_cfg["api_key"]
         agent_pipeline_filename = cfg.agent_sdk.get("pipeline_filename", "pipeline.py")
         self.pipeline_filename = agent_pipeline_filename
         self.executor = SubprocessExecutionWrapper(
             agent_root=str(self.agent_root),
             pipeline_filename=agent_pipeline_filename,
             timeout_sec=cfg.trainer.get("timeout_sec", 1800),
-            extra_env={self.pipeline_env_key: self.pipeline_api_key} if self.pipeline_api_key else None,
+            extra_env=self.pipeline_extra_env or None,
         )
         # dev 评测驱动 MCTS：trainer.dev_eval_cmd（见设计文档 §3/§6）
         dev_cmd = cfg.trainer.dev_eval_cmd
@@ -264,11 +288,16 @@ class Orchestrator:
         empty_jsonl = node_dir_abs / "empty.jsonl"
         empty_jsonl.write_text("", encoding="utf-8")
 
+        # 基线用 generation 用途的 LLM（或第一个可用的）
+        baseline_purpose = "generation" if "generation" in self.pipeline_llm else next(iter(self.pipeline_llm))
+        baseline_llm = self.pipeline_llm[baseline_purpose]
+        baseline_env_key = self.pipeline_env_keys[baseline_purpose]
+
         adapted = adapt_baseline_source(
             src_path.read_text(encoding="utf-8"),
-            api_url=self.pipeline_llm["api_url"],
-            model_name=self.pipeline_llm["model_name"],
-            key_env=self.pipeline_env_key,
+            api_url=baseline_llm["api_url"],
+            model_name=baseline_llm["model_name"],
+            key_env=baseline_env_key,
             empty_jsonl_path=str(empty_jsonl),
             cache_path=str(node_dir_abs / "cache"),
         )

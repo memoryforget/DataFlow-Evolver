@@ -101,10 +101,10 @@ if TYPE_CHECKING:
 - 是否需要 LLM Serving，并发量要求
 - 是否需要断点续传（BatchedPipelineABC）
 
-### Step 2: 算子选择策略
+### Step 2: 算子策略
 
-优先使用已有算子，参考 `context/knowledge_base.md` §八。
-若为 core_text 算子，参考 `generating-dataflow-pipeline` skill 的算子选择规则。
+编写自定义算子为主，可参考 `context/knowledge_base.md` §八 中 reasoning/math 类别算子的
+源码作为编码风格参考（prompt 构造、LLM 调用模式、响应解析）。不直接复用已有算子。
 
 ### Step 3: 生成代码
 

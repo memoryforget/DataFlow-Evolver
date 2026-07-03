@@ -23,9 +23,9 @@ TaskProfiler ──> TaskProfile
 ```
 
 - **PipelineAgent** 不是普通的 chat API 调用，而是驱动 **Claude Agent SDK**（无头），
-  让 SDK 内的 Claude 借助本地技能 `generating-dataflow-pipeline` / `dataflow-dev`
-  以及 **MCP 动态算子发现**（`dataflow-operators` in-process server）
-  把完整可运行的 DataFlow 流水线 `.py` 写到节点工作目录。
+  让 SDK 内的 Claude 借助本地技能 `dataflow-dev`
+  以及 **MCP 算子源码参考**（`dataflow-operators` in-process server）
+  编写自定义算子并构建完整可运行的 DataFlow 流水线 `.py` 到节点工作目录。
 - **DownstreamTrainerWrapper** 是 **可插拔外部脚本桥接**：框架不内置训练逻辑，
   而是按 I/O 契约子进程调用你提供的"训练+评估"脚本。
 
@@ -106,7 +106,7 @@ cp -r <DataFlow>/dataflow workspace/_agent_root/dataflow
 ```
 
 > `_agent_root/dataflow/` 是上游 DataFlow 的拷贝，会随上游更新而变旧，必要时手动重拷同步。
-> MCP server（`llm/mcp_operators.py`）启动时动态加载 registry，无需手动刷新静态目录。
+> MCP server（`llm/mcp_operators.py`）启动时动态加载 registry，提供已有算子源码供 PipelineAgent 作为编码风格参考。
 
 ---
 
