@@ -29,10 +29,9 @@ train = [
     # --- 推理 ---
     "vllm>=0.6.6,<0.7",
     # --- 工具 ---
-    "math-verify==0.5.2",
     "numpy>=1.26,<2",
     # --- 数学评测：答案等价判定（LIMO grader 依赖） ---
-    # latex2sympy2 会自动安装兼容的 antlr4-python3-runtime
+    # 注意：不包含 math-verify（DataFlow 算子用，但评测脚本不调用）
     "sympy==1.12",
     "latex2sympy2==1.9.1",
     "regex>=2023.0",
