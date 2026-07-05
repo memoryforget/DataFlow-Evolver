@@ -86,17 +86,6 @@ HF_CACHE_DIR = os.environ.get("HF_CACHE_DIR", None)
 MAX_BAD_CASES_PER_BENCH = 10
 SFT_TRAIN_TIMEOUT_SEC = int(os.environ.get("SFT_TRAIN_TIMEOUT_SEC", "21600"))
 TRAIN_RUN_ID = os.environ.get("DF_TRAIN_RUN_ID", "manual")
-TEST_SMALL_BENCHMARKS = ("AIME2024", "AMC23", "CHMath")
-TEST_LARGE_BENCHMARKS = (
-    "GSM8K",
-    "MATH500",
-    "OlympiadBench",
-    "Gaokao",
-    "Kaoyan",
-    "GradeSchool",
-    "MinervaMath",
-    "GPQA",
-)
 
 
 def _node_rank() -> int:
@@ -211,6 +200,7 @@ def _forward_remote_env() -> dict[str, str]:
         "EVAL_",
         "HF_",
         "MATH_",
+        "GLOO_",
         "NCCL_",
         "CUDA_",
         "TORCH_",
@@ -344,8 +334,22 @@ def convert_dataset(src_path: Path, dst_dir: Path) -> Path:
     """将 DataFlow JSONL 转为 LlamaFactory sharegpt 格式的 JSON 文件。
 
     ShareGPT 格式支持多轮对话，每条样本含 conversations: [{from, value}, ...]
+    过滤超过 CUTOFF_LEN 的样本（使用实际 tokenizer 精确计算）
     """
+    from transformers import AutoTokenizer
+
     rows = []
+    filtered_count = 0
+    total_count = 0
+
+    # 初始化 tokenizer（与训练模型一致）
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
+        logger.info("已加载 tokenizer: %s", BASE_MODEL)
+    except Exception as e:
+        logger.warning("无法加载 tokenizer (%s)，回退到粗略估算模式", e)
+        tokenizer = None
+
     with src_path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -355,17 +359,53 @@ def convert_dataset(src_path: Path, dst_dir: Path) -> Path:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            total_count += 1
             # 提取 instruction/question 和 output/answer
             instruction = obj.get("instruction", obj.get("question", obj.get("input", "")))
             output = obj.get("generated_cot", obj.get("output", obj.get("answer", "")))
             if instruction and output:
+                system_prompt = "Please reason step by step, and put your final answer within \\boxed{}."
+
+                # 计算 token 数
+                if tokenizer is not None:
+                    # 精确计算：使用实际 tokenizer
+                    try:
+                        # 模拟实际训练格式
+                        conversation = [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": instruction},
+                            {"role": "assistant", "content": output},
+                        ]
+                        formatted = tokenizer.apply_chat_template(
+                            conversation, tokenize=False, add_generation_prompt=False
+                        )
+                        token_count = len(tokenizer.encode(formatted, add_special_tokens=True))
+                    except Exception as e:
+                        logger.warning("Token 计算失败，跳过样本: %s", e)
+                        filtered_count += 1
+                        continue
+                else:
+                    # 粗略估算（回退模式）
+                    token_count = int((len(system_prompt) + len(instruction) + len(output)) * 0.5)
+
+                # 过滤超长样本
+                if token_count > CUTOFF_LEN:
+                    filtered_count += 1
+                    continue
+
                 # ShareGPT 格式：system prompt + user + assistant
                 conversation = [
-                    {"from": "system", "value": "Please reason step by step, and put your final answer within \\boxed{}."},
+                    {"from": "system", "value": system_prompt},
                     {"from": "human", "value": instruction},
                     {"from": "gpt", "value": output},
                 ]
                 rows.append({"conversations": conversation})
+
+    if filtered_count > 0:
+        logger.warning(
+            "过滤超长样本：%d/%d (%.1f%%) 超过 CUTOFF_LEN=%d",
+            filtered_count, total_count, 100.0 * filtered_count / total_count, CUTOFF_LEN
+        )
 
     if not rows:
         raise ValueError(f"数据集为空或字段不匹配：{src_path}")
@@ -541,26 +581,27 @@ def run_eval(model_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
     """用 vLLM 加载 fine-tuned 模型评测。
 
     mode='dev': MATH train 全量 (7500 条公开训练题，非 benchmark test set) 驱动 MCTS 奖励。
-    mode='test': 完整测试套件，区分小基准（多样本 pass@1）和大基准（单样本贪心）。
+    mode='test': 完整测试套件，统一使用单样本贪心（与 LIMO 论文一致）。
     """
     from vllm import LLM, SamplingParams
-    import math
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from math_benchmarks import (
-        load_gsm8k, gsm8k_prompt, gsm8k_score,
-        load_math500, math500_prompt, math500_score,
-        load_math_train, math_train_prompt, math_train_score,
-        load_aime2024, aime_prompt, aime_score,
-        load_amc23, amc23_prompt, amc23_score,
-        load_chmath, chmath_prompt, chmath_score,
-        load_olympiadbench, olympiadbench_prompt, olympiadbench_score,
-        load_gaokao, gaokao_prompt, gaokao_score,
-        load_kaoyan, kaoyan_prompt, kaoyan_score,
-        load_gradeschool, gradeschool_prompt, gradeschool_score,
-        load_minervamath, minervamath_prompt, minervamath_score,
-        load_gpqa, gpqa_prompt, gpqa_score,
+        load_gsm8k, gsm8k_prompt,
+        load_math500, math500_prompt,
+        load_math_train, math_train_prompt,
+        load_aime2024, aime_prompt,
+        load_amc23, amc23_prompt,
+        load_chmath, chmath_prompt,
+        load_olympiadbench, olympiadbench_prompt,
+        load_gaokao, gaokao_prompt,
+        load_kaoyan, kaoyan_prompt,
+        load_gradeschool, gradeschool_prompt,
+        load_minervamath, minervamath_prompt,
+        load_gpqa, gpqa_prompt,
     )
+    from math_benchmarks.grader import check_is_correct
+    from math_benchmarks.answer_extract import extract_answer
 
     logger.info("加载 vLLM 模型：%s (TP=%d, DP=%d)", model_dir, TP_SIZE, DP_SIZE)
     llm = LLM(
@@ -575,32 +616,26 @@ def run_eval(model_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
     tokenizer = llm.get_tokenizer()
 
     if mode == "test":
-        # 小基准（<50题）：生成 4 个样本，temperature=0.6，计算无偏 pass@1
-        small_benchmarks = [
-            ("AIME2024", load_aime2024, aime_prompt, aime_score),
-            ("AMC23", load_amc23, amc23_prompt, amc23_score),
-            ("CHMath", load_chmath, chmath_prompt, chmath_score),
+        # 所有 benchmark 统一使用单样本贪心（与 LIMO 论文一致）
+        benchmarks = [
+            ("GSM8K", load_gsm8k, gsm8k_prompt),
+            ("AIME2024", load_aime2024, aime_prompt),
+            ("AMC23", load_amc23, amc23_prompt),
+            ("MATH500", load_math500, math500_prompt),
+            ("OlympiadBench", load_olympiadbench, olympiadbench_prompt),
+            ("CHMath", load_chmath, chmath_prompt),
+            ("Gaokao", load_gaokao, gaokao_prompt),
+            ("Kaoyan", load_kaoyan, kaoyan_prompt),
+            ("GradeSchool", load_gradeschool, gradeschool_prompt),
+            ("MinervaMath", load_minervamath, minervamath_prompt),
+            ("GPQA", load_gpqa, gpqa_prompt),
         ]
-        # 大基准（≥50题）：单次贪心，temperature=0
-        large_benchmarks = [
-            ("GSM8K", load_gsm8k, gsm8k_prompt, gsm8k_score),
-            ("MATH500", load_math500, math500_prompt, math500_score),
-            ("OlympiadBench", load_olympiadbench, olympiadbench_prompt, olympiadbench_score),
-            ("Gaokao", load_gaokao, gaokao_prompt, gaokao_score),
-            ("Kaoyan", load_kaoyan, kaoyan_prompt, kaoyan_score),
-            ("GradeSchool", load_gradeschool, gradeschool_prompt, gradeschool_score),
-            ("MinervaMath", load_minervamath, minervamath_prompt, minervamath_score),
-            ("GPQA", load_gpqa, gpqa_prompt, gpqa_score),
-        ]
-        assert tuple(name for name, *_ in small_benchmarks) == TEST_SMALL_BENCHMARKS
-        assert tuple(name for name, *_ in large_benchmarks) == TEST_LARGE_BENCHMARKS
         metric_name = "math_test_avg_accuracy"
     else:
         # dev mode: MATH train 全量，单样本贪心
         math_train_path = os.environ.get("MATH_TRAIN_PATH", None)
-        small_benchmarks = []
-        large_benchmarks = [
-            ("MATH-train", lambda **kw: load_math_train(data_path=math_train_path, **kw), math_train_prompt, math_train_score),
+        benchmarks = [
+            ("MATH-train", lambda **kw: load_math_train(data_path=math_train_path, **kw), math_train_prompt),
         ]
         metric_name = "math_train_accuracy"
 
@@ -608,86 +643,14 @@ def run_eval(model_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
     all_bad_cases: list[dict] = []
     detail = {}
 
-    # 处理小基准：多样本 pass@1
-    for bench_name, load_fn, prompt_fn, score_fn in small_benchmarks:
-        logger.info("评测 %s (多样本 pass@1) ...", bench_name)
-        examples = load_fn(cache_dir=HF_CACHE_DIR)
-        if not examples:
-            raise RuntimeError(f"{bench_name} 数据集为空")
-
-        # 构造 prompts
-        prompts = []
-        for ex in examples:
-            user_msg = _user_prompt_for(ex, prompt_fn)
-            conversation = [
-                {"role": "system", "content": _system_prompt_for(bench_name, ex)},
-                {"role": "user", "content": user_msg},
-            ]
-            prompt_text = tokenizer.apply_chat_template(
-                conversation, tokenize=False, add_generation_prompt=True
-            )
-            prompts.append(prompt_text)
-
-        # 生成 4 个样本（temperature=0.6）
-        params_multi = SamplingParams(
-            n=4,  # 每个 prompt 生成 4 个样本
-            temperature=0.6,
-            top_p=0.95,
-            top_k=20,
-            presence_penalty=1.5,
-            max_tokens=MAX_NEW_TOKENS,
-            stop_token_ids=[151643, 151645],
-        )
-        outputs = llm.generate(prompts, params_multi)
-
-        # 计算无偏 pass@1
-        correct_count = 0
-        bad_cases = []
-        for out, ex in zip(outputs, examples):
-            # 获取该问题的 4 个样本
-            samples = [o.text for o in out.outputs]
-            # 逐个判断是否正确
-            correctness = []
-            for sample in samples:
-                acc, _ = score_fn([sample], [ex])
-                correctness.append(acc > 0.5)  # acc=1.0 表示正确
-
-            # 无偏 pass@1 估计：1 - C(n-c, k) / C(n, k)
-            # 其中 n=4（总样本数），c=sum(correctness)（正确样本数），k=1
-            c = sum(correctness)
-            n = len(correctness)
-            k = 1
-            if c == 0:
-                pass_at_1 = 0.0
-                # 记录 bad case（取第一个样本）
-                bad_cases.append({
-                    "input": ex["question"],
-                    "prediction": samples[0],
-                    "ground_truth": ex["gold_answer"],
-                    "error_type": "wrong_answer",
-                })
-            else:
-                # pass@1 = 1 - C(n-c, k) / C(n, k)
-                pass_at_1 = 1.0 - (math.comb(n - c, k) / math.comb(n, k))
-
-            correct_count += pass_at_1
-
-        accuracy = correct_count / len(examples) if examples else 0.0
-        scores.append(accuracy)
-        for bc in bad_cases[:MAX_BAD_CASES_PER_BENCH]:
-            bc["error_type"] = f"{bench_name}:{bc.get('error_type', 'wrong_answer')}"
-            all_bad_cases.append(bc)
-        detail[bench_name] = {"accuracy": accuracy, "total": len(examples), "method": "pass@1"}
-        logger.info("%s pass@1: %.4f (%d 条)", bench_name, accuracy, len(examples))
-
-    # 处理大基准：单样本贪心
+    # 单样本贪心参数（与 LIMO 论文一致）
     params_single = SamplingParams(
         temperature=0,
         max_tokens=MAX_NEW_TOKENS,
         stop_token_ids=[151643, 151645],
     )
 
-    for bench_name, load_fn, prompt_fn, score_fn in large_benchmarks:
+    for bench_name, load_fn, prompt_fn in benchmarks:
         logger.info("评测 %s (单样本贪心) ...", bench_name)
         examples = load_fn(cache_dir=HF_CACHE_DIR)
         if not examples:
@@ -710,11 +673,36 @@ def run_eval(model_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
         outputs = llm.generate(prompts, params_single)
         predictions = [out.outputs[0].text for out in outputs]
 
-        accuracy, bad_cases = score_fn(predictions, examples)
+        # 使用 LIMO grader 进行答案比较
+        correct_count = 0
+        bad_cases = []
+        for pred_text, ex in zip(predictions, examples):
+            # 提取答案
+            pred_answer = extract_answer(pred_text, mode="auto")
+            gold_answer = ex.get("answer") or ex.get("gold_answer", "")
+
+            # 使用 LIMO 的 math_equal 判定
+            is_correct = check_is_correct(pred_answer, gold_answer, timeout=True)
+
+            if is_correct:
+                correct_count += 1
+            else:
+                bad_cases.append({
+                    "input": ex["question"],
+                    "prediction": pred_text,
+                    "extracted_answer": pred_answer,
+                    "ground_truth": gold_answer,
+                    "error_type": "wrong_answer",
+                })
+
+        accuracy = correct_count / len(examples) if examples else 0.0
         scores.append(accuracy)
+
+        # 记录前 MAX_BAD_CASES_PER_BENCH 个 bad cases
         for bc in bad_cases[:MAX_BAD_CASES_PER_BENCH]:
             bc["error_type"] = f"{bench_name}:{bc.get('error_type', 'wrong_answer')}"
             all_bad_cases.append(bc)
+
         detail[bench_name] = {"accuracy": accuracy, "total": len(examples), "method": "greedy"}
         logger.info("%s accuracy: %.4f (%d 条)", bench_name, accuracy, len(examples))
 
