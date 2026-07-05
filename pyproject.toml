@@ -31,8 +31,8 @@ train = [
     # --- 工具 ---
     "numpy>=1.26,<2",
     # --- 数学评测：答案等价判定（LIMO grader 依赖） ---
-    # 注意：不包含 math-verify（DataFlow 算子用，但评测脚本不调用）
-    "sympy==1.12",
+    # 注意：torch 2.5.x 要求 sympy==1.13.1，与 LIMO 的 1.12 不同但兼容
+    "sympy",  # 让 torch 决定版本
     "latex2sympy2==1.9.1",
     "regex>=2023.0",
 ]
