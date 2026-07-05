@@ -89,6 +89,8 @@ def test_build_remote_worker_ssh_cmd_contains_expected_env_and_args(tmp_path, mo
     monkeypatch.setenv("MASTER_ADDR", "10.0.0.1")
     monkeypatch.setenv("MASTER_PORT", "29500")
     monkeypatch.setenv("SFT_NUM_GPUS", "16")
+    monkeypatch.setenv("GLOO_SOCKET_IFNAME", "eth2")
+    monkeypatch.setenv("NCCL_SOCKET_IFNAME", "eth2")
     monkeypatch.setenv("REMOTE_CWD", "/shared/DataFlow-Evolve")
     monkeypatch.setenv("SSH_OPTS", "-p 2222")
     monkeypatch.setenv("SFT_REMOTE_PYTHON", "/opt/conda/envs/df-train/bin/python")
@@ -101,6 +103,8 @@ def test_build_remote_worker_ssh_cmd_contains_expected_env_and_args(tmp_path, mo
     assert "NODE_RANK=1" in remote_str
     assert "MASTER_ADDR=10.0.0.1" in remote_str
     assert "NNODES=2" in remote_str
+    assert "GLOO_SOCKET_IFNAME=eth2" in remote_str
+    assert "NCCL_SOCKET_IFNAME=eth2" in remote_str
     assert "--mode" in remote_str and "test" in remote_str
     assert str(dataset.resolve()) in remote_str
 
