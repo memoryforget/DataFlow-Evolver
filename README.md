@@ -128,9 +128,12 @@ cd <DataFlow> && pip install -e .
 
 ## 运行
 export IS_SANDBOX=1
-export ANTHROPIC_BASE_URL=
+export HF_HOME="./hf_cache"
+export ANTHROPIC_BASE_URL=http://123.129.219.111:3000
 export ANTHROPIC_API_KEY=
 export DF_API_KEY=
+export NCCL_SOCKET_IFNAME=eth2
+export GLOO_SOCKET_IFNAME=eth2
 ```bash
 python -m dataflow_evolve.main \
   --config configs/default.yaml \
