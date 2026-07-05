@@ -175,7 +175,7 @@ python -m dataflow_evolve.main \
 
 ## 数学 SFT 下游链路（LlamaFactory + Math Benchmark）
 
-当前已配置的 Phase-2 真实链路：**Full SFT + 三 Math Bench 评测**。
+当前已配置的 Phase-2 真实链路：**Full SFT + 完整数学/科学 benchmark suite 评测**。
 
 ### 安装训练/评测依赖
 
@@ -199,14 +199,20 @@ uv pip install -e ".[train]" \
 | `SFT_NUM_GPUS` | `16` | 训练**集群总卡数**（torchrun；双机每机 8 卡）；`NPROC_PER_NODE = SFT_NUM_GPUS // NNODES` |
 | `EVAL_TP_SIZE` | `2` | vLLM 推理 tensor parallel size |
 | `EVAL_DP_SIZE` | `4` | vLLM 推理 data parallel size（eval 只在 rank0 单机跑，`TP×DP=8`=本机卡数） |
-| `EVAL_MAX_MODEL_LEN` | `131072` | vLLM 最大序列长度（Qwen2.5-32B 上下文窗口） |
-| `EVAL_MAX_NEW_TOKENS` | `32768` | 评测推理最大生成 token 数（LIMO 硬截断） |
+| `EVAL_MAX_MODEL_LEN` | `65536` | vLLM 最大序列长度（Qwen2.5-32B 上下文窗口） |
+| `EVAL_MAX_NEW_TOKENS` | `8192` | 评测推理最大生成 token 数 |
 | `MATH_TRAIN_PATH` | `data/math_train.jsonl` | dev 评测题库路径（MATH competition train 7500 条） |
 | `HF_CACHE_DIR` | `None` | HuggingFace datasets 缓存目录 |
+| `BENCHMARK_ROOT` | `data/benchmarks/limo_eval` | 仓库内固定 benchmark 根目录约定，不是运行时配置项 |
 
 > **双机执行模型**：`run_sft` 是 torchrun 分布式作业，两机(rank0/rank1)都参与；`convert_dataset` 与
 > `run_eval` 只在 **rank0** 执行——rank1 训练完即退出，不重复评测、不竞态写 `results.json`。eval 的 vLLM
 > 推理在 rank0 **单机 8 卡**跑（32B bf16 权重≈64GB，单机 640GB 显存放得下，训练才需双机 ZeRO-3）。
+
+> `BENCHMARK_ROOT` 这里是文档里的目录约定名，不是代码会读取的环境变量或 YAML 配置项。
+> test 模式 benchmark 现在只读取项目内固定相对路径，不再通过环境变量或 HF fallback 动态找数据。
+> 目录命名固定为：`aime`、`amc`、`math`、`gsm8k`、`cn_math_2024`、`gaokao`、`kaoyan`、`grade_school_math`、`minerva`、`olympiadbench`、`gpqa`。
+> 如果你要替换 benchmark，只需要覆盖 `data/benchmarks/limo_eval/<bench>/test.jsonl`。
 
 ### 运行方式
 
@@ -216,16 +222,16 @@ uv pip install -e ".[train]" \
 # dev 模式（MCTS 迭代，框架自动调用）：MATH train 全量 7500 题
 python scripts/llamafactory_math_sft_eval.py --mode dev --dataset <ds.jsonl> --output <out_dir>
 
-# test 模式（终评，手动调用一次）：跑 GSM8K test + MATH-500 + AIME 2024
+# test 模式（终评，手动调用一次）：跑完整 benchmark suite
 python scripts/llamafactory_math_sft_eval.py --mode test --dataset <ds.jsonl> --output <out_dir>
 ```
 
 内部流程：
-1. **格式转换**：DataFlow JSONL (`instruction` + `generated_cot`) → LlamaFactory alpaca 格式
-2. **Full SFT**：Qwen3.5-9B + DeepSpeed ZeRO-2（8 GPU），全量微调
+1. **格式转换**：DataFlow JSONL (`instruction` + `generated_cot`) → LlamaFactory ShareGPT 格式
+2. **Full SFT**：Qwen2.5-32B + DeepSpeed ZeRO-3（双机 16 GPU），全量微调
 3. **评测**：vLLM 加载 fine-tuned 模型推理+判分（Qwen2.5-Math prompt 格式）
    - dev：MATH train 全量（7500 条公开竞赛训练题，非 benchmark test set）
-   - test：GSM8K test (1319) + MATH-500 (500) + AIME 2024 (30)
+   - test：GSM8K + AIME2024 + MATH500 + AMC23 + OlympiadBench + CHMath + Gaokao + Kaoyan + GradeSchool + MinervaMath + GPQA
 4. **输出**：bench 平均 accuracy 作为 `score` 写入 `results.json`
 
 ### 双机训练部署（`dispatch: ssh`）
@@ -233,9 +239,14 @@ python scripts/llamafactory_math_sft_eval.py --mode test --dataset <ds.jsonl> --
 LIMO 配置的 Qwen2.5-32B Full SFT 需**双机 16 卡**。但 MCTS 编排器是 node0 上的单进程，
 无法直接驱动双机 torchrun（node1 上没有进程会合，会卡在 rendezvous 直到超时）。
 
-解决方式：**免密 SSH 拉起**。编排器每轮训练时本机拉起 rank0，同时经免密 SSH 到 node1 后台拉起
-rank1，两边靠 torchrun rendezvous 会合完成双机训练。要求两机之间有**共享文件系统**
-（NFS/Lustre/GPFS 等，dataset/output 路径两机一致）+ **免密 SSH**。
+解决方式：**免密 SSH 拉起**。当前职责边界是：
+- 编排器只负责把 pipeline 产出的数据路径交给训练脚本；
+- 训练脚本在 node0 内部先做 `convert_dataset`；
+- 然后由训练脚本自己经免密 SSH 到 node1 拉起 worker，再本地进入 rank0 训练；
+- 训练完成后只在 rank0 单机做 dev/test 评测。
+
+要求两机之间有**共享文件系统**（NFS/Lustre/GPFS 等，dataset/output 路径两机一致）+
+**免密 SSH**。
 
 **1. 打开 ssh 调度**（`configs/default.yaml`）：
 
@@ -248,18 +259,21 @@ trainer:
     master_port: 29500
     nnodes: 2
     gpus_per_node: 8                   # 每机 GPU 数
-    remote_cwd: /shared/DataFlow-Evolve  # node1 上项目根（共享 FS 通常同路径）；留空=编排器 cwd
+    remote_cwd: /shared/DataFlow-Evolve  # node1 上先 cd 到这个项目目录，再执行 scripts/llamafactory_math_sft_eval.py；留空=编排器 cwd
     ssh_opts: ""                       # 额外 ssh 选项，如 "-i ~/.ssh/id_rsa -p 22"
 ```
 
 也可用环境变量注入：`NODE1_HOST` / `MASTER_ADDR` / `REMOTE_CWD`。
+其中 `REMOTE_CWD` 只是远端 worker 的工作目录；如果 node0/node1 项目绝对路径完全一致，通常可以直接留空，默认复用 node0 启动时的 cwd。
 
 **2. 在 node0 起编排器**（照常，`python -m dataflow_evolve.main ...`）。node1 上**无需**起任何常驻进程
-——编排器会在每轮训练时自动 SSH 到 node1 拉起 rank1。
+——训练脚本会在每轮训练时自动 SSH 到 node1 拉起 worker。
 
-编排器内部为两侧训练子进程设好 `NODE_RANK`（rank0=0 / rank1=1）、`MASTER_ADDR` / `MASTER_PORT` /
-`NNODES` / `SFT_NUM_GPUS`（=gpus_per_node×nnodes 集群总卡数）等分布式 env，修掉了 eval 脚本原本
-`NODE_RANK`/`MASTER_ADDR` 缺失的问题。node1 侧日志落 `<output>/train_node1.log`（共享 FS 可见）。
+编排器只负责给 node0 训练脚本注入 `NODE_RANK=0`、`MASTER_ADDR` / `MASTER_PORT` /
+`NNODES` / `SFT_NUM_GPUS` / `NODE1_HOST` / `REMOTE_CWD` / `SSH_OPTS` 等环境变量。当前脚本会：
+- 只在 rank0 / node0 做数据格式转换；
+- convert 完成后由 node0 脚本内部先 SSH 拉起 node1 worker，再本地进入 rank0 训练；
+- 训练日志流式落盘到 `<output>/sft_train_rank0.log` 与 `<output>/sft_train_rank1.log`，node1 外层 SSH 日志落 `<output>/train_node1.log`。
 
 要点与容错：
 - 双机需 100G+ RoCE/InfiniBand 互连，否则 ZeRO-3 通信成瓶颈（脚本 docstring 已注明）。
@@ -272,9 +286,9 @@ trainer:
 `configs/default.yaml` 的 trainer 块有两个独立超时：
 
 - `timeout_sec: 3600`（1h）——**流水线执行**（纯数据合成）超时，由执行器使用；数据合成通常几分钟完成。
-- `train_timeout_sec: 25200`（7h）——**dev/test 评测**（含内层 Full SFT 训练 + 三 bench 推理）超时。
+- `train_timeout_sec: 28800`（8h）——**dev/test 评测**（含内层 Full SFT 训练 + benchmark suite 推理）超时。
 
-内层 `llamafactory_math_sft_eval.py` 的 SFT 训练子进程有 6h 超时（脚本内 `torchrun`），故外层 7h > 内层 6h + 评测，训练能完整跑完。每轮 MCTS 迭代调用一次 `dev_eval_cmd`；超过 `train_timeout_sec` 则强制终止进程树并标记该节点 `failed`，不阻塞主循环。
+内层 `llamafactory_math_sft_eval.py` 的 SFT 训练子进程有 6h 超时（脚本内 `torchrun`），故外层 8h > 内层 6h + 评测，训练能完整跑完。每轮 MCTS 迭代调用一次 `dev_eval_cmd`；超过 `train_timeout_sec` 则强制终止进程树并标记该节点 `failed`，不阻塞主循环。
 
 ### 评测 Benchmark 详情
 
@@ -283,8 +297,16 @@ trainer:
 | GSM8K | 1319 | 小学-初中 | `#### <number>` | 数值精确匹配 |
 | MATH-500 | 500 | 高中竞赛 | `\boxed{...}` | LaTeX 语义等价（math_verify） |
 | AIME 2024 | 30 | 竞赛级 | 整数 0-999 | 整数精确匹配 |
+| AMC23 | 取决于配置数据源 | 竞赛级 | 整数或字母 | 数值/字母精确匹配 |
+| OlympiadBench | 取决于配置数据源 | 竞赛级 | `\boxed{...}` / LaTeX | LaTeX 语义等价 |
+| CHMath | 取决于配置数据源 | 中文数学 | `\boxed{...}` / LaTeX | LaTeX 语义等价 |
+| Gaokao | 取决于配置数据源 | 高中 | `\boxed{...}` / LaTeX | LaTeX 语义等价 |
+| Kaoyan | 取决于配置数据源 | 大学/考研 | `\boxed{...}` / LaTeX | LaTeX 语义等价 |
+| GradeSchool | 取决于配置数据源 | 小学数学 | `#### <number>` / 数值 | 数值精确匹配 |
+| MinervaMath | 取决于配置数据源 | 高难数学 | `\boxed{...}` / LaTeX | LaTeX 语义等价 |
+| GPQA | 取决于配置数据源 | 科学问答 | 选项字母 / 答案文本 | 多选题精确匹配 |
 
-最终 `score = mean(gsm8k_acc, math500_acc, aime_acc)`。
+最终 `score = mean(all_configured_benchmark_scores)`；test 模式要求整套 benchmark 都成功加载，缺任何一个就直接失败，不再静默跳过。
 
 ---
 

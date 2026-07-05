@@ -65,7 +65,7 @@ def build_prompt(question: str) -> str:
 
 
 # Qwen2.5-Math 评测用的 system prompt
-SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}"
+SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}."
 
 
 def score_predictions(

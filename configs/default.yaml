@@ -78,13 +78,13 @@ trainer:
   # 防数据泄露纪律（见 docs/design-decisions.md §3）：
   #   dev：仅给 MCTS 当奖励信号，允许被「刷」；test：全程对 loop 不可见，仅终评一次。
   dev_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode dev     # Full SFT + MATH train 7500 题评测
-  test_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode test   # 终评：GSM8K test + MATH-500 + AIME
+  test_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode test   # 终评：完整 benchmark suite（GSM8K/AIME/MATH500/AMC23/OlympiadBench/CHMath/Gaokao/Kaoyan/GradeSchool/MinervaMath/GPQA）
   timeout_sec: 3600                                             # 流水线执行（纯数据合成）超时；约几分钟完成，1h 足够
-  train_timeout_sec: 25200                                      # dev/test 评测（含内层 Full SFT 训练 6h + 三 bench 评测）超时=7h
+  train_timeout_sec: 28800                                      # dev/test 评测（含内层 Full SFT 训练 6h + benchmark suite 评测）超时=8h
   # 训练调度方式：
   #   local（默认）：编排器在本机拉起训练子进程，阻塞等待（单机）。
-  #   ssh：编排器每轮训练时本机拉起 rank0，同时经免密 SSH 到 node1 拉起 rank1，
-  #        torchrun 会合完成双机训练（前提：两机共享文件系统 + 免密 SSH）。见 README 双机部署。
+  #   ssh：编排器只在 node0 拉起一次训练脚本；脚本内部完成 convert_dataset、
+  #        经免密 SSH 拉起 node1 worker、双机 torchrun 训练，以及 rank0 单机评测。
   dispatch: local
   # dispatch=ssh 时的双机参数：
   ssh:

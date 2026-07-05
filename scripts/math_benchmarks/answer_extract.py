@@ -3,6 +3,7 @@
 支持：
 - \boxed{} 提取
 - #### <number> 提取 (GSM8K 格式)
+- 多选题字母答案提取
 - 末尾数值提取
 - 数值/表达式语义等价判定
 """
@@ -45,19 +46,37 @@ def extract_last_number(text: str) -> str | None:
     return None
 
 
+def extract_choice_letter(text: str) -> str | None:
+    """提取多选题字母答案（A-E）。"""
+    patterns = [
+        r"(?i)(?:final answer|answer|option|choice)\s*(?:is|:)?\s*\(?([A-E])\)?(?:[\s\.,;!]|$)",
+        r"(?i)\b([A-E])\b\s*(?:is correct|is the correct answer)",
+        r"(?i)\(([A-E])\)\s*$",
+        r"(?i)\b([A-E])\b\s*$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text.strip())
+        if match:
+            return match.group(1).upper()
+    return None
+
+
 def extract_answer(text: str, mode: str = "auto") -> str | None:
     """根据模式提取答案。
 
     mode:
         "boxed"  - 只提取 \\boxed{}
         "gsm8k"  - 只提取 #### <number>
+        "choice" - 只提取多选题字母答案（A-E）
         "number" - 只提取末尾数值
-        "auto"   - 依次尝试 boxed → gsm8k → number
+        "auto"   - 依次尝试 boxed → gsm8k → choice → number
     """
     if mode == "boxed":
         return extract_boxed(text)
     elif mode == "gsm8k":
         return extract_gsm8k_answer(text)
+    elif mode == "choice":
+        return extract_choice_letter(text)
     elif mode == "number":
         return extract_last_number(text)
     else:
@@ -65,6 +84,9 @@ def extract_answer(text: str, mode: str = "auto") -> str | None:
         if result is not None:
             return result
         result = extract_gsm8k_answer(text)
+        if result is not None:
+            return result
+        result = extract_choice_letter(text)
         if result is not None:
             return result
         return extract_last_number(text)

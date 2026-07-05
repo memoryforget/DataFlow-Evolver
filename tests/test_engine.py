@@ -177,8 +177,8 @@ def test_ssh_trainer_missing_script_degrades(tmp_path):
     assert result.error_msg is not None
 
 
-def test_ssh_trainer_builds_remote_command(tmp_path, monkeypatch):
-    """nnodes=2：验证 SSH 命令构造正确（rank1 带 NODE_RANK=1 等分布式 env），不真连 node1。"""
+def test_ssh_trainer_passes_cluster_env_to_launcher(tmp_path, monkeypatch):
+    """nnodes=2：框架只本地拉一次 node0 脚本，并把集群信息注入环境变量。"""
     ds = tmp_path / "ds.jsonl"
     ds.write_text('{"instruction":"q","answer":"a"}\n', encoding="utf-8")
     out = tmp_path / "out"
@@ -186,20 +186,10 @@ def test_ssh_trainer_builds_remote_command(tmp_path, monkeypatch):
 
     real_popen = subprocess.Popen
 
-    class _FakeRemote:
-        pid = -1
-        def wait(self, timeout=None):
-            return 0
-
     def fake_popen(cmd, *args, **kwargs):
-        # SSH 远端拉起：命令首 token 是 "ssh"
-        if isinstance(cmd, list) and cmd and cmd[0] == "ssh":
-            captured["ssh_cmd"] = cmd
-            fr = _FakeRemote()
-            # _launch_remote 会给 proc 挂 _logfile；这里补一个可关闭对象
-            fr._logfile = kwargs.get("stdout")
-            return fr
-        # rank0 本机：让 reference 脚本真跑，产出 results.json
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env")
+        assert not (isinstance(cmd, list) and cmd and cmd[0] == "ssh")
         return real_popen(cmd, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
@@ -208,16 +198,16 @@ def test_ssh_trainer_builds_remote_command(tmp_path, monkeypatch):
     wrapper = _ssh_wrapper(cmd, nnodes=2, timeout_sec=60, node1_host="user@10.0.0.2")
     result = wrapper.run(str(ds), str(out))
 
-    assert result.failed is False           # rank0 本机跑通
-    ssh_cmd = captured.get("ssh_cmd")
-    assert ssh_cmd is not None, "应经 SSH 拉起 rank1"
-    assert ssh_cmd[0] == "ssh"
-    assert "user@10.0.0.2" in ssh_cmd
-    remote_str = ssh_cmd[-1]
-    assert "NODE_RANK=1" in remote_str
-    assert "MASTER_ADDR=127.0.0.1" in remote_str
-    assert "NNODES=2" in remote_str
-    assert "--dataset" in remote_str and "--output" in remote_str
+    assert result.failed is False
+    launcher_cmd = captured.get("cmd")
+    env = captured.get("env")
+    assert launcher_cmd is not None and env is not None
+    assert str(REF_SCRIPT) in " ".join(str(x) for x in launcher_cmd)
+    assert env["NODE_RANK"] == "0"
+    assert env["MASTER_ADDR"] == "127.0.0.1"
+    assert env["NNODES"] == "2"
+    assert env["NODE1_HOST"] == "user@10.0.0.2"
+    assert env["SFT_REMOTE_PYTHON"] == sys.executable
 
 
 def test_ssh_trainer_times_out(tmp_path):
