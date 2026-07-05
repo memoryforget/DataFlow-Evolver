@@ -31,6 +31,10 @@ train = [
     # --- 工具 ---
     "math-verify>=0.5",
     "numpy>=1.26,<2",
+    # --- 数学评测：答案等价判定（LIMO grader 依赖） ---
+    "sympy>=1.12",
+    "latex2sympy2>=1.9",
+    "regex>=2023.0",
 ]
 
 [build-system]
