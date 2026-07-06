@@ -83,7 +83,7 @@ DP_SIZE = int(os.environ.get("EVAL_DP_SIZE", "4"))
 MAX_MODEL_LEN = int(os.environ.get("EVAL_MAX_MODEL_LEN", "65536"))  # Qwen2.5-32B 上下文窗口
 MAX_NEW_TOKENS = int(os.environ.get("EVAL_MAX_NEW_TOKENS", "8192"))  # 评测生成长度上限
 HF_CACHE_DIR = os.environ.get("HF_CACHE_DIR", None)
-MAX_BAD_CASES_PER_BENCH = 10
+MAX_BAD_CASES_PER_BENCH = 30
 SFT_TRAIN_TIMEOUT_SEC = int(os.environ.get("SFT_TRAIN_TIMEOUT_SEC", "21600"))
 TRAIN_RUN_ID = os.environ.get("DF_TRAIN_RUN_ID", "manual")
 
