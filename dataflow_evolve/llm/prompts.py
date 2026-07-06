@@ -70,8 +70,24 @@ Entry file（空输入）: {entry_path}
 写自定义算子时，可用 MCP get_operator_detail 查看 reasoning 类别的已有算子源码作为编码风格参考。"""
 
 PIPELINE_SELFCORRECT_PROMPT = """上一次生成的流水线 `{node_dir}/pipeline.py` 执行时崩溃了。\
-请用 `dataflow-dev` 的 `known_issues.md` 报错速查表匹配下面的错误并修复。\
-如有需要，用 Read 工具查看 `{node_dir}/operators/` 下的自定义算子源码确认 API 签名。\
+请用 `dataflow-dev` 的 `known_issues.md` 报错速查表匹配下面的错误并修复。
+
+**诊断步骤**：
+1. 先读取 `.claude/skills/dataflow-dev/diagnostics/known_issues.md` 匹配错误关键词
+2. 如果命中 Issue #010（LLM API）或 #011（FileStorage），直接应用 Issue 中的修复示例
+3. 如果不确定 API 签名，查阅 DataFlow 源码确认：
+   - FileStorage API: `dataflow/utils/storage.py`
+   - LLM Serving API: `dataflow/serving/api_llm_serving_request.py`
+   - OperatorABC: `dataflow/core/operator.py`
+4. 用 Read 工具查看 `{node_dir}/operators/` 下的自定义算子源码确认问题位置
+
+**常见错误快速修复**：
+- `FileStorage.write() takes 2 positional arguments but 3 were given`
+  → 修复：`storage.write(df)` (删除第二个参数)
+
+- `'APILLMServing_request' object has no attribute 'request'`
+  → 修复：`self.llm_serving.generate_from_input(user_inputs=..., system_prompt=...)`
+
 修复后覆盖写回对应文件（pipeline.py 或 operators/ 下的算子文件），然后运行 \
 `DF_COMPILE_ONLY=1 python {node_dir}/pipeline.py` 验证 compile 通过。
 
@@ -190,7 +206,18 @@ PIPELINE_REVIEW_SELFCORRECT_PROMPT = """上一次生成的流水线 `{node_dir}/
 逐 step 追踪数据质量是从哪一步（哪个算子）开始变坏的——既包括行数骤减/变空，也包括行数没变但\
 **内容劣化**（某字段从有值变 null/空、schema 不符、跑题等）——据此判断是哪个算子的逻辑或 prompt 有问题并修复它。
 
-如有需要，用 Read 工具查看 `{node_dir}/operators/` 下的自定义算子源码。\
+【DataFlow 源码参考】如果不确定 API 用法，可以查阅 DataFlow 源码确认：
+- LLM Serving API 签名: `dataflow/serving/api_llm_serving_request.py`
+- FileStorage API: `dataflow/utils/storage.py`
+- Operator 基类: `dataflow/core/operator.py`
+- 已有算子实现参考: `dataflow/operators/reasoning/` (数学推理类算子)
+
+常见数据质量问题修复方向：
+1. **字段为空/null**：检查对应算子的 LLM prompt 是否明确要求输出该字段
+2. **LLM 返回 None**：检查是否正确处理 API 失败（`[r if r is not None else '' for r in responses]`）
+3. **内容跑题**：检查 system_prompt 和 prompt 模板是否约束足够强
+4. **格式不符**：检查响应解析逻辑（如 JSON 提取、正则匹配）
+
 修复后运行 `DF_COMPILE_ONLY=1 python {node_dir}/pipeline.py` 验证 compile 通过。
 
 约束：无头运行，禁止交互式询问（AskUserQuestion）与 git/gh 子流程。只修复数据质量、保持目标不变。"""

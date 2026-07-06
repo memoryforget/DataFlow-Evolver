@@ -17,14 +17,16 @@ logger = get_logger("llm.agent_sdk")
 _DEFAULT_SYSTEM_PROMPT_APPEND = (
     "You write DataFlow pipelines with CUSTOM operators for Math SFT.\n\n"
 
-    "## CRITICAL: Read DataFlow Development Guide FIRST\n"
-    "Before writing ANY code, you MUST read the DataFlow development guide:\n"
-    "1. Read `.claude/skills/dataflow-dev/diagnostics/known_issues.md` for common API errors\n"
-    "2. Key facts from the guide:\n"
-    "   - FileStorage.write() takes ONLY ONE argument: `storage.write(df)`\n"
-    "   - LLM serving uses: `self.llm_serving.generate_from_input(user_inputs=list[str], system_prompt=str)`\n"
-    "   - storage.step() usage: `op.run(storage=self.storage.step(), ...)`\n"
-    "   - Import from parent module: `from dataflow.operators.reasoning import OpName`\n\n"
+    "## CRITICAL: Read API Reference FIRST\n"
+    "Before writing ANY code, you MUST read:\n"
+    "1. `.claude/skills/dataflow-dev/templates/operator_api_reference.md` - Complete operator example with correct APIs\n"
+    "2. `.claude/skills/dataflow-dev/diagnostics/known_issues.md` - Common API errors and fixes\n\n"
+
+    "Key facts you'll learn:\n"
+    "- FileStorage.write() takes ONLY ONE argument: `storage.write(df)`\n"
+    "- LLM serving uses: `self.llm_serving.generate_from_input(user_inputs=list[str], system_prompt=str)`\n"
+    "- Operator run() must return list of output keys: `return ['output_key']`\n"
+    "- Handle None responses: `[r if r is not None else '' for r in responses]`\n\n"
 
     "## Step 1: Design Custom Operators\n"
     "For each processing step, write a dedicated operator class:\n"
@@ -37,15 +39,14 @@ _DEFAULT_SYSTEM_PROMPT_APPEND = (
     "- Do NOT use @OPERATOR_REGISTRY.register() — custom ops skip registry\n"
     "- Each operator in its own file under operators/ in the node workspace\n\n"
 
-    "## Critical API Examples (Copy Exactly):\n"
+    "## Critical API Examples (Copy from operator_api_reference.md):\n"
     "```python\n"
     "# FileStorage API - ONLY ONE ARGUMENT\n"
     "def run(self, storage, input_key='text', output_key='result'):\n"
     "    df = storage.read('dataframe')\n"
     "    # ... process ...\n"
     "    storage.write(df)  # ✓ Correct - ONE argument only\n"
-    "    # storage.write(df, 'dataframe')  # ✗ WRONG - will crash!\n"
-    "    return [output_key]\n\n"
+    "    return [output_key]  # ✓ Must return output keys\n\n"
 
     "# LLM Serving API - use generate_from_input()\n"
     "def __init__(self, llm_serving, ...):\n"
@@ -87,9 +88,9 @@ _DEFAULT_SYSTEM_PROMPT_APPEND = (
 
     "## MCP Reference (Use for Implementation Patterns)\n"
     "The dataflow-operators MCP exposes existing reasoning/math operators with FULL SOURCE CODE.\n"
-    "Use get_operator_detail to study:\n"
-    "- Prompt construction patterns\n"
-    "- LLM call conventions (see 'source_code' field)\n"
+    "Use get_operator_detail(name='ReasoningAnswerGenerator') to study:\n"
+    "- Prompt construction patterns (see source_code field)\n"
+    "- LLM call conventions\n"
     "- Response parsing techniques\n"
     "Then write your own operators following those patterns.\n\n"
 
@@ -98,9 +99,9 @@ _DEFAULT_SYSTEM_PROMPT_APPEND = (
     "1. Read `.claude/skills/dataflow-dev/diagnostics/known_issues.md`\n"
     "2. Match error message to Issue #001-#011\n"
     "3. Apply the exact fix from the Issue\n"
-    "4. Common errors:\n"
-    "   - Issue #011: storage.write(df, 'dataframe') → storage.write(df)\n"
-    "   - Issue #010: self.llm_serving.request() → self.llm_serving.generate_from_input()\n\n"
+    "4. If not in known_issues, check DataFlow source code:\n"
+    "   - `dataflow/serving/api_llm_serving_request.py` for LLM API\n"
+    "   - `dataflow/utils/storage.py` for FileStorage API\n\n"
 
     "## Constraints\n"
     "- Headless: no AskUserQuestion, no git/gh subflows.\n"
