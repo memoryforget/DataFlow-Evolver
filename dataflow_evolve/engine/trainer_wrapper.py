@@ -168,7 +168,7 @@ class SSHTrainerWrapper(TrainerWrapperABC):
 
     def _launcher_env(self, run_id: str) -> dict[str, str]:
         """构造 node0 launcher 环境。真正的 node1 拉起由脚本内部完成。"""
-        return {
+        env = {
             "NNODES": str(self.nnodes),
             "NODE_RANK": "0",
             "MASTER_ADDR": self.master_addr,
@@ -177,10 +177,13 @@ class SSHTrainerWrapper(TrainerWrapperABC):
             "FORCE_TORCHRUN": "1",
             "DF_TRAIN_RUN_ID": run_id,
             "NODE1_HOST": self.node1_host,
-            "REMOTE_CWD": self.remote_cwd,
             "SSH_OPTS": self.ssh_opts,
             "SFT_REMOTE_PYTHON": self.python_exe,
         }
+        # REMOTE_CWD 可能为 None，需要转换为字符串或省略
+        if self.remote_cwd is not None:
+            env["REMOTE_CWD"] = str(self.remote_cwd)
+        return env
 
     def run(self, dataset_path: str, output_dir: str) -> TrainResult:
         out_dir = Path(output_dir).resolve()
