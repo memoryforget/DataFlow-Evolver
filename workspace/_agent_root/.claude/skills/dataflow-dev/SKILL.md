@@ -148,8 +148,11 @@ if TYPE_CHECKING:
 | `Key Matching Error` / `does not match any output keys` | Issue #003（Pipeline key 不一致）|
 | `You must call storage.step() before` | Issue #004（缺少 storage.step()）|
 | `DummyStorage` + `AttributeError` / `TypeError` | Issue #005（DummyStorage 不支持 get_keys_from_dataframe）|
-| `ModuleNotFoundError` + `dataflow.operators.reasoning.refine` | Issue（LazyLoader 路径，应从父模块 import）|
+| `ModuleNotFoundError` + `dataflow.operators.reasoning.refine` | Issue #008（LazyLoader 路径，应从父模块 import）|
 | `AttributeError: 'NoneType' object has no attribute 'strip'` + `re.split` | Issue #006（re.split 捕获组 None 问题）|
+| `'APILLMServing_request' object has no attribute 'request'` | Issue #010（LLM API 调用方式错误）|
+| `'APILLMServing_request' object is not callable` | Issue #010（LLM API 调用方式错误）|
+| `FileStorage.write() takes 2 positional arguments but 3 were given` | Issue #011（write() 只接受一个参数）|
 
 ---
 

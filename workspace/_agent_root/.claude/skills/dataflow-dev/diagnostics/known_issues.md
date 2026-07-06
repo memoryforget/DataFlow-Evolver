@@ -333,6 +333,147 @@ json_schema={
 
 ---
 
+## Issue #010 — APILLMServing_request 调用方式错误
+
+**标题**：`AttributeError: 'APILLMServing_request' object has no attribute 'request'` / `TypeError: 'APILLMServing_request' object is not callable`
+
+**症状关键词**：
+- `AttributeError: 'APILLMServing_request' object has no attribute 'request'`
+- `TypeError: 'APILLMServing_request' object is not callable`
+- LLM 调用返回 None
+- `messages[1].content: got object, want string` (API 400 错误)
+- 生成结果全为空或占位文本
+
+**根因**：
+
+`APILLMServing_request` 是一个类，需要实例化后调用 `generate_from_input()` 方法。常见错误：
+1. 尝试调用不存在的 `.request()` 方法
+2. 直接把实例当函数调用 `self.llm_serving(...)`
+3. 传入错误的参数格式（messages 而非 user_inputs）
+
+**解决方案**：
+
+正确的调用方式：
+
+```python
+# 1. 在算子 __init__ 中接收 serving 实例
+def __init__(self, llm_serving, ...):
+    super().__init__()
+    self.llm_serving = llm_serving  # 必须命名为 llm_serving
+
+# 2. 在 run() 中调用 generate_from_input()
+def run(self, storage, input_key="text", output_key="result"):
+    df = storage.read("dataframe")
+    
+    # 准备输入
+    user_inputs = df[input_key].tolist()  # list[str]
+    system_prompt = "You are a helpful assistant"
+    
+    # 正确调用
+    responses = self.llm_serving.generate_from_input(
+        user_inputs=user_inputs,
+        system_prompt=system_prompt
+    )
+    
+    # responses 是 list[str]，与 user_inputs 一一对应
+    # 处理 None 值（API 失败时返回 None）
+    df[output_key] = [r if r is not None else "" for r in responses]
+    
+    storage.write(df)
+    return [output_key]
+```
+
+**完整 API 签名**：
+
+```python
+APILLMServing_request.generate_from_input(
+    user_inputs: list[str],           # 必需：用户输入列表
+    system_prompt: str = "",           # 可选：系统提示
+    json_schema: dict | None = None,   # 可选：结构化输出 schema
+    **kwargs                           # 其他参数传递给 API
+) -> list[str]
+```
+
+**注意事项**：
+- 输入必须是 `list[str]`，不是 `messages` 格式
+- 返回值是 `list[str]`，与输入一一对应
+- 如果 API 调用失败，对应位置返回 `None`
+- **必须在算子内部处理 `None` 值**，否则下游算子会崩溃
+
+**修复示例**：
+
+```python
+# ❌ 错误 1：调用不存在的方法
+response = self.llm_serving.request(prompt=user_input)
+
+# ❌ 错误 2：把实例当函数
+response = self.llm_serving(user_input, system_prompt)
+
+# ❌ 错误 3：传入 messages 格式
+response = self.llm_serving.generate_from_input(
+    messages=[{"role": "user", "content": "..."}]  # 错误格式
+)
+
+# ✅ 正确
+responses = self.llm_serving.generate_from_input(
+    user_inputs=["question 1", "question 2"],
+    system_prompt="You are a math tutor"
+)
+```
+
+---
+
+## Issue #011 — FileStorage.write() 参数数量错误
+
+**标题**：`TypeError: FileStorage.write() takes 2 positional arguments but 3 were given`
+
+**症状关键词**：
+- `FileStorage.write() takes 2 positional arguments but 3 were given`
+- `storage.write()` 报错
+- Pipeline 执行崩溃在 `storage.write(df, ...)` 行
+
+**根因**：
+
+`FileStorage.write()` 只接受一个参数（DataFrame），不接受第二个参数指定存储格式。这是最常见的 API 误用错误。
+
+**解决方案**：
+
+正确的 API 签名：
+
+```python
+storage.write(df)  # ✓ 只传 DataFrame
+```
+
+存储格式在 FileStorage 初始化时通过 `cache_type` 参数指定：
+
+```python
+storage = FileStorage(
+    first_entry_file_name="input.jsonl",
+    cache_path="./cache",
+    cache_type="jsonl"  # 在这里指定格式，不是在 write() 时指定
+)
+```
+
+**修复示例**：
+
+```python
+# ❌ 错误：传入两个参数
+storage.write(df, 'dataframe')
+storage.write(df, 'jsonl')
+storage.write(df, format='jsonl')
+
+# ✅ 正确：只传 DataFrame
+storage.write(df)
+```
+
+**完整 API 签名**：
+
+```python
+FileStorage.write(df: pd.DataFrame) -> None
+```
+
+---
+
 ## 快速匹配表
 
 | 报错关键词 | Issue 编号 |
@@ -346,6 +487,9 @@ json_schema={
 | `prompt_restrict` 未生效 | #007 |
 | `ModuleNotFoundError` + `dataflow.operators.reasoning.refine` | #008 |
 | `Invalid schema for response_format` / `additionalProperties' is required` | #009 |
+| `'APILLMServing_request' object has no attribute 'request'` | #010 |
+| `'APILLMServing_request' object is not callable` | #010 |
+| `FileStorage.write() takes 2 positional arguments but 3 were given` | #011 |
 
 ---
 
