@@ -534,7 +534,7 @@ async def list_operators(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "get_operator_detail",
-    "Get detailed information about a specific operator by name, including full constructor and run() parameter signatures with defaults.",
+    "Get detailed information about a specific operator by name, including full constructor and run() parameter signatures with defaults, AND the complete source code for reference.",
     {"name": Annotated[str, "Operator class name (e.g., 'ReasoningAnswerGenerator')"]},
 )
 async def get_operator_detail(args: dict[str, Any]) -> dict[str, Any]:
@@ -542,9 +542,20 @@ async def get_operator_detail(args: dict[str, Any]) -> dict[str, Any]:
     if not op_name:
         return {"content": [{"type": "text", "text": "Error: name is required"}], "is_error": True}
 
+    obj_map = OPERATOR_REGISTRY.get_obj_map()
+
     for cat_name, ops in _catalog.items():
         for op in ops:
             if op["name"] == op_name:
+                # Get source code
+                source_code = ""
+                try:
+                    cls = obj_map.get(op_name)
+                    if cls:
+                        source_code = inspect.getsource(cls)
+                except Exception as e:
+                    source_code = f"[Source code unavailable: {e}]"
+
                 detail = {
                     "name": op["name"],
                     "category": op["category"],
@@ -554,6 +565,7 @@ async def get_operator_detail(args: dict[str, Any]) -> dict[str, Any]:
                     "allowed_prompts": op["allowed_prompts"],
                     "init_params": op["init_params"],
                     "run_params": op["run_params"],
+                    "source_code": source_code,
                 }
                 return {"content": [{"type": "text", "text": json.dumps(detail, indent=2, ensure_ascii=False)}]}
 
