@@ -142,10 +142,20 @@ def build_pipeline_prompt(
             for r in rec_list
         )
         recommendation_block = (
-            f"\n【参考算子类别（仅供编码风格参考，不要直接复用）】\n"
+            f"\n【MCP 算子源码参考（强烈建议使用）】\n"
             f"   相关类别：{rec_text}\n"
-            f"   用法：可通过 MCP get_operator_detail 查看这些类别中算子的源码，\n"
-            f"   学习其 prompt 构造、LLM 调用模式、响应解析方式，然后写自己的算子。\n"
+            f"   **使用步骤**：\n"
+            f"   1. 调用 MCP tool: `list_operators` 查看 {rec_list[0]['category']} 类别的算子列表\n"
+            f"   2. 选择 1-2 个相关算子（如 ReasoningQuestionGenerator, ReasoningAnswerGenerator）\n"
+            f"   3. 调用 MCP tool: `get_operator_detail` 获取算子的**完整源码**（在返回的 source_code 字段中）\n"
+            f"   4. 学习源码中的：\n"
+            f"      - Prompt 构造模式（如何拼接 system_prompt 和 user_input）\n"
+            f"      - LLM 调用方式（generate_from_input 的正确用法）\n"
+            f"      - 响应解析技巧（如何从 LLM 输出中提取结构化数据）\n"
+            f"      - 错误处理模式（如何处理 None 返回值）\n"
+            f"   5. 编写你自己的算子时，遵循相同的模式和 API 约定\n"
+            f"   \n"
+            f"   **注意**：MCP 提供的是**实现参考**，不要直接复用已有算子，而是学习其编码风格后写自定义算子。\n"
         )
     return PIPELINE_AGENT_PROMPT.format(
         target=profile.task_description,
