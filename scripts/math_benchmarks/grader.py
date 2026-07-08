@@ -427,6 +427,8 @@ def call_with_timeout(func, *args, timeout=3, **kwargs):
         process.join()
         return False
 
+    if output_queue.empty():
+        return False
     return output_queue.get()
 
 # def call_with_timeout(func, *args, timeout=1, **kwargs):
@@ -457,6 +459,8 @@ def call_with_timeout(func, *args, timeout=3, **kwargs):
 
 
 def check_is_correct(pred, gt, timeout=True):
+    if pred is None:
+        return False
     return math_equal(strip_string(pred), strip_string(gt), timeout=timeout)
 
 

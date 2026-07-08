@@ -46,6 +46,14 @@ LIMO 论文核心配置（2502.03387）：
     2. 显存占用估算：ZeRO-3 将 32B 模型状态均摊至 ~32GB/卡，激活值约 20-25GB，总占用 55-65GB
     3. 全局批次大小 = NNODES × (NUM_GPUS/NNODES) × BATCH_SIZE × GRAD_ACCUM = 2 × 8 × 1 × 4 = 64
 
+评测环境依赖：
+    - vLLM: 0.19.1 (DP>1 通过 vllm serve + OpenAI API 模式)
+    - transformers: 4.57.x (必须 <5，transformers 5.x 删除了 all_special_tokens_extended)
+    - torch: 2.10.0+cu128
+    - 环境变量: 必须设置 VLLM_WORKER_MULTIPROC_METHOD=spawn (避免 CUDA fork 错误)
+    - DP>1 时独立脚本自动启动 vllm serve + OpenAI API 模式推理
+    - 推荐使用独立评测环境，避免和训练环境冲突
+
 输出：<out_dir>/results.json
     {"score": float, "metric_name": "math_*_accuracy", "bad_cases": [...], "benchmarks": [...]}
 """
@@ -54,13 +62,18 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import multiprocessing
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+# 设置多进程启动方式为 spawn，避免 CUDA fork 问题
+multiprocessing.set_start_method('spawn', force=True)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -68,7 +81,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # 配置常量（可通过环境变量覆盖）— LIMO 论文配置
 # ---------------------------------------------------------------------------
-BASE_MODEL = os.environ.get("SFT_BASE_MODEL", "Qwen/Qwen2.5-32B-Instruct")
+BASE_MODEL = os.environ.get("SFT_BASE_MODEL", "/vepfs-mlp2/c20250602/500050/models/Qwen2.5-32B-Instruct")
 NUM_EPOCHS = float(os.environ.get("SFT_NUM_EPOCHS", "15"))
 LEARNING_RATE = float(os.environ.get("SFT_LEARNING_RATE", "5.0e-6"))
 BATCH_SIZE = int(os.environ.get("SFT_BATCH_SIZE", "1"))
@@ -76,13 +89,14 @@ GRAD_ACCUM = int(os.environ.get("SFT_GRAD_ACCUM", "4"))
 NUM_GPUS = int(os.environ.get("SFT_NUM_GPUS", "16"))  # 训练：双机总卡数（torchrun 分布式）
 CUTOFF_LEN = int(os.environ.get("SFT_CUTOFF_LEN", "16384"))  # LIMO 序列长度
 WARMUP_STEPS = int(os.environ.get("SFT_WARMUP_STEPS", "5"))  # 论文无 warmup，保留5步防初期震荡
-# 评测：仅在 rank0 单机跑（vLLM 非 torchrun 分布式）。32B 权重 bf16≈64GB，单机 8×A100 80G
-# 用 TP=2 每卡放 32GB 足够，故默认 TP=2 × DP=4 = 8（本机卡数），不再假设跨机 16 卡。
-TP_SIZE = int(os.environ.get("EVAL_TP_SIZE", "2"))
-DP_SIZE = int(os.environ.get("EVAL_DP_SIZE", "4"))
-MAX_MODEL_LEN = int(os.environ.get("EVAL_MAX_MODEL_LEN", "65536"))  # Qwen2.5-32B 上下文窗口
+# 评测：使用独立 vLLM 脚本，支持 TP（tensor parallel）+ DP（data parallel）。
+# 32B 权重 bf16≈64GB，使用 TP=4（每卡 16GB）在 4×A100 80G 上运行。
+# vLLM 0.19.1 DP>1 时自动启动 vllm serve + OpenAI API 模式推理（8 GPU）。
+TP_SIZE = int(os.environ.get("EVAL_TP_SIZE", "4"))
+DP_SIZE = int(os.environ.get("EVAL_DP_SIZE", "2"))  # 默认 DP=2，配合 TP=4 使用全部 8 张 GPU
+MAX_MODEL_LEN = int(os.environ.get("EVAL_MAX_MODEL_LEN", "32768"))  # Qwen2.5-32B 上下文窗口,与LIMO一致
 MAX_NEW_TOKENS = int(os.environ.get("EVAL_MAX_NEW_TOKENS", "8192"))  # 评测生成长度上限
-HF_CACHE_DIR = os.environ.get("HF_CACHE_DIR", None)
+HF_CACHE_DIR = os.environ.get("HF_CACHE_DIR", "./hf_cache")  # HuggingFace 缓存目录（vLLM tokenizer）
 MAX_BAD_CASES_PER_BENCH = 30
 SFT_TRAIN_TIMEOUT_SEC = int(os.environ.get("SFT_TRAIN_TIMEOUT_SEC", "21600"))
 TRAIN_RUN_ID = os.environ.get("DF_TRAIN_RUN_ID", "manual")
@@ -119,8 +133,92 @@ def _remote_python() -> str:
     return os.environ.get("SFT_REMOTE_PYTHON", sys.executable)
 
 
+def _eval_python() -> str:
+    return os.environ.get("SFT_EVAL_PYTHON", "").strip()
+
+
 def _should_launch_remote_worker() -> bool:
     return _node_rank() == 0 and _nnodes() > 1
+
+
+def _read_sysfs_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _detect_nccl_ib_hca_and_gid_index(socket_ifname: str) -> tuple[str | None, str | None]:
+    base = Path("/sys/class/infiniband")
+    if not socket_ifname or not base.exists():
+        return None, None
+
+    candidates: list[tuple[int, str, str]] = []
+    for ndev_path in base.glob("*/ports/*/gid_attrs/ndevs/*"):
+        if _read_sysfs_text(ndev_path) != socket_ifname:
+            continue
+
+        gid_index = ndev_path.name
+        port_dir = ndev_path.parents[2]
+        gid_value = _read_sysfs_text(port_dir / "gids" / gid_index)
+        gid_type = _read_sysfs_text(ndev_path.parents[1] / "types" / gid_index)
+        if not gid_value or gid_value == "0000:0000:0000:0000:0000:0000:0000:0000":
+            continue
+
+        is_link_local = gid_value.lower().startswith("fe80:")
+        if gid_type == "RoCE v2" and not is_link_local:
+            score = 0
+        elif gid_type == "IB/RoCE v1" and not is_link_local:
+            score = 1
+        elif gid_type == "RoCE v2":
+            score = 2
+        elif gid_type == "IB/RoCE v1":
+            score = 3
+        else:
+            score = 9
+
+        hca = ndev_path.parents[4].name
+        port = port_dir.name
+        candidates.append((score, f"{hca}:{port}", gid_index))
+
+    if not candidates:
+        return None, None
+
+    _, hca, gid_index = min(candidates)
+    return hca, gid_index
+
+
+def _ensure_nccl_ib_env_from_socket_ifname() -> None:
+    if os.environ.get("NCCL_IB_DISABLE", "").strip() == "1":
+        return
+
+    socket_ifname = os.environ.get("NCCL_SOCKET_IFNAME", "").strip()
+    if not socket_ifname:
+        return
+
+    hca_is_explicit = bool(os.environ.get("NCCL_IB_HCA", "").strip())
+    gid_is_explicit = bool(os.environ.get("NCCL_IB_GID_INDEX", "").strip())
+    if hca_is_explicit and gid_is_explicit:
+        return
+
+    hca, gid_index = _detect_nccl_ib_hca_and_gid_index(socket_ifname)
+    if not hca and not gid_index:
+        logger.warning("无法根据 NCCL_SOCKET_IFNAME=%s 推断 NCCL_IB_HCA / NCCL_IB_GID_INDEX", socket_ifname)
+        return
+
+    if not hca_is_explicit and hca:
+        os.environ["NCCL_IB_HCA"] = hca
+        os.environ["DF_AUTO_NCCL_IB_HCA"] = "1"
+    if not gid_is_explicit and gid_index:
+        os.environ["NCCL_IB_GID_INDEX"] = gid_index
+        os.environ["DF_AUTO_NCCL_IB_GID_INDEX"] = "1"
+
+    logger.info(
+        "自动设置 NCCL RDMA 配置: NCCL_SOCKET_IFNAME=%s, NCCL_IB_HCA=%s, NCCL_IB_GID_INDEX=%s",
+        socket_ifname,
+        os.environ.get("NCCL_IB_HCA", ""),
+        os.environ.get("NCCL_IB_GID_INDEX", ""),
+    )
 
 
 def _kill_process_tree(pid: int) -> None:
@@ -154,37 +252,15 @@ def _stream_subprocess(
     with log_path.open("w", encoding="utf-8", buffering=1) as logf:
         logf.write(f"CMD: {' '.join(cmd)}\n")
         logf.write(f"CWD: {cwd}\n")
-        logf.write(
-            "ENV: "
-            f"NNODES={env.get('NNODES')} "
-            f"NODE_RANK={env.get('NODE_RANK')} "
-            f"NPROC_PER_NODE={env.get('NPROC_PER_NODE')} "
-            f"MASTER_ADDR={env.get('MASTER_ADDR', 'localhost')} "
-            f"MASTER_PORT={env.get('MASTER_PORT')}\n"
-        )
         logf.flush()
-
-        if sys.platform == "win32":
-            proc = subprocess.Popen(
-                cmd,
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                text=True,
-                cwd=cwd,
-                env=env,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-            )
-        else:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                text=True,
-                cwd=cwd,
-                env=env,
-                preexec_fn=os.setsid,
-            )
-
+        proc = subprocess.Popen(
+            cmd,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            cwd=cwd,
+            env=env,
+            start_new_session=True,
+        )
         try:
             return proc.wait(timeout=timeout_sec)
         except subprocess.TimeoutExpired as exc:
@@ -234,8 +310,14 @@ def _forward_remote_env() -> dict[str, str]:
         "DF_TRAIN_RUN_ID",
     }
     env: dict[str, str] = {}
+    auto_ib_hca = os.environ.get("DF_AUTO_NCCL_IB_HCA") == "1"
+    auto_ib_gid = os.environ.get("DF_AUTO_NCCL_IB_GID_INDEX") == "1"
     for key, value in os.environ.items():
         if not value:
+            continue
+        if auto_ib_hca and key == "NCCL_IB_HCA":
+            continue
+        if auto_ib_gid and key == "NCCL_IB_GID_INDEX":
             continue
         if key in exact or key.startswith(prefixes):
             env[key] = value
@@ -325,6 +407,111 @@ def _wait_remote_worker(proc: subprocess.Popen, timeout_sec: int) -> None:
         _close_logfile(proc)
     if rc != 0:
         raise RuntimeError(f"node1 worker 非零退出（{rc}），详见 train_node1.log")
+
+
+def _load_results_json(results_path: Path) -> dict:
+    if not results_path.exists():
+        raise RuntimeError(f"评测结果不存在：{results_path}")
+    try:
+        return json.loads(results_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"results.json 解析失败：{results_path}") from exc
+
+
+def _run_eval_with_standalone_script(model_dir: Path, output_dir: Path, mode: str, eval_python: str) -> dict:
+    """使用独立的 vLLM 评测脚本运行评测（避免 CUDA fork 问题）。
+
+    DP>1 时由独立脚本内部自动启动 vllm serve + OpenAI API 模式推理。
+    DP=1 时直接用 vLLM LLM 类。
+    """
+    script_path = Path(__file__).resolve().parent / "vllm_eval_standalone.py"
+    results_path = output_dir / "results.json"
+    log_path = output_dir / "eval.log"
+
+    cmd = [
+        eval_python, str(script_path),
+        "--model-dir", str(model_dir.resolve()),
+        "--output-dir", str(output_dir.resolve()),
+        "--mode", mode,
+        "--tp-size", str(TP_SIZE),
+        "--dp-size", str(DP_SIZE),
+        "--max-model-len", str(MAX_MODEL_LEN),
+    ]
+
+    env = dict(os.environ)
+    env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+    # 设置评测使用的 GPU
+    eval_gpus = os.environ.get("EVAL_CUDA_VISIBLE_DEVICES", "").strip()
+    if eval_gpus:
+        env["CUDA_VISIBLE_DEVICES"] = eval_gpus
+        logger.info("评测使用 GPU: %s", eval_gpus)
+    elif "CUDA_VISIBLE_DEVICES" not in env:
+        total_gpus = TP_SIZE * DP_SIZE
+        default_gpus = ",".join(str(i) for i in range(total_gpus))
+        env["CUDA_VISIBLE_DEVICES"] = default_gpus
+        logger.info("评测使用默认 GPU: %s", default_gpus)
+
+    # 清理不需要的环境变量
+    for key in (
+        "NODE1_HOST",
+        "FORCE_TORCHRUN",
+        "SFT_REMOTE_PYTHON",
+        "SFT_EVAL_PYTHON",
+        "DF_EVAL_EXTERNAL_LAUNCHER",
+    ):
+        env.pop(key, None)
+
+    logger.info("使用独立 vLLM 评测脚本：%s", script_path)
+    logger.info("启动评测子进程 (TP=%d, DP=%d)：%s", TP_SIZE, DP_SIZE, " ".join(shlex.quote(part) for part in cmd))
+
+    with log_path.open("w", encoding="utf-8", buffering=1) as logf:
+        logf.write(f"CMD: {' '.join(cmd)}\n")
+        logf.write(f"CWD: {script_path.parent.parent}\n")
+        logf.write(f"MODEL_DIR: {model_dir.resolve()}\n")
+        logf.write(f"CUDA_VISIBLE_DEVICES: {env.get('CUDA_VISIBLE_DEVICES', 'not set')}\n")
+        logf.write(f"VLLM_WORKER_MULTIPROC_METHOD: spawn\n")
+        logf.write(f"TP_SIZE: {TP_SIZE}, DP_SIZE: {DP_SIZE}\n")
+        logf.flush()
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=str(script_path.parent.parent),
+                env=env,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"eval 环境 python 不可执行：{eval_python}") from exc
+        rc = proc.wait()
+
+    if rc != 0:
+        raise RuntimeError(f"评测子进程失败 (exit={rc})，日志：{log_path}")
+    return _load_results_json(results_path)
+
+
+def _run_eval_stage(model_dir: Path, output_dir: Path, mode: str) -> dict:
+    """执行评测阶段，自动选择正确的模型目录。
+
+    如果存在 pytorch_model/ 子目录（转换后的标准格式），则使用它；
+    否则直接使用 model_dir（假设已经是标准格式）。
+    """
+    # 检查是否有转换后的 PyTorch 模型
+    pytorch_model_dir = model_dir / "pytorch_model"
+    if pytorch_model_dir.exists() and any(pytorch_model_dir.glob("*.safetensors")):
+        logger.info("检测到转换后的 PyTorch 模型，使用：%s", pytorch_model_dir)
+        eval_model_dir = pytorch_model_dir
+    else:
+        eval_model_dir = model_dir
+
+    eval_python = _eval_python()
+    if not eval_python:
+        raise RuntimeError(
+            "未配置评测环境 python（SFT_EVAL_PYTHON 环境变量为空）。"
+            "评测必须在独立的 df-eval 环境中运行。"
+        )
+    return _run_eval_with_standalone_script(eval_model_dir, output_dir, mode, eval_python)
 
 
 # ---------------------------------------------------------------------------
@@ -552,220 +739,212 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
         raise RuntimeError(f"SFT 训练失败 (exit={returncode})，日志：{log_path}")
 
     logger.info("Full SFT 训练完成，模型保存于：%s", model_dir)
+
+    # 只在 rank0 执行 DeepSpeed checkpoint 转换和清理
+    if rank == 0:
+        _convert_and_cleanup_checkpoint(model_dir, output_dir)
+
     return model_dir
 
 
-# ---------------------------------------------------------------------------
-# 3. Math Benchmark 评测
-# ---------------------------------------------------------------------------
-EVAL_SYSTEM_PROMPT_BOXED = (
-    "Please reason step by step, and put your final answer within \\boxed{}."
+def _convert_and_cleanup_checkpoint(model_dir: Path, output_dir: Path) -> None:
+    """将 DeepSpeed ZeRO-3 checkpoint 转换为标准 PyTorch BF16 格式并清理临时文件。
+
+    只保留：
+    - pytorch_model/ (转换后的 BF16 格式权重)
+    - config.json, tokenizer*, generation_config.json, chat_template.jinja (模型配置)
+    - trainer_log.jsonl, *_results.json, training_args.bin, trainer_state.json (训练日志和参数)
+    - zero_to_fp32.py, latest (保留以便手动操作)
+
+    删除：
+    - global_step*/（DeepSpeed checkpoint 分片，占用最大，~300GB）
+      ├─ *_optim_states.pt（优化器状态，不需要推理）
+      └─ *_model_states.pt（模型权重分片，已转换）
+    """
+    logger.info("开始转换 DeepSpeed checkpoint 到 PyTorch BF16 格式...")
+
+    # 检查是否存在 DeepSpeed checkpoint
+    latest_file = model_dir / "latest"
+    if not latest_file.exists():
+        logger.warning("未找到 latest 文件，跳过转换")
+        return
+
+    checkpoint_tag = latest_file.read_text(encoding="utf-8").strip()
+    checkpoint_dir = model_dir / checkpoint_tag
+
+    if not checkpoint_dir.exists():
+        logger.warning("Checkpoint 目录不存在：%s，跳过转换", checkpoint_dir)
+        return
+
+    # 检查是否已经转换过
+    pytorch_model_dir = model_dir / "pytorch_model"
+    if pytorch_model_dir.exists() and any(pytorch_model_dir.glob("*.safetensors")):
+        logger.info("PyTorch 模型已存在，跳过转换")
+    else:
+        # 使用 Python 脚本转换，保持 BF16 精度
+        convert_log = output_dir / "checkpoint_convert.log"
+
+        # 创建转换脚本（使用 transformers + torch.bfloat16）
+        convert_script = model_dir / "_convert_to_bf16.py"
+        convert_script.write_text("""
+import sys
+import torch
+from pathlib import Path
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model_dir = Path(sys.argv[1])
+output_dir = Path(sys.argv[2])
+
+print(f"加载 DeepSpeed checkpoint: {model_dir}")
+# 使用 device_map="cpu" 避免 OOM，指定 torch_dtype=torch.bfloat16
+model = AutoModelForCausalLM.from_pretrained(
+    str(model_dir),
+    torch_dtype=torch.bfloat16,
+    device_map="cpu",
+    trust_remote_code=True,
 )
 
+print(f"保存为 BF16 safetensors: {output_dir}")
+output_dir.mkdir(parents=True, exist_ok=True)
+model.save_pretrained(
+    str(output_dir),
+    safe_serialization=True,
+    max_shard_size="5GB",
+)
 
-def _system_prompt_for(bench_name: str, example: dict) -> str:
-    return EVAL_SYSTEM_PROMPT_BOXED
+# 同时保存 tokenizer 和配置
+print("复制 tokenizer 和配置文件")
+tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
+tokenizer.save_pretrained(str(output_dir))
 
+# 修复 tokenizer_config.json 兼容性问题（transformers 5.x → 4.x）
+# transformers 4.x 不支持 extra_special_tokens 为列表格式
+import json
+tokenizer_config_path = output_dir / "tokenizer_config.json"
+if tokenizer_config_path.exists():
+    config = json.loads(tokenizer_config_path.read_text(encoding="utf-8"))
+    if "extra_special_tokens" in config:
+        print("移除 extra_special_tokens 字段以兼容 transformers 4.x")
+        del config["extra_special_tokens"]
+        tokenizer_config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
 
-def _user_prompt_for(example: dict, prompt_fn) -> str:
-    question = prompt_fn(example["question"])
-    choices = example.get("choices")
-    if not choices:
-        return question
+print("转换完成！")
+""", encoding="utf-8")
 
-    option_lines = "\n".join(f"{label}. {text}" for label, text in choices)
-    return f"{question}\n\nOptions:\n{option_lines}"
-
-
-def run_eval(model_dir: Path, output_dir: Path, mode: str = "dev") -> dict:
-    """用 vLLM 加载 fine-tuned 模型评测。
-
-    mode='dev': MATH train 全量 (7500 条公开训练题，非 benchmark test set) 驱动 MCTS 奖励。
-    mode='test': 完整测试套件，统一使用单样本贪心（与 LIMO 论文一致）。
-    """
-    from vllm import LLM, SamplingParams
-
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from math_benchmarks import (
-        load_gsm8k, gsm8k_prompt,
-        load_math500, math500_prompt,
-        load_math_train, math_train_prompt,
-        load_aime2024, aime_prompt,
-        load_amc23, amc23_prompt,
-        load_chmath, chmath_prompt,
-        load_olympiadbench, olympiadbench_prompt,
-        load_gaokao, gaokao_prompt,
-        load_kaoyan, kaoyan_prompt,
-        load_gradeschool, gradeschool_prompt,
-        load_minervamath, minervamath_prompt,
-        load_gpqa, gpqa_prompt,
-    )
-    from math_benchmarks.grader import check_is_correct
-    from math_benchmarks.answer_extract import extract_answer
-
-    logger.info("加载 vLLM 模型：%s (TP=%d, DP=%d)", model_dir, TP_SIZE, DP_SIZE)
-    llm = LLM(
-        model=str(model_dir),
-        tensor_parallel_size=TP_SIZE,
-        data_parallel_size=DP_SIZE,
-        max_model_len=MAX_MODEL_LEN,
-        trust_remote_code=True,
-        enable_prefix_caching=True,
-    )
-
-    tokenizer = llm.get_tokenizer()
-
-    if mode == "test":
-        # 所有 benchmark 统一使用单样本贪心（与 LIMO 论文一致）
-        benchmarks = [
-            ("GSM8K", load_gsm8k, gsm8k_prompt),
-            ("AIME2024", load_aime2024, aime_prompt),
-            ("AMC23", load_amc23, amc23_prompt),
-            ("MATH500", load_math500, math500_prompt),
-            ("OlympiadBench", load_olympiadbench, olympiadbench_prompt),
-            ("CHMath", load_chmath, chmath_prompt),
-            ("Gaokao", load_gaokao, gaokao_prompt),
-            ("Kaoyan", load_kaoyan, kaoyan_prompt),
-            ("GradeSchool", load_gradeschool, gradeschool_prompt),
-            ("MinervaMath", load_minervamath, minervamath_prompt),
-            ("GPQA", load_gpqa, gpqa_prompt),
+        convert_cmd = [
+            sys.executable,
+            str(convert_script),
+            str(model_dir),
+            str(pytorch_model_dir),
         ]
-        metric_name = "math_test_avg_accuracy"
-    else:
-        # dev mode: MATH train 全量，单样本贪心
-        math_train_path = os.environ.get("MATH_TRAIN_PATH", None)
-        benchmarks = [
-            ("MATH-train", lambda **kw: load_math_train(data_path=math_train_path, **kw), math_train_prompt),
-        ]
-        metric_name = "math_train_accuracy"
 
-    scores = []
-    all_bad_cases: list[dict] = []
-    detail = {}
+        logger.info("执行 BF16 转换：%s", " ".join(convert_cmd))
+        try:
+            with convert_log.open("w", encoding="utf-8") as logf:
+                proc = subprocess.Popen(
+                    convert_cmd,
+                    stdout=logf,
+                    stderr=subprocess.STDOUT,
+                    cwd=str(model_dir),
+                )
+                rc = proc.wait(timeout=3600)  # 1小时超时
 
-    # 单样本贪心参数（与 LIMO 论文一致）
-    params_single = SamplingParams(
-        temperature=0,
-        max_tokens=MAX_NEW_TOKENS,
-        stop_token_ids=[151643, 151645],
-    )
+            if rc != 0:
+                logger.error("Checkpoint 转换失败 (exit=%d)，日志：%s", rc, convert_log)
+                return
 
-    for bench_name, load_fn, prompt_fn in benchmarks:
-        logger.info("评测 %s (单样本贪心) ...", bench_name)
-        examples = load_fn(cache_dir=HF_CACHE_DIR)
-        if not examples:
-            raise RuntimeError(f"{bench_name} 数据集为空")
+            logger.info("Checkpoint 转换完成：%s", pytorch_model_dir)
 
-        # 构造 prompts
-        prompts = []
-        for ex in examples:
-            user_msg = _user_prompt_for(ex, prompt_fn)
-            conversation = [
-                {"role": "system", "content": _system_prompt_for(bench_name, ex)},
-                {"role": "user", "content": user_msg},
-            ]
-            prompt_text = tokenizer.apply_chat_template(
-                conversation, tokenize=False, add_generation_prompt=True
-            )
-            prompts.append(prompt_text)
+            # 清理转换脚本
+            if convert_script.exists():
+                convert_script.unlink()
 
-        # 单次生成（temperature=0）
-        outputs = llm.generate(prompts, params_single)
-        predictions = [out.outputs[0].text for out in outputs]
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            logger.error("Checkpoint 转换超时")
+            return
+        except Exception as e:
+            logger.error("Checkpoint 转换失败：%s", e)
+            return
 
-        # 使用 LIMO grader 进行答案比较
-        correct_count = 0
-        bad_cases = []
-        for pred_text, ex in zip(predictions, examples):
-            # 提取答案
-            pred_answer = extract_answer(pred_text, mode="auto")
-            gold_answer = ex.get("answer") or ex.get("gold_answer", "")
+    # 清理占用最大的 DeepSpeed checkpoint 目录
+    logger.info("清理大文件...")
 
-            # 使用 LIMO 的 math_equal 判定
-            is_correct = check_is_correct(pred_answer, gold_answer, timeout=True)
+    if checkpoint_dir.exists():
+        # 计算删除前的大小
+        checkpoint_size = sum(f.stat().st_size for f in checkpoint_dir.rglob("*") if f.is_file())
+        logger.info("删除 DeepSpeed checkpoint 目录：%s (大小：%.2f GB)",
+                    checkpoint_dir, checkpoint_size / (1024**3))
+        shutil.rmtree(checkpoint_dir)
 
-            if is_correct:
-                correct_count += 1
-            else:
-                bad_cases.append({
-                    "input": ex["question"],
-                    "prediction": pred_text,
-                    "extracted_answer": pred_answer,
-                    "ground_truth": gold_answer,
-                    "error_type": "wrong_answer",
-                })
-
-        accuracy = correct_count / len(examples) if examples else 0.0
-        scores.append(accuracy)
-
-        # 记录前 MAX_BAD_CASES_PER_BENCH 个 bad cases
-        for bc in bad_cases[:MAX_BAD_CASES_PER_BENCH]:
-            bc["error_type"] = f"{bench_name}:{bc.get('error_type', 'wrong_answer')}"
-            all_bad_cases.append(bc)
-
-        detail[bench_name] = {"accuracy": accuracy, "total": len(examples), "method": "greedy"}
-        logger.info("%s accuracy: %.4f (%d 条)", bench_name, accuracy, len(examples))
-
-    avg_score = sum(scores) / len(scores) if scores else 0.0
-    logger.info("平均分 (%s): %.4f", metric_name, avg_score)
-
-    # 保存各 bench 详情
-    (output_dir / "eval_detail.json").write_text(
-        json.dumps(detail, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-    return {
-        "score": avg_score,
-        "metric_name": metric_name,
-        "bad_cases": all_bad_cases,
-        "benchmarks": list(detail.keys()),
-    }
+    # 显示清理后的磁盘占用
+    total_size = sum(f.stat().st_size for f in model_dir.rglob("*") if f.is_file())
+    logger.info("清理完成，模型目录大小：%.2f GB", total_size / (1024**3))
 
 
 # ---------------------------------------------------------------------------
 # 主入口
+# 主入口
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(description="LlamaFactory Math SFT + Eval")
-    parser.add_argument("--dataset", required=True, help="输入数据集 JSONL 路径")
+    parser.add_argument("--dataset", help="输入数据集 JSONL 路径（训练时必需）")
     parser.add_argument("--output", required=True, help="输出目录")
+    parser.add_argument(
+        "--model-dir",
+        default="",
+        help="已训练模型目录；提供后跳过数据转换和 SFT，仅执行评测",
+    )
     parser.add_argument(
         "--mode", default="dev", choices=["dev", "test"],
         help="dev=MATH train only（MCTS 迭代）；test=full math/science benchmark suite（终评）",
     )
     args = parser.parse_args()
 
-    dataset_path = Path(args.dataset)
+    dataset_path = Path(args.dataset) if args.dataset else None
+    model_dir = Path(args.model_dir) if args.model_dir else None
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
     mode = args.mode
     rank = _node_rank()
     remote_proc: subprocess.Popen | None = None
 
+    _ensure_nccl_ib_env_from_socket_ifname()
+
     try:
-        if _nnodes() > 1 and rank == 0 and not _node1_host():
-            raise RuntimeError("NNODES>1 但未设置 NODE1_HOST")
+        if model_dir is not None:
+            # --model-dir 模式：直接评测已有模型
+            if not model_dir.exists():
+                raise RuntimeError(f"评测模型目录不存在：{model_dir}")
 
-        # 1. 数据转换完全由 node0 / rank0 负责；node1 worker 不再介入。
-        data_dir = output_dir / "sft_data"
-        if rank == 0:
-            convert_dataset(dataset_path, data_dir)
+            eval_python = _eval_python() or sys.executable
+            results = _run_eval_with_standalone_script(model_dir, output_dir, mode, eval_python)
+        else:
+            if dataset_path is None:
+                raise RuntimeError("未提供 --dataset；训练模式下必须指定输入数据集")
+            if _nnodes() > 1 and rank == 0 and not _node1_host():
+                raise RuntimeError("NNODES>1 但未设置 NODE1_HOST")
 
-        # 2. 双机模式：由 node0 脚本内部先 SSH 拉起 node1 worker，再本地进入 rank0 训练。
-        if _should_launch_remote_worker():
-            remote_proc = _launch_remote_worker(dataset_path, output_dir, mode)
+            # 1. 数据转换完全由 node0 / rank0 负责；node1 worker 不再介入。
+            data_dir = output_dir / "sft_data"
+            if rank == 0:
+                convert_dataset(dataset_path, data_dir)
 
-        # 3. Full SFT：torchrun 在两机间协调的分布式作业。
-        model_dir = run_sft(data_dir, output_dir)
-        if remote_proc is not None:
-            _wait_remote_worker(remote_proc, timeout_sec=max(60, SFT_TRAIN_TIMEOUT_SEC // 100))
-            remote_proc = None
+            # 2. 双机模式：由 node0 脚本内部先 SSH 拉起 node1 worker，再本地进入 rank0 训练。
+            if _should_launch_remote_worker():
+                remote_proc = _launch_remote_worker(dataset_path, output_dir, mode)
 
-        # 4. 评测：只在 rank0 单机执行；node1 worker 训练完即退出。
-        if rank != 0:
-            logger.info("rank=%d 训练完成，非 rank0 不参与评测，退出。", rank)
-            return
-        results = run_eval(model_dir, output_dir, mode=mode)
+            # 3. Full SFT：torchrun 在两机间协调的分布式作业。
+            model_dir = run_sft(data_dir, output_dir)
+            if remote_proc is not None:
+                _wait_remote_worker(remote_proc, timeout_sec=max(60, SFT_TRAIN_TIMEOUT_SEC // 100))
+                remote_proc = None
+
+            # 4. 评测：只在 rank0 单机执行；node1 worker 训练完即退出。
+            if rank != 0:
+                logger.info("rank=%d 训练完成，非 rank0 不参与评测，退出。", rank)
+                return
+            results = _run_eval_stage(model_dir, output_dir, mode=mode)
 
     except Exception as exc:
         logger.error("流程失败：%s", exc, exc_info=True)

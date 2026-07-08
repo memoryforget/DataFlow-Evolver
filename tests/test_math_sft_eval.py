@@ -20,27 +20,11 @@ from math_benchmarks.additional_benchmarks import gpqa_score, load_chmath, load_
 from math_benchmarks.aime2024 import load_aime2024
 from math_benchmarks.gsm8k import load_gsm8k
 
-TEST_LARGE_BENCHMARKS = _MODULE.TEST_LARGE_BENCHMARKS
-TEST_SMALL_BENCHMARKS = _MODULE.TEST_SMALL_BENCHMARKS
 EVAL_SYSTEM_PROMPT_BOXED = _MODULE.EVAL_SYSTEM_PROMPT_BOXED
 _build_remote_worker_ssh_cmd = _MODULE._build_remote_worker_ssh_cmd
 _should_launch_remote_worker = _MODULE._should_launch_remote_worker
 _system_prompt_for = _MODULE._system_prompt_for
 _user_prompt_for = _MODULE._user_prompt_for
-
-
-def test_test_benchmark_suite_matches_expected_contract():
-    assert TEST_SMALL_BENCHMARKS == ("AIME2024", "AMC23", "CHMath")
-    assert TEST_LARGE_BENCHMARKS == (
-        "GSM8K",
-        "MATH500",
-        "OlympiadBench",
-        "Gaokao",
-        "Kaoyan",
-        "GradeSchool",
-        "MinervaMath",
-        "GPQA",
-    )
 
 
 def test_user_prompt_appends_choices():

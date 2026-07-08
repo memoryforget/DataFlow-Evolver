@@ -43,12 +43,16 @@ class DownstreamTrainerWrapper(TrainerWrapperABC):
         train_eval_cmd: str,
         timeout_sec: int = 1800,
         python_path: str | None = None,
+        eval_python_path: str | None = None,
     ) -> None:
         self.cmd_parts = _split_cmd(train_eval_cmd)
         # 允许配置独立的 train 环境 python（解决 agent/train 依赖冲突）
         if python_path and self.cmd_parts and self.cmd_parts[0] in ("python", "python3"):
             self.cmd_parts[0] = python_path
         self.timeout_sec = timeout_sec
+        self.launch_env: dict[str, str] = {}
+        if eval_python_path:
+            self.launch_env["SFT_EVAL_PYTHON"] = eval_python_path
 
     def run(self, dataset_path: str, output_dir: str) -> TrainResult:
         out_dir = Path(output_dir).resolve()
@@ -66,7 +70,7 @@ class DownstreamTrainerWrapper(TrainerWrapperABC):
 
         # 使用 Popen 以便在超时时杀死整个进程树（包括孙进程）
         try:
-            env = {**os.environ, "DF_TRAIN_RUN_ID": run_id}
+            env = {**os.environ, **self.launch_env, "DF_TRAIN_RUN_ID": run_id}
             if sys.platform == "win32":
                 # Windows: 创建新进程组
                 proc = subprocess.Popen(
@@ -151,6 +155,7 @@ class SSHTrainerWrapper(TrainerWrapperABC):
         ssh_opts: str = "",
         timeout_sec: int = 25200,
         python_path: str | None = None,
+        eval_python_path: str | None = None,
     ) -> None:
         self.cmd_parts = _split_cmd(train_eval_cmd)
         # rank1 远端解释器与 rank0 一致（默认沿用 python_path 或本机 python）
@@ -165,6 +170,7 @@ class SSHTrainerWrapper(TrainerWrapperABC):
         self.remote_cwd = remote_cwd or os.getcwd()
         self.ssh_opts = ssh_opts
         self.timeout_sec = timeout_sec
+        self.eval_python = eval_python_path or ""
 
     def _launcher_env(self, run_id: str) -> dict[str, str]:
         """构造 node0 launcher 环境。真正的 node1 拉起由脚本内部完成。"""
@@ -183,6 +189,8 @@ class SSHTrainerWrapper(TrainerWrapperABC):
         # REMOTE_CWD 可能为 None，需要转换为字符串或省略
         if self.remote_cwd is not None:
             env["REMOTE_CWD"] = str(self.remote_cwd)
+        if self.eval_python:
+            env["SFT_EVAL_PYTHON"] = self.eval_python
         return env
 
     def run(self, dataset_path: str, output_dir: str) -> TrainResult:

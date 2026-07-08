@@ -39,7 +39,7 @@ agent_sdk:
 
 # 数据生成规模：注入生成 prompt，指导算子产出量（合成式据此设 num_samples，转换式控采样/过滤）
 generation:
-  target_samples: 3000                      # 目标产出条数（0=不指定）；按下游 SFT 需求调，Condor 建议 <5000
+  target_samples: 800                      # 目标产出条数（0=不指定）；按下游 SFT 需求调，Condor 建议 <5000
 
 # 强基线锚点（相对增益奖励 / 池阈值；见 docs/design-decisions.md §2）
 # ✅ 已接入 main.py。锁定决策：Δ=0（node>baseline 即正向）、seed=42、只跑一次基线。
@@ -57,11 +57,11 @@ search:
   exploration_constant: 1.414
   exploration_decay: 1.0                    # 探索常数 c 的指数衰减率（按已评估节点数）；1.0=不衰减
   exploration_min: 0.0                      # 衰减下限，防 c 衰减到 0
-  max_iterations: 20
+  max_iterations: 10
   max_children_per_node: 4
   self_correction_retries: 5               # 流水线执行崩溃后的自修正重试次数
   review_self_correction_retries: 5        # Phase-1 评审打回后的自修正重试次数（看中间 step 产物定位、修复、重审）
-  checkpoint: ""                           # 断点续跑：非空=每轮落盘树状态到该路径，启动时存在则载入续跑；空=关闭
+  checkpoint: "./workspace/checkpoint.json"                           # 断点续跑：非空=每轮落盘树状态到该路径，启动时存在则载入续跑；空=关闭
 
 # Phase-1 快反馈：数据评审
 review:
@@ -71,9 +71,12 @@ review:
 
 # Phase-2 真实训练：外部脚本桥接
 trainer:
-  # train 环境的 python 路径（与 agent 环境隔离，解决 pydantic 版本冲突）
+  # train 环境的 python 路径（df-train；负责 SFT）
   # 留空则使用当前环境的 python
-  train_python: ${TRAIN_PYTHON:}
+  train_python: /vepfs-mlp2/c20250602/500050/lh/xqf/miniconda3/envs/df-train/bin/python
+  # eval 环境的 python 路径（df-eval；负责 vLLM benchmark 评测）
+  # 留空则在 train 进程内直接评测（仅适合同环境开发/调试）
+  eval_python: /vepfs-mlp2/c20250602/500050/lh/xqf/miniconda3/envs/df-eval/bin/python
   train_eval_cmd: python scripts/reference_train_eval.py   # 兼容旧入口（占位伪评测）
   # 防数据泄露纪律（见 docs/design-decisions.md §3）：
   #   dev：仅给 MCTS 当奖励信号，允许被「刷」；test：全程对 loop 不可见，仅终评一次。
@@ -85,15 +88,15 @@ trainer:
   #   local（默认）：编排器在本机拉起训练子进程，阻塞等待（单机）。
   #   ssh：编排器只在 node0 拉起一次训练脚本；脚本内部完成 convert_dataset、
   #        经免密 SSH 拉起 node1 worker、双机 torchrun 训练，以及 rank0 单机评测。
-  dispatch: local
+  dispatch: ssh
   # dispatch=ssh 时的双机参数：
   ssh:
-    node1_host: ${NODE1_HOST:}          # node1 的 SSH 目标（如 user@10.0.0.2 或 ~/.ssh/config 里的别名）
-    master_addr: ${MASTER_ADDR:}        # node0 对 node1 可路由的 IP（torchrun rendezvous 主地址）
+    node1_host: "30300"          # node1 的 SSH 目标（如 user@10.0.0.2 或 ~/.ssh/config 里的别名）
+    master_addr: 198.19.158.245       # node0 对 node1 可路由的 IP（torchrun rendezvous 主地址）
     master_port: 29500
     nnodes: 2
     gpus_per_node: 8                    # 每机 GPU 数（脚本内 NPROC_PER_NODE=gpus_per_node*nnodes//nnodes）
-    remote_cwd: ${REMOTE_CWD:}          # node1 上项目根目录（共享 FS 通常与本机同路径）；留空=编排器 cwd
+    remote_cwd: /vepfs-mlp2/c20250602/500050/lh/xqf/DataFlow-Evolver         # node1 上项目根目录（共享 FS 通常与本机同路径）；留空=编排器 cwd
     ssh_opts: ""                        # 额外 ssh 选项，如 "-i ~/.ssh/id_rsa -p 22"
 
 # Phase-2 慢反馈：诊断
@@ -104,7 +107,7 @@ diagnostic:
 # ✅ 已接入 main.py：运行期暂存 → dump 前统一[门槛筛→去重→占比裁剪]。
 # 门槛：暖启动 node_dev > baseline_dev+margin（严格）；冷启动 node_dev ≥ max(本轮分位数, score_threshold)。
 data_pool:
-  enabled: false                  # 默认关闭；开启需先做受控实验（等量对比+多样性量化）
+  enabled: true                  # 默认关闭；开启需先做受控实验（等量对比+多样性量化）
   score_threshold: 0.0            # 冷启动绝对地板（与分位数取 max；0=不设地板，纯靠分位数+review.passed）
   quantile: 0.5                   # 冷启动分位数门槛（0.5=中位数；尺度无关，跨 benchmark 不重调）
   max_pool_fraction_per_pipeline: 0.3   # 单 pipeline 占池上限 30%；来源数 <⌈1/f⌉(=4) 时不生效

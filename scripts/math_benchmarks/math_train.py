@@ -4,9 +4,14 @@
 这些是公开训练语料（非 benchmark test set），用作 MCTS dev 奖励信号不会污染终评。
 答案格式：LaTeX \\boxed{} 内为最终答案。
 评测 prompt 复用 Qwen2.5-Math 的模板格式。
+
+默认只加载固定的 500 条子集（seed=42 随机采样），加速 MCTS 迭代。
+设置环境变量 MATH_TRAIN_SAMPLE_SIZE=0 可加载全量 7500 条。
 """
 from __future__ import annotations
 
+import os
+import random
 from pathlib import Path
 
 from .answer_extract import extract_answer, extract_boxed, is_equiv
@@ -16,11 +21,18 @@ _DEFAULT_MATH_TRAIN_PATH = str(
     Path(__file__).resolve().parents[2] / "data" / "math_train.jsonl"
 )
 
+_SAMPLE_SIZE = int(os.environ.get("MATH_TRAIN_SAMPLE_SIZE", "500"))
+_SAMPLE_SEED = 42
+
 
 def load_math_train(
     data_path: str | None = None, cache_dir: str | None = None
 ) -> list[dict]:
-    """加载 MATH train set（本地文件）。返回 [{"question", "gold_answer", "level", "subject"}, ...]"""
+    """加载 MATH train set（本地文件）。返回 [{"question", "gold_answer", "level", "subject"}, ...]
+
+    默认返回固定的 500 条子集（seed=42），保证每次评测结果可复现。
+    设置环境变量 MATH_TRAIN_SAMPLE_SIZE=0 返回全量。
+    """
     import json
 
     path = Path(data_path) if data_path else Path(_DEFAULT_MATH_TRAIN_PATH)
@@ -51,6 +63,11 @@ def load_math_train(
                 "level": row.get("level", ""),
                 "subject": row.get("subject", ""),
             })
+
+    if _SAMPLE_SIZE > 0 and len(examples) > _SAMPLE_SIZE:
+        rng = random.Random(_SAMPLE_SEED)
+        examples = rng.sample(examples, _SAMPLE_SIZE)
+
     return examples
 
 

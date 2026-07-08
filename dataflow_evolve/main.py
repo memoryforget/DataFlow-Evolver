@@ -164,6 +164,7 @@ class Orchestrator:
         # dev 评测驱动 MCTS：trainer.dev_eval_cmd（见设计文档 §3/§6）
         dev_cmd = cfg.trainer.dev_eval_cmd
         train_python = cfg.trainer.get("train_python", None)
+        eval_python = cfg.trainer.get("eval_python", None)
         train_timeout = cfg.trainer.train_timeout_sec
         # 训练调度：local=本机拉起子进程（单机）；ssh=本机 rank0 + SSH 到 node1 拉起 rank1（双机）
         dispatch = cfg.trainer.get("dispatch", "local")
@@ -171,6 +172,8 @@ class Orchestrator:
         logger.info("dev 评测命令：%s（超时 %ds，dispatch=%s）", dev_cmd, train_timeout, dispatch)
         if train_python:
             logger.info("train 环境 python：%s", train_python)
+        if eval_python:
+            logger.info("eval 环境 python：%s", eval_python)
 
         def _make_trainer(cmd: str):
             if not cmd:
@@ -187,11 +190,13 @@ class Orchestrator:
                     ssh_opts=ssh_cfg.get("ssh_opts", ""),
                     timeout_sec=train_timeout,
                     python_path=train_python,
+                    eval_python_path=eval_python,
                 )
             return DownstreamTrainerWrapper(
                 train_eval_cmd=cmd,
                 timeout_sec=train_timeout,
                 python_path=train_python,
+                eval_python_path=eval_python,
             )
 
         self.trainer = _make_trainer(dev_cmd)

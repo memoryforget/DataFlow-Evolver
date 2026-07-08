@@ -33,9 +33,14 @@ TaskProfiler ──> TaskProfile
 
 ## 安装
 
-本项目将 **编排层（Agent）** 和 **训练层（Train）** 的依赖分离到不同的 optional extras，
-因为 `claude-agent-sdk` 依赖的 `pydantic>=2.11` 与 `llamafactory` 要求的 `pydantic<=2.10.6` 冲突，
-**不能共存于同一环境**。实际部署需要两个 conda 环境。
+本项目将 **编排层（Agent）**、**SFT 训练层（df-train）**、**vLLM 评测层（df-eval）**
+分离到不同的 optional extras：
+
+- `claude-agent-sdk` 与 `llamafactory` 的 `pydantic` 约束冲突，不能和 Agent 混装。
+- `llamafactory + deepspeed` 与 `vllm + xformers` 依赖的 PyTorch 版本线不同，
+  不建议再放进同一个环境。
+
+推荐部署为三个 conda 环境；如果你只做其中一个阶段，也可以只创建对应环境。
 
 ### 前置：安装 uv（全局，一次性）
 
@@ -55,37 +60,59 @@ uv pip install -e ".[agent]"     # openai / pyyaml / pydantic / claude-agent-sdk
 uv pip install -e ".[dev]"       # pytest（可选）
 ```
 
-### 环境 2：Train（训练/推理子进程）
+### 环境 2：df-train（SFT 训练子进程）
 
 ```bash
 conda create -n df-train python=3.11 -y
 conda activate df-train
 
-uv pip install -e ".[train]" \
+uv pip install -e ".[df-train]" \
+  --index-url https://mirrors.aliyun.com/pypi/simple/ \
   --extra-index-url https://download.pytorch.org/whl/cu121 \
   --index-strategy unsafe-best-match
 ```
 
-> **CUDA 兼容性**：`torch>=2.5,<2.6` 使用 cu121 wheel，兼容驱动 CUDA 12.1+（向下兼容）。
+> **CUDA 兼容性**：`df-train` 的 `torch>=2.5,<2.6` 使用 cu121 wheel，兼容驱动 CUDA 12.1+（向下兼容）。
 > 若机器 CUDA < 12.1，切换到对应的 PyTorch index（如 `cu118`）。
+
+### 环境 3：df-eval（vLLM 推理 / benchmark 评测）
+
+```bash
+conda create -n df-eval python=3.11 -y
+conda activate df-eval
+
+uv pip install -e ".[df-eval]"   --index-url https://mirrors.aliyun.com/pypi/simple/   --extra-index-url https://download.pytorch.org/whl/cu121   --index-strategy unsafe-best-match
+```
+
+> **CUDA 兼容性**：`df-eval` 使用 **vLLM 0.19.1 + transformers 4.57.x + torch 2.10.0**，
+> 推荐使用 PyTorch 官方 CUDA 12.8 wheel（兼容 CUDA 12.1+ 驱动）。
+> 
+> **重要**：不要使用 transformers 5.x，它删除了 `all_special_tokens_extended` 属性导致 vLLM 报错。
+> - 需设置环境变量 `VLLM_WORKER_MULTIPROC_METHOD=spawn` 避免 CUDA fork 错误（框架已自动设置）
+> - DP>1 时独立脚本自动启动 `vllm serve` + OpenAI API 模式推理（不再使用 external_launcher）
+> 
+> 评测配置：默认使用 TP=4（Tensor Parallel）+ DP=2（Data Parallel），共 8 张 GPU。
+> 系统 CUDA 驱动需 >= 12.1。
 
 ### 跨环境桥接
 
-训练子进程由主进程 `subprocess` 调用，通过配置指定 train 环境的 python 路径：
+训练子进程由主进程 `subprocess` 调用。SFT 与 benchmark 评测可分别指定不同环境的 python 路径：
 
 ```yaml
 # configs/default.yaml
 trainer:
   train_python: /path/to/miniconda3/envs/df-train/bin/python
+  eval_python: /path/to/miniconda3/envs/df-eval/bin/python
 ```
 
 或通过环境变量：
 
 ```bash
 export TRAIN_PYTHON=/path/to/miniconda3/envs/df-train/bin/python
+export EVAL_PYTHON=/path/to/miniconda3/envs/df-eval/bin/python
 ```
 
-留空则使用当前环境的 `python`（适用于单环境开发/测试场景）。
+留空则使用当前环境的 `python`。通常只建议在单环境开发/测试场景下这样做。
 
 ### 一次性准备 Agent 工作目录 `workspace/_agent_root/`
 
@@ -122,7 +149,8 @@ cd <DataFlow> && pip install -e .
 | `DF_API_KEY` | 辅助 Agent（Profiler/Review/Diagnostic）调用的 OpenAI-compatible API 密钥 |
 | `DF_API_URL` / `DF_MODEL` | 辅助 Agent 的 API 地址 / 模型名（可选，有默认值） |
 | `CLAUDE_MODEL` | Agent SDK 使用的 Claude 模型（默认 `claude-opus-4-6`） |
-| `TRAIN_PYTHON` | Train 环境的 python 路径（编排主进程用它 subprocess 调训练脚本） |
+| `TRAIN_PYTHON` | df-train 环境的 python 路径（编排主进程用它启动 SFT 脚本） |
+| `EVAL_PYTHON` | df-eval 环境的 python 路径（rank0 训练完成后切换到它执行 vLLM benchmark） |
 
 ---
 
@@ -155,6 +183,8 @@ python -m dataflow_evolve.main \
 
 其中 `<train_python>` 由 `trainer.train_python` 配置（留空则用当前环境 python），
 `<eval_cmd>` 对应 `trainer.dev_eval_cmd`（MCTS 迭代）或 `trainer.test_eval_cmd`（终评）。
+如果同时配置了 `trainer.eval_python`，脚本会在 rank0 训练完成后通过环境变量 `SFT_EVAL_PYTHON`
+重新拉起同一个脚本的 `--model-dir` 纯评测分支，并在 `df-eval` 环境内执行 vLLM benchmark。
 
 脚本必须在 `<out_dir>/results.json` 回写：
 
@@ -180,14 +210,34 @@ python -m dataflow_evolve.main \
 
 当前已配置的 Phase-2 真实链路：**Full SFT + 完整数学/科学 benchmark suite 评测**。
 
-### 安装训练/评测依赖
+### 安装 SFT / vLLM 依赖
 
 ```bash
-# 使用独立的 train 环境（见上方「安装」章节）
+# SFT 训练环境
 conda activate df-train
-uv pip install -e ".[train]" \
+uv pip install -e ".[df-train]" \
   --extra-index-url https://download.pytorch.org/whl/cu121 \
   --index-strategy unsafe-best-match
+
+# vLLM 评测环境
+conda activate df-eval
+uv pip install -e ".[df-eval]" \
+  --index-url https://mirrors.aliyun.com/pypi/simple/ \
+  --extra-index-url https://download.pytorch.org/whl/cu121 \
+  --index-strategy unsafe-best-match
+```
+
+> 推荐将 SFT 和 vLLM 评测拆成两次调用：
+> 先在 `df-train` 中产出 `sft_model/`，再在 `df-eval` 中通过 `--model-dir` 加载该模型做 benchmark。
+> 不再建议为了跑通整条链路，在同一个环境里混装 `llamafactory/deepspeed` 和 `vllm/xformers`。
+
+如果只对一个已经训练好的模型做评测，在 `df-eval` 中直接运行：
+
+```bash
+python scripts/llamafactory_math_sft_eval.py \
+  --model-dir <out_dir>/sft_model \
+  --output <out_dir> \
+  --mode dev
 ```
 
 ### 环境变量
@@ -200,9 +250,10 @@ uv pip install -e ".[train]" \
 | `SFT_BATCH_SIZE` | `1` | per-device batch size |
 | `SFT_GRAD_ACCUM` | `4` | 梯度累积步数 |
 | `SFT_NUM_GPUS` | `16` | 训练**集群总卡数**（torchrun；双机每机 8 卡）；`NPROC_PER_NODE = SFT_NUM_GPUS // NNODES` |
-| `EVAL_TP_SIZE` | `2` | vLLM 推理 tensor parallel size |
-| `EVAL_DP_SIZE` | `4` | vLLM 推理 data parallel size（eval 只在 rank0 单机跑，`TP×DP=8`=本机卡数） |
-| `EVAL_MAX_MODEL_LEN` | `65536` | vLLM 最大序列长度（Qwen2.5-32B 上下文窗口） |
+| `EVAL_TP_SIZE` | `4` | vLLM 推理 tensor parallel size |
+| `EVAL_DP_SIZE` | `2` | vLLM 推理 data parallel size（TP×DP = 总 GPU 数，默认 4×2=8） |
+| `EVAL_CUDA_VISIBLE_DEVICES` | 未设置 | 评测使用的 GPU（如 `0,1,2,3,4,5,6,7`）；留空则自动使用前 TP×DP 个 GPU |
+| `EVAL_MAX_MODEL_LEN` | `32768` | vLLM 最大序列长度（Qwen2.5-32B 上下文窗口） |
 | `EVAL_MAX_NEW_TOKENS` | `8192` | 评测推理最大生成 token 数 |
 | `MATH_TRAIN_PATH` | `data/math_train.jsonl` | dev 评测题库路径（MATH competition train 7500 条） |
 | `HF_CACHE_DIR` | `None` | HuggingFace datasets 缓存目录 |

@@ -1,10 +1,7 @@
 # Part of the code is modified from the code snippets provided in "Solving Quantitative Reasoning Problems with Language Models" by Lewkowycz et al.
-import pdb
 import re
 import sympy
-import threading
 from sympy.parsing.latex import parse_latex
-from .parser import strip_string
 
 SUBSTITUTIONS = [
     ('an ', ''), ('a ', ''), ('.$', '$'), ('\\$', ''), (r'\ ', ''), ('\%', '%'),
