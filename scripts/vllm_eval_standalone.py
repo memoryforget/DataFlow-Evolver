@@ -32,6 +32,45 @@ logger = logging.getLogger(__name__)
 SERVE_PORT = int(os.environ.get("VLLM_SERVE_PORT", "18902"))
 SERVE_HOST = "127.0.0.1"
 
+# LIMO 论文：对小 benchmark(<50 题)用 temperature=0.6 采样 N 个样本，计算 unbiased pass@1；
+# 其余 benchmark 用 greedy 单样本。pass@1(k=1) 的无偏估计 = 每题正确样本数 / N，再对题目求平均。
+MULTI_SAMPLE_BENCHES = {"aime2024", "amc23", "chmath"}
+MULTI_SAMPLE_N = int(os.environ.get("EVAL_MULTI_SAMPLE_N", "4"))
+MULTI_SAMPLE_TEMP = float(os.environ.get("EVAL_MULTI_SAMPLE_TEMP", "0.6"))
+
+
+def _sampling_plan(bench_name: str) -> tuple[int, float]:
+    """返回 (n, temperature)：小 benchmark 多样本 temp=0.6，其余 greedy 单样本。"""
+    if bench_name in MULTI_SAMPLE_BENCHES:
+        return MULTI_SAMPLE_N, MULTI_SAMPLE_TEMP
+    return 1, 0.0
+
+
+def _score_benchmark(bench_name: str, examples: list, preds_per_example: list,
+                     all_bad_cases: list, max_bad_cases: int) -> float:
+    """按 unbiased pass@1 打分。preds_per_example[i] 为第 i 题的 N 个预测文本列表。"""
+    from math_benchmarks.grader import check_is_correct
+    from math_benchmarks.answer_extract import extract_answer
+
+    total = 0.0
+    for i, ex in enumerate(examples):
+        preds = preds_per_example[i] or [""]
+        correct = sum(
+            1 for p in preds
+            if check_is_correct(extract_answer(p, bench_name), ex["gold_answer"])
+        )
+        total += correct / len(preds)
+        if correct == 0 and len(all_bad_cases) < max_bad_cases:
+            first = preds[0]
+            all_bad_cases.append({
+                "input": ex["question"],
+                "prediction": first[:500],
+                "extracted_answer": extract_answer(first, bench_name),
+                "ground_truth": ex["gold_answer"],
+                "error_type": f"{bench_name}:wrong_answer",
+            })
+    return total / max(len(examples), 1)
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -41,7 +80,7 @@ def parse_args():
     parser.add_argument("--tp-size", type=int, default=4)
     parser.add_argument("--dp-size", type=int, default=1)
     parser.add_argument("--max-model-len", type=int, default=32768)
-    parser.add_argument("--max-new-tokens", type=int, default=8192)
+    parser.add_argument("--max-new-tokens", type=int, default=32768)
     return parser.parse_args()
 
 
@@ -62,19 +101,24 @@ def _wait_for_server(base_url: str, timeout: int = 300) -> bool:
 
 
 def _generate_via_api(base_url: str, model: str, messages_list: list[list[dict]],
-                      max_tokens: int, concurrency: int = 64) -> list[str]:
-    """通过 OpenAI Chat Completions API 并发推理。"""
+                      max_tokens: int, n: int = 1, temperature: float = 0.0,
+                      concurrency: int = 64) -> list[list[str]]:
+    """通过 OpenAI Chat Completions API 并发推理。
+
+    每个 prompt 采样 n 个样本，返回 list[list[str]]（每题 n 个预测文本）。
+    """
     import urllib.request
     from concurrent.futures import ThreadPoolExecutor
 
-    results = [""] * len(messages_list)
+    results: list[list[str]] = [[] for _ in messages_list]
 
-    def _call(idx: int) -> tuple[int, str]:
+    def _call(idx: int) -> tuple[int, list[str]]:
         payload = json.dumps({
             "model": model,
             "messages": messages_list[idx],
             "max_tokens": max_tokens,
-            "temperature": 0.0,
+            "temperature": temperature,
+            "n": n,
         }).encode()
         req = urllib.request.Request(
             f"{base_url}/v1/chat/completions",
@@ -84,11 +128,11 @@ def _generate_via_api(base_url: str, model: str, messages_list: list[list[dict]]
         )
         with urllib.request.urlopen(req, timeout=600) as resp:
             data = json.loads(resp.read())
-        return idx, data["choices"][0]["message"]["content"]
+        return idx, [c["message"]["content"] for c in data["choices"]]
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        for idx, text in pool.map(lambda i: _call(i), range(len(messages_list))):
-            results[idx] = text
+        for idx, texts in pool.map(lambda i: _call(i), range(len(messages_list))):
+            results[idx] = texts
     return results
 
 
@@ -155,8 +199,6 @@ def run_eval_offline(model_dir: Path, mode: str, tp_size: int,
                      max_model_len: int, max_new_tokens: int) -> dict:
     """DP=1: 直接用 vLLM LLM 类推理。"""
     from vllm import LLM, SamplingParams
-    from math_benchmarks.grader import check_is_correct
-    from math_benchmarks.answer_extract import extract_answer
 
     llm = LLM(
         model=str(model_dir),
@@ -166,35 +208,25 @@ def run_eval_offline(model_dir: Path, mode: str, tp_size: int,
         enforce_eager=True,
     )
     tokenizer = llm.get_tokenizer()
-    sampling_params = SamplingParams(temperature=0.0, max_tokens=max_new_tokens)
     benchmarks = _load_benchmarks(mode)
 
     bench_scores = {}
     all_bad_cases = []
-    MAX_BAD_CASES_PER_BENCH = 30
+    max_bad_total = 30 * len(benchmarks)
     for bench_name, load_fn, prompt_fn in benchmarks:
         try:
             examples = load_fn()
-            logger.info("评测 %s: %d 条样本", bench_name, len(examples))
+            n, temp = _sampling_plan(bench_name)
+            logger.info("评测 %s: %d 条样本 (n=%d, temp=%.2f)", bench_name, len(examples), n, temp)
             prompts = _build_prompts(examples, prompt_fn, tokenizer)
-            outputs = llm.generate(prompts, sampling_params)
-            correct = 0
-            for i, ex in enumerate(examples):
-                pred_text = outputs[i].outputs[0].text
-                pred_answer = extract_answer(pred_text, bench_name)
-                if check_is_correct(pred_answer, ex["gold_answer"]):
-                    correct += 1
-                elif len(all_bad_cases) < MAX_BAD_CASES_PER_BENCH * len(benchmarks):
-                    all_bad_cases.append({
-                        "input": ex["question"],
-                        "prediction": pred_text[:500],
-                        "extracted_answer": pred_answer,
-                        "ground_truth": ex["gold_answer"],
-                        "error_type": f"{bench_name}:wrong_answer",
-                    })
-            accuracy = correct / len(examples)
+            sp = SamplingParams(temperature=temp, n=n, max_tokens=max_new_tokens)
+            outputs = llm.generate(prompts, sp)
+            preds_per_example = [[o.text for o in outputs[i].outputs]
+                                 for i in range(len(examples))]
+            accuracy = _score_benchmark(bench_name, examples, preds_per_example,
+                                        all_bad_cases, max_bad_total)
             bench_scores[bench_name] = accuracy
-            logger.info("%s accuracy: %.4f (%d/%d)", bench_name, accuracy, correct, len(examples))
+            logger.info("%s pass@1: %.4f (n=%d)", bench_name, accuracy, n)
         except Exception as e:
             logger.error("评测 %s 失败: %s", bench_name, e, exc_info=True)
             bench_scores[bench_name] = 0.0
@@ -229,9 +261,6 @@ def _cleanup_vllm_workers():
 def run_eval_serve(model_dir: Path, mode: str, tp_size: int, dp_size: int,
                    max_model_len: int, max_new_tokens: int) -> dict:
     """DP>1: 启动 vllm serve 子进程，通过 OpenAI Chat API 推理。"""
-    from math_benchmarks.grader import check_is_correct
-    from math_benchmarks.answer_extract import extract_answer
-
     base_url = f"http://{SERVE_HOST}:{SERVE_PORT}"
     model_str = str(model_dir)
 
@@ -248,45 +277,41 @@ def run_eval_serve(model_dir: Path, mode: str, tp_size: int, dp_size: int,
         "--enforce-eager",
         "--gpu-memory-utilization", "0.9",
     ]
-    logger.info("启动 vllm serve: TP=%d DP=%d, port=%d", tp_size, dp_size, SERVE_PORT)
+    serve_log_path = model_dir.parent / "vllm_serve.log"
+    serve_timeout = int(os.environ.get("VLLM_SERVE_TIMEOUT", "900"))
+    logger.info("启动 vllm serve: TP=%d DP=%d, port=%d, 日志=%s, 超时=%ds",
+                tp_size, dp_size, SERVE_PORT, serve_log_path, serve_timeout)
+    serve_log = open(serve_log_path, "w")
     serve_proc = subprocess.Popen(
-        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cmd, stdout=serve_log, stderr=subprocess.STDOUT,
         preexec_fn=os.setsid,
     )
 
     try:
-        if not _wait_for_server(base_url, timeout=300):
-            raise RuntimeError("vllm serve 启动超时（300s）")
+        if not _wait_for_server(base_url, timeout=serve_timeout):
+            raise RuntimeError(
+                f"vllm serve 启动超时（{serve_timeout}s），详见 {serve_log_path}")
         logger.info("vllm serve 就绪")
 
         benchmarks = _load_benchmarks(mode)
 
         bench_scores = {}
         all_bad_cases = []
-        MAX_BAD_CASES_PER_BENCH = 30
+        max_bad_total = 30 * len(benchmarks)
         for bench_name, load_fn, prompt_fn in benchmarks:
             try:
                 examples = load_fn()
-                logger.info("评测 %s: %d 条样本", bench_name, len(examples))
+                n, temp = _sampling_plan(bench_name)
+                logger.info("评测 %s: %d 条样本 (n=%d, temp=%.2f)",
+                            bench_name, len(examples), n, temp)
                 messages_list = _build_messages(examples, prompt_fn)
-                pred_texts = _generate_via_api(base_url, model_str, messages_list, max_new_tokens)
-                correct = 0
-                for i, ex in enumerate(examples):
-                    pred_answer = extract_answer(pred_texts[i], bench_name)
-                    if check_is_correct(pred_answer, ex["gold_answer"]):
-                        correct += 1
-                    elif len(all_bad_cases) < MAX_BAD_CASES_PER_BENCH * len(benchmarks):
-                        all_bad_cases.append({
-                            "input": ex["question"],
-                            "prediction": pred_texts[i][:500],
-                            "extracted_answer": pred_answer,
-                            "ground_truth": ex["gold_answer"],
-                            "error_type": f"{bench_name}:wrong_answer",
-                        })
-                accuracy = correct / len(examples)
+                preds_per_example = _generate_via_api(
+                    base_url, model_str, messages_list, max_new_tokens,
+                    n=n, temperature=temp)
+                accuracy = _score_benchmark(bench_name, examples, preds_per_example,
+                                            all_bad_cases, max_bad_total)
                 bench_scores[bench_name] = accuracy
-                logger.info("%s accuracy: %.4f (%d/%d)",
-                            bench_name, accuracy, correct, len(examples))
+                logger.info("%s pass@1: %.4f (n=%d)", bench_name, accuracy, n)
             except Exception as e:
                 logger.error("评测 %s 失败: %s", bench_name, e, exc_info=True)
                 bench_scores[bench_name] = 0.0
@@ -310,6 +335,10 @@ def run_eval_serve(model_dir: Path, mode: str, tp_size: int, dp_size: int,
             serve_proc.wait(timeout=5)
         # 清理可能残留的 vLLM worker 进程（它们可能不在同一进程组）
         _cleanup_vllm_workers()
+        try:
+            serve_log.close()
+        except Exception:
+            pass
         logger.info("vllm serve 已停止")
 
 

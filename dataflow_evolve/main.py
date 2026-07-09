@@ -101,7 +101,7 @@ class Orchestrator:
             serving,
             schema_threshold=review_cfg.get("schema_threshold", 0.6),
             relevance_threshold=review_cfg.get("relevance_threshold", 0.6),
-            sample_size=review_cfg.get("sample_size", 20),
+            sample_size=review_cfg.get("sample_size", 40),
         )
         self.diagnostician = DiagnosticAgent(
             serving, max_bad_cases=cfg.diagnostic.get("max_bad_cases", 30)
@@ -200,7 +200,9 @@ class Orchestrator:
             )
 
         self.trainer = _make_trainer(dev_cmd)
-        # test 终评（全程对 MCTS loop 不可见，仅终评一次）
+        # test 终评（全程对 MCTS loop 不可见，仅终评一次）。
+        # 注意：run() 不会调用 self.test_trainer；它仅为「手动终评」预留（防泄露纪律见 README §防数据泄露）。
+        # 终评一般直接运行 scripts/llamafactory_math_sft_eval.py --mode test，或另接显式入口调用它。
         test_cmd = cfg.trainer.get("test_eval_cmd", "")
         self.test_trainer = _make_trainer(test_cmd)
 
@@ -229,8 +231,8 @@ class Orchestrator:
             exploration_decay=search.get("exploration_decay", 1.0),
             exploration_min=search.get("exploration_min", 0.0),
         )
-        self.max_iterations = search.get("max_iterations", 20)
-        self.self_correction_retries = search.get("self_correction_retries", 2)
+        self.max_iterations = search.get("max_iterations", 10)
+        self.self_correction_retries = search.get("self_correction_retries", 5)
         self.review_self_correction_retries = search.get("review_self_correction_retries", 5)
         # 断点续跑（默认关闭）：非空路径则每轮落盘树状态，启动时若存在则载入续跑
         self.checkpoint_path = search.get("checkpoint", "")

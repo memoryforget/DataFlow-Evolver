@@ -28,7 +28,7 @@ llm:
 
 # PipelineAgent 使用的 Claude Agent SDK
 agent_sdk:
-  model: claude-opus-4-7
+  model: claude-opus-4-8
   permission_mode: bypassPermissions       # 无头自动化
   setting_sources: [project]               # 从 cwd/.claude 加载技能
   skills: [dataflow-dev]                    # 经 setting_sources(project)+.claude/skills 自动发现；generating-dataflow-pipeline 不再强制使用
@@ -80,7 +80,7 @@ trainer:
   train_eval_cmd: python scripts/reference_train_eval.py   # 兼容旧入口（占位伪评测）
   # 防数据泄露纪律（见 docs/design-decisions.md §3）：
   #   dev：仅给 MCTS 当奖励信号，允许被「刷」；test：全程对 loop 不可见，仅终评一次。
-  dev_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode dev     # Full SFT + MATH train 7500 题评测
+  dev_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode dev     # Full SFT + MATH train 评测（默认抽样 500 题，MATH_TRAIN_SAMPLE_SIZE=0 跑全量 7500）
   test_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode test   # 终评：完整 benchmark suite（GSM8K/AIME/MATH500/AMC23/OlympiadBench/CHMath/Gaokao/Kaoyan/GradeSchool/MinervaMath/GPQA）
   timeout_sec: 3600                                             # 流水线执行（纯数据合成）超时；约几分钟完成，1h 足够
   train_timeout_sec: 28800                                      # dev/test 评测（含内层 Full SFT 训练 6h + benchmark suite 评测）超时=8h
@@ -107,7 +107,7 @@ diagnostic:
 # ✅ 已接入 main.py：运行期暂存 → dump 前统一[门槛筛→去重→占比裁剪]。
 # 门槛：暖启动 node_dev > baseline_dev+margin（严格）；冷启动 node_dev ≥ max(本轮分位数, score_threshold)。
 data_pool:
-  enabled: true                  # 默认关闭；开启需先做受控实验（等量对比+多样性量化）
+  enabled: true                  # 已接入 main.py：true=启动即建 DataPool 累积高质量数据；置 false 关闭（做独立性消融/省算力时）。开启前建议先做受控实验（等量对比+多样性量化）
   score_threshold: 0.0            # 冷启动绝对地板（与分位数取 max；0=不设地板，纯靠分位数+review.passed）
   quantile: 0.5                   # 冷启动分位数门槛（0.5=中位数；尺度无关，跨 benchmark 不重调）
   max_pool_fraction_per_pipeline: 0.3   # 单 pipeline 占池上限 30%；来源数 <⌈1/f⌉(=4) 时不生效

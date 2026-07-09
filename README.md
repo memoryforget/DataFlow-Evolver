@@ -1,6 +1,8 @@
-# DataFlow-Evolve
+# DataFlow-Evolver
 
 多智能体、MCTS 驱动的自动数据工程框架（双反馈环）。
+
+> 说明：仓库/项目名为 **DataFlow-Evolver**；Python 包与入口模块沿用 `dataflow_evolve`（如 `python -m dataflow_evolve.main`），两者不一致是历史命名，导入路径以 `dataflow_evolve` 为准。
 
 根据高层任务描述，自动生成 / 变异 DataFlow 流水线 DAG，并通过 **双反馈环**——
 快速的"左移"数据评审（Phase-1）+ 真实的下游模型训练评估（Phase-2，产出可执行诊断报告）——
@@ -81,7 +83,7 @@ uv pip install -e ".[df-train]" \
 conda create -n df-eval python=3.11 -y
 conda activate df-eval
 
-uv pip install -e ".[df-eval]"   --index-url https://mirrors.aliyun.com/pypi/simple/   --extra-index-url https://download.pytorch.org/whl/cu121   --index-strategy unsafe-best-match
+uv pip install -e ".[df-eval]"   --index-url https://mirrors.aliyun.com/pypi/simple/   --extra-index-url https://download.pytorch.org/whl/cu128   --index-strategy unsafe-best-match
 ```
 
 > **CUDA 兼容性**：`df-eval` 使用 **vLLM 0.19.1 + transformers 4.57.x + torch 2.10.0**，
@@ -105,12 +107,9 @@ trainer:
   eval_python: /path/to/miniconda3/envs/df-eval/bin/python
 ```
 
-或通过环境变量：
-
-```bash
-export TRAIN_PYTHON=/path/to/miniconda3/envs/df-train/bin/python
-export EVAL_PYTHON=/path/to/miniconda3/envs/df-eval/bin/python
-```
+> 这两项**只识别 YAML 键**，不是直接读取的环境变量。若想用环境变量注入，请在 YAML 里写成
+> `train_python: ${TRAIN_PYTHON:}` / `eval_python: ${EVAL_PYTHON:}`（`utils/config.py` 会做 `${ENV:default}` 展开）。
+> `eval_python` 在内部会以 `SFT_EVAL_PYTHON` 传给评测子进程。
 
 留空则使用当前环境的 `python`。通常只建议在单环境开发/测试场景下这样做。
 
@@ -146,23 +145,29 @@ cd <DataFlow> && pip install -e .
 | 变量 | 用途 |
 |---|---|
 | `ANTHROPIC_API_KEY` | **PipelineAgent 的 Agent SDK 运行所必需**（未设置则无法实际生成流水线） |
-| `DF_API_KEY` | 辅助 Agent（Profiler/Review/Diagnostic）调用的 OpenAI-compatible API 密钥 |
-| `DF_API_URL` / `DF_MODEL` | 辅助 Agent 的 API 地址 / 模型名（可选，有默认值） |
-| `CLAUDE_MODEL` | Agent SDK 使用的 Claude 模型（默认 `claude-opus-4-6`） |
-| `TRAIN_PYTHON` | df-train 环境的 python 路径（编排主进程用它启动 SFT 脚本） |
-| `EVAL_PYTHON` | df-eval 环境的 python 路径（rank0 训练完成后切换到它执行 vLLM benchmark） |
+| `DF_API_KEY` | 辅助 Agent（Profiler/Review/Diagnostic）调用的 OpenAI-compatible API 密钥；API 地址/模型名在 `llm.api` 段配置（非环境变量） |
+
+> Claude 模型不由环境变量控制，而是 `configs/default.yaml` 的 `agent_sdk.model`（当前默认 `claude-opus-4-8`）。
+> df-train / df-eval 的 python 路径同样是 YAML 键 `trainer.train_python` / `trainer.eval_python`（见上"跨环境桥接"），
+> 不是直接读取的 `TRAIN_PYTHON` / `EVAL_PYTHON` 环境变量。
 
 ---
 
 ## 运行
+
+```bash
 export IS_SANDBOX=1
 export HF_HOME="./hf_cache"
 export ANTHROPIC_BASE_URL=http://123.129.219.111:3000
-export ANTHROPIC_API_KEY=
-export DF_API_KEY=
-export NCCL_SOCKET_IFNAME=eth2
-export GLOO_SOCKET_IFNAME=eth2
-```bash
+export ANTHROPIC_API_KEY=<你的 key>
+export DF_API_KEY=<你的 key>
+
+# 多机训练（dispatch: ssh）必需：把 NCCL/GLOO 钉到跨机可达的网卡，
+# 需与 trainer.ssh.master_addr 所在网卡一致（本机 master_addr=198.19.158.245 → eth5）；
+# 不设会导致 NCCL 自动选到管理网卡(如 eth0)而跨机连不通。单机训练可忽略。
+export NCCL_SOCKET_IFNAME=eth5
+export GLOO_SOCKET_IFNAME=eth5
+
 python -m dataflow_evolve.main \
   --config configs/default.yaml \
   --task "构建一个高质量的数学问答 SFT 数据集" \
@@ -223,9 +228,13 @@ uv pip install -e ".[df-train]" \
 conda activate df-eval
 uv pip install -e ".[df-eval]" \
   --index-url https://mirrors.aliyun.com/pypi/simple/ \
-  --extra-index-url https://download.pytorch.org/whl/cu121 \
+  --extra-index-url https://download.pytorch.org/whl/cu128 \
   --index-strategy unsafe-best-match
 ```
+
+> **transformers 版本刻意错开**：`df-train` 用 transformers 5.x（`pyproject.toml` 钉 `>=5.6,<5.7`），
+> `df-eval` 用 4.57.x（`<5`）。训练导出的 tokenizer 元数据由 `llamafactory_math_sft_eval.py` 的
+> checkpoint 转换阶段自动做 5.x→4.x 兼容处理（移除 `extra_special_tokens`），所以两个环境版本不同是预期行为，勿强行统一。
 
 > 推荐将 SFT 和 vLLM 评测拆成两次调用：
 > 先在 `df-train` 中产出 `sft_model/`，再在 `df-eval` 中通过 `--model-dir` 加载该模型做 benchmark。
@@ -244,7 +253,7 @@ python scripts/llamafactory_math_sft_eval.py \
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `SFT_BASE_MODEL` | `Qwen/Qwen2.5-32B-Instruct` | 基座模型（HuggingFace ID 或本地路径） |
+| `SFT_BASE_MODEL` | 本地路径 `/vepfs-mlp2/c20250602/500050/models/Qwen2.5-32B-Instruct` | 基座模型（HuggingFace ID 或本地路径）；脚本内默认是该机器上的本地权重 |
 | `SFT_NUM_EPOCHS` | `15` | 训练 epoch 数（LIMO 配置） |
 | `SFT_LEARNING_RATE` | `5e-6` | 学习率（LIMO：极低、无 warmup） |
 | `SFT_BATCH_SIZE` | `1` | per-device batch size |
@@ -255,8 +264,8 @@ python scripts/llamafactory_math_sft_eval.py \
 | `EVAL_CUDA_VISIBLE_DEVICES` | 未设置 | 评测使用的 GPU（如 `0,1,2,3,4,5,6,7`）；留空则自动使用前 TP×DP 个 GPU |
 | `EVAL_MAX_MODEL_LEN` | `32768` | vLLM 最大序列长度（Qwen2.5-32B 上下文窗口） |
 | `EVAL_MAX_NEW_TOKENS` | `8192` | 评测推理最大生成 token 数 |
-| `MATH_TRAIN_PATH` | `data/math_train.jsonl` | dev 评测题库路径（MATH competition train 7500 条） |
-| `HF_CACHE_DIR` | `None` | HuggingFace datasets 缓存目录 |
+| `MATH_TRAIN_SAMPLE_SIZE` | `500` | dev 评测从 MATH train（7500 条）随机抽样的题数（`seed=42`）；设 `0` 跑全量 7500 |
+| `HF_CACHE_DIR` | `./hf_cache` | HuggingFace 缓存目录（当前脚本中定义但未实际使用） |
 | `BENCHMARK_ROOT` | `data/benchmarks/limo_eval` | 仓库内固定 benchmark 根目录约定，不是运行时配置项 |
 
 > **双机执行模型**：`run_sft` 是 torchrun 分布式作业，两机(rank0/rank1)都参与；`convert_dataset` 与
@@ -273,7 +282,7 @@ python scripts/llamafactory_math_sft_eval.py \
 脚本遵循 Phase-2 契约，由框架自动调用（`trainer.dev_eval_cmd`）：
 
 ```bash
-# dev 模式（MCTS 迭代，框架自动调用）：MATH train 全量 7500 题
+# dev 模式（MCTS 迭代，框架自动调用）：MATH train 默认随机抽样 500 题（MATH_TRAIN_SAMPLE_SIZE=0 跑全量 7500）
 python scripts/llamafactory_math_sft_eval.py --mode dev --dataset <ds.jsonl> --output <out_dir>
 
 # test 模式（终评，手动调用一次）：跑完整 benchmark suite
@@ -281,10 +290,10 @@ python scripts/llamafactory_math_sft_eval.py --mode test --dataset <ds.jsonl> --
 ```
 
 内部流程：
-1. **格式转换**：DataFlow JSONL (`instruction` + `generated_cot`) → LlamaFactory ShareGPT 格式
+1. **格式转换**：DataFlow JSONL → LlamaFactory ShareGPT 格式。字段按优先级取：instruction ← `instruction`/`question`/`input`；output ← `generated_cot`/`output`/`answer`（本项目当前 schema 用的是 `instruction`+`output`）
 2. **Full SFT**：Qwen2.5-32B + DeepSpeed ZeRO-3（双机 16 GPU），全量微调
 3. **评测**：vLLM 加载 fine-tuned 模型推理+判分（Qwen2.5-Math prompt 格式）
-   - dev：MATH train 全量（7500 条公开竞赛训练题，非 benchmark test set）
+   - dev：MATH train（7500 条公开竞赛训练题，非 benchmark test set；默认随机抽样 500 条作奖励信号，`MATH_TRAIN_SAMPLE_SIZE=0` 跑全量）
    - test：GSM8K + AIME2024 + MATH500 + AMC23 + OlympiadBench + CHMath + Gaokao + Kaoyan + GradeSchool + MinervaMath + GPQA
 4. **输出**：bench 平均 accuracy 作为 `score` 写入 `results.json`
 
@@ -313,7 +322,7 @@ trainer:
     master_port: 29500
     nnodes: 2
     gpus_per_node: 8                   # 每机 GPU 数
-    remote_cwd: /shared/DataFlow-Evolve  # node1 上先 cd 到这个项目目录，再执行 scripts/llamafactory_math_sft_eval.py；留空=编排器 cwd
+    remote_cwd: /shared/DataFlow-Evolver  # node1 上先 cd 到这个项目目录，再执行 scripts/llamafactory_math_sft_eval.py；留空=编排器 cwd
     ssh_opts: ""                       # 额外 ssh 选项，如 "-i ~/.ssh/id_rsa -p 22"
 ```
 
@@ -379,15 +388,16 @@ MCTS 反复用同一 benchmark 当奖励会**对它过拟合**；若再用同一
 
 ---
 
-## 数据池（可选副产品，默认关闭）
+## 数据池（可选副产品）
 
-`configs/default.yaml` 的 `data_pool` 段可开启跨节点高质量数据的累积池。定位见
+`configs/default.yaml` 的 `data_pool` 段控制跨节点高质量数据的累积池。定位见
 [`docs/design-decisions.md`](./docs/design-decisions.md)：
 
 - **交付主线是「最优 pipeline」**；池是可选成品，**与 MCTS 奖励解耦**（奖励保持 per-node）。
 - 池价值 = 可直接用的成品 + 回收已花算力 + 承载诊断驱动的累积覆盖（单节点结构上做不到）。
-- ⚠️ **脚手架阶段**：`core/data_pool.py` 已有接口/去重/上限，但**尚未接入主循环**；
-  「池 vs 单 pipeline 谁更强」是**待受控实验检验的假设**（须等量对比 + 多样性量化），**非既定结论**。
+- **接入状态**：`core/data_pool.py` 的接口/去重/上限**已接入 `main.py`**（启动时按 `data_pool.enabled` 实例化 `DataPool`）。
+  当前 `default.yaml` 的 `enabled` 默认值为 **`true`**（随仓库配置）；若做独立性消融或省算力，可手动置 `false`。
+- ⚠️ 「池 vs 单 pipeline 谁更强」仍是**待受控实验检验的假设**（须等量对比 + 多样性量化），**非既定结论**。
 
 ---
 

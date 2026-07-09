@@ -5,6 +5,9 @@ __pycache__/
 .pytest_cache/
 .env
 
+# HuggingFace 本地缓存（运行期产物，勿提交）
+hf_cache/
+
 # 1. 忽略 workspace 下的所有内容（但保留目录结构，允许进入）
 workspace/*
 !workspace/.gitkeep

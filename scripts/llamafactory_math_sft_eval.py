@@ -4,7 +4,7 @@
     python scripts/llamafactory_math_sft_eval.py --dataset <ds.jsonl> --output <out_dir> [--mode dev|test]
 
 模式：
-    dev（默认）：MATH train 全量 (7500 条) 评测，驱动 MCTS 奖励信号。
+    dev（默认）：MATH train 随机抽样 500 条评测（MATH_TRAIN_SAMPLE_SIZE 控制，=0 跑全量 7500），驱动 MCTS 奖励信号。
     test：GSM8K + AIME2024 + MATH500 + AMC23 + OlympiadBench + CHMath +
           Gaokao + Kaoyan + GradeSchool + MinervaMath + GPQA，仅终评用。
 
@@ -95,7 +95,7 @@ WARMUP_STEPS = int(os.environ.get("SFT_WARMUP_STEPS", "5"))  # 论文无 warmup�
 TP_SIZE = int(os.environ.get("EVAL_TP_SIZE", "4"))
 DP_SIZE = int(os.environ.get("EVAL_DP_SIZE", "2"))  # 默认 DP=2，配合 TP=4 使用全部 8 张 GPU
 MAX_MODEL_LEN = int(os.environ.get("EVAL_MAX_MODEL_LEN", "32768"))  # Qwen2.5-32B 上下文窗口,与LIMO一致
-MAX_NEW_TOKENS = int(os.environ.get("EVAL_MAX_NEW_TOKENS", "8192"))  # 评测生成长度上限
+MAX_NEW_TOKENS = int(os.environ.get("EVAL_MAX_NEW_TOKENS", "32768"))  # 评测生成长度上限，与 LIMO 一致(实际受 MAX_MODEL_LEN-prompt 挤占)
 HF_CACHE_DIR = os.environ.get("HF_CACHE_DIR", "./hf_cache")  # HuggingFace 缓存目录（vLLM tokenizer）
 MAX_BAD_CASES_PER_BENCH = 30
 SFT_TRAIN_TIMEOUT_SEC = int(os.environ.get("SFT_TRAIN_TIMEOUT_SEC", "21600"))
@@ -436,6 +436,7 @@ def _run_eval_with_standalone_script(model_dir: Path, output_dir: Path, mode: st
         "--tp-size", str(TP_SIZE),
         "--dp-size", str(DP_SIZE),
         "--max-model-len", str(MAX_MODEL_LEN),
+        "--max-new-tokens", str(MAX_NEW_TOKENS),
     ]
 
     env = dict(os.environ)
@@ -492,18 +493,11 @@ def _run_eval_with_standalone_script(model_dir: Path, output_dir: Path, mode: st
 
 
 def _run_eval_stage(model_dir: Path, output_dir: Path, mode: str) -> dict:
-    """执行评测阶段，自动选择正确的模型目录。
+    """执行评测阶段。
 
-    如果存在 pytorch_model/ 子目录（转换后的标准格式），则使用它；
-    否则直接使用 model_dir（假设已经是标准格式）。
+    SFT 的 save_model 直接把 HF bf16 safetensors 落在 model_dir，评测直接使用即可。
     """
-    # 检查是否有转换后的 PyTorch 模型
-    pytorch_model_dir = model_dir / "pytorch_model"
-    if pytorch_model_dir.exists() and any(pytorch_model_dir.glob("*.safetensors")):
-        logger.info("检测到转换后的 PyTorch 模型，使用：%s", pytorch_model_dir)
-        eval_model_dir = pytorch_model_dir
-    else:
-        eval_model_dir = model_dir
+    eval_model_dir = model_dir
 
     eval_python = _eval_python()
     if not eval_python:
@@ -668,6 +662,9 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
             "reduce_scatter": True,
             "reduce_bucket_size": 5e8,
             "allgather_bucket_size": 5e8,
+            # 必须开启：ZeRO-3 下 save_model 才会 gather 分片、落出可加载的 HF bf16 safetensors；
+            # 否则只剩 DeepSpeed 原始分片(global_step*)，vLLM 无法加载权重。
+            "stage3_gather_16bit_weights_on_model_save": True,
         },
         "activation_checkpointing": {
             "partition_activations": False,
@@ -747,21 +744,40 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
     return model_dir
 
 
+def _sync_tokenizer_from_base(model_dir: Path) -> None:
+    """用 base 模型的 tokenizer 文件覆盖 model_dir。
+
+    SFT 不会修改 tokenizer，但 df-train 的 transformers 5.x 写出的 tokenizer 文件与
+    df-eval 的 transformers 4.x 存在格式漂移（additional_special_tokens 丢失、
+    chat_template 从内联改为独立 .jinja、tokenizer.json 重新序列化等）。直接拷贝 base
+    的 tokenizer 文件最干净，可彻底消除格式差异并保证 4.x 正确加载。"""
+    base = Path(BASE_MODEL)
+    if not base.exists():
+        logger.warning("BASE_MODEL 不存在：%s，跳过 tokenizer 同步", base)
+        return
+    names = ["tokenizer_config.json", "tokenizer.json", "vocab.json",
+             "merges.txt", "special_tokens_map.json", "added_tokens.json"]
+    copied = [n for n in names if (base / n).exists()
+              and (shutil.copy2(base / n, model_dir / n) or True)]
+    # base 把 chat_template 内联在 tokenizer_config.json；删除训练残留的独立 .jinja 以免二义
+    jinja = model_dir / "chat_template.jinja"
+    if jinja.exists():
+        jinja.unlink()
+    logger.info("已用 base tokenizer 覆盖 %s：%s", model_dir, copied)
+
+
 def _convert_and_cleanup_checkpoint(model_dir: Path, output_dir: Path) -> None:
-    """将 DeepSpeed ZeRO-3 checkpoint 转换为标准 PyTorch BF16 格式并清理临时文件。
+    """确认 SFT 产出的 HF bf16 权重可用，并清理 DeepSpeed 大分片。
 
-    只保留：
-    - pytorch_model/ (转换后的 BF16 格式权重)
-    - config.json, tokenizer*, generation_config.json, chat_template.jinja (模型配置)
-    - trainer_log.jsonl, *_results.json, training_args.bin, trainer_state.json (训练日志和参数)
-    - zero_to_fp32.py, latest (保留以便手动操作)
+    ds_config 已开启 stage3_gather_16bit_weights_on_model_save，因此 LlamaFactory 的
+    save_model 会直接在 model_dir 落出可加载的 HF bf16 safetensors，无需任何后处理转换。
+    本函数只做两件事：
+    1. 用 base 模型的 tokenizer 文件覆盖 model_dir（消除 5.x/4.x 格式漂移，保证 df-eval 正确加载）；
+    2. 删除占用最大的 global_step*/（DeepSpeed 原始分片，~300GB，推理不需要）。
 
-    删除：
-    - global_step*/（DeepSpeed checkpoint 分片，占用最大，~300GB）
-      ├─ *_optim_states.pt（优化器状态，不需要推理）
-      └─ *_model_states.pt（模型权重分片，已转换）
+    若未找到 HF safetensors（异常情况），保留 global_step* 不删除，避免权重丢失。
     """
-    logger.info("开始转换 DeepSpeed checkpoint 到 PyTorch BF16 格式...")
+    logger.info("确认 HF bf16 权重并清理 DeepSpeed 分片...")
 
     # 检查是否存在 DeepSpeed checkpoint
     latest_file = model_dir / "latest"
@@ -776,98 +792,20 @@ def _convert_and_cleanup_checkpoint(model_dir: Path, output_dir: Path) -> None:
         logger.warning("Checkpoint 目录不存在：%s，跳过转换", checkpoint_dir)
         return
 
-    # 检查是否已经转换过
-    pytorch_model_dir = model_dir / "pytorch_model"
-    if pytorch_model_dir.exists() and any(pytorch_model_dir.glob("*.safetensors")):
-        logger.info("PyTorch 模型已存在，跳过转换")
-    else:
-        # 使用 Python 脚本转换，保持 BF16 精度
-        convert_log = output_dir / "checkpoint_convert.log"
+    # save_model（ds_config 已开 stage3_gather_16bit_weights_on_model_save）已直接把
+    # HF bf16 safetensors 落在 model_dir。确认权重存在后即可安全清理 DeepSpeed 分片。
+    if not any(model_dir.glob("*.safetensors")):
+        # 未找到 HF 权重（save_model 未按预期产出）——保留 global_step* 不删，避免丢失可恢复权重
+        logger.error(
+            "未在 %s 找到 HF safetensors（应由 save_model + "
+            "stage3_gather_16bit_weights_on_model_save 产出）；保留 %s 不清理。",
+            model_dir, checkpoint_dir)
+        return
 
-        # 创建转换脚本（使用 transformers + torch.bfloat16）
-        convert_script = model_dir / "_convert_to_bf16.py"
-        convert_script.write_text("""
-import sys
-import torch
-from pathlib import Path
-from transformers import AutoModelForCausalLM, AutoTokenizer
+    logger.info("确认 HF bf16 权重位于 model_dir：%s", model_dir)
+    _sync_tokenizer_from_base(model_dir)
 
-model_dir = Path(sys.argv[1])
-output_dir = Path(sys.argv[2])
-
-print(f"加载 DeepSpeed checkpoint: {model_dir}")
-# 使用 device_map="cpu" 避免 OOM，指定 torch_dtype=torch.bfloat16
-model = AutoModelForCausalLM.from_pretrained(
-    str(model_dir),
-    torch_dtype=torch.bfloat16,
-    device_map="cpu",
-    trust_remote_code=True,
-)
-
-print(f"保存为 BF16 safetensors: {output_dir}")
-output_dir.mkdir(parents=True, exist_ok=True)
-model.save_pretrained(
-    str(output_dir),
-    safe_serialization=True,
-    max_shard_size="5GB",
-)
-
-# 同时保存 tokenizer 和配置
-print("复制 tokenizer 和配置文件")
-tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
-tokenizer.save_pretrained(str(output_dir))
-
-# 修复 tokenizer_config.json 兼容性问题（transformers 5.x → 4.x）
-# transformers 4.x 不支持 extra_special_tokens 为列表格式
-import json
-tokenizer_config_path = output_dir / "tokenizer_config.json"
-if tokenizer_config_path.exists():
-    config = json.loads(tokenizer_config_path.read_text(encoding="utf-8"))
-    if "extra_special_tokens" in config:
-        print("移除 extra_special_tokens 字段以兼容 transformers 4.x")
-        del config["extra_special_tokens"]
-        tokenizer_config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
-
-print("转换完成！")
-""", encoding="utf-8")
-
-        convert_cmd = [
-            sys.executable,
-            str(convert_script),
-            str(model_dir),
-            str(pytorch_model_dir),
-        ]
-
-        logger.info("执行 BF16 转换：%s", " ".join(convert_cmd))
-        try:
-            with convert_log.open("w", encoding="utf-8") as logf:
-                proc = subprocess.Popen(
-                    convert_cmd,
-                    stdout=logf,
-                    stderr=subprocess.STDOUT,
-                    cwd=str(model_dir),
-                )
-                rc = proc.wait(timeout=3600)  # 1小时超时
-
-            if rc != 0:
-                logger.error("Checkpoint 转换失败 (exit=%d)，日志：%s", rc, convert_log)
-                return
-
-            logger.info("Checkpoint 转换完成：%s", pytorch_model_dir)
-
-            # 清理转换脚本
-            if convert_script.exists():
-                convert_script.unlink()
-
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            logger.error("Checkpoint 转换超时")
-            return
-        except Exception as e:
-            logger.error("Checkpoint 转换失败：%s", e)
-            return
-
-    # 清理占用最大的 DeepSpeed checkpoint 目录
+    # 清理占用最大的 DeepSpeed checkpoint 目录（权重已确认存在，可安全删除）
     logger.info("清理大文件...")
 
     if checkpoint_dir.exists():
