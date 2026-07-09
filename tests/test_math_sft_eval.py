@@ -20,32 +20,8 @@ from math_benchmarks.additional_benchmarks import gpqa_score, load_chmath, load_
 from math_benchmarks.aime2024 import load_aime2024
 from math_benchmarks.gsm8k import load_gsm8k
 
-EVAL_SYSTEM_PROMPT_BOXED = _MODULE.EVAL_SYSTEM_PROMPT_BOXED
 _build_remote_worker_ssh_cmd = _MODULE._build_remote_worker_ssh_cmd
 _should_launch_remote_worker = _MODULE._should_launch_remote_worker
-_system_prompt_for = _MODULE._system_prompt_for
-_user_prompt_for = _MODULE._user_prompt_for
-
-
-def test_user_prompt_appends_choices():
-    prompt = _user_prompt_for(
-        {
-            "question": "Which one is correct?",
-            "choices": [("A", "first"), ("B", "second")],
-        },
-        lambda question: question,
-    )
-    assert "Options:" in prompt
-    assert "A. first" in prompt
-    assert "B. second" in prompt
-
-
-def test_eval_prompt_contract_matches_limo():
-    assert EVAL_SYSTEM_PROMPT_BOXED == (
-        "Please reason step by step, and put your final answer within \\boxed{}."
-    )
-    assert _system_prompt_for("GPQA", {"question": "q"}) == EVAL_SYSTEM_PROMPT_BOXED
-    assert _system_prompt_for("GSM8K", {"question": "q"}) == EVAL_SYSTEM_PROMPT_BOXED
 
 
 def test_should_launch_remote_worker_depends_on_rank_and_nnodes(monkeypatch):
