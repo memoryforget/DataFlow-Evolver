@@ -9,8 +9,8 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
-from dataflow_evolve.utils.config import Config
-from dataflow_evolve.utils.logging import get_logger
+from dataflow_evolver.utils.config import Config
+from dataflow_evolver.utils.logging import get_logger
 
 logger = get_logger("llm.agent_sdk")
 
@@ -139,7 +139,7 @@ def _build_options(agent_cfg: Config, cwd: str) -> Any:
     """
     from claude_agent_sdk import ClaudeAgentOptions
 
-    from dataflow_evolve.llm.mcp_operators import operator_mcp_server
+    from dataflow_evolver.llm.mcp_operators import operator_mcp_server
 
     append_text = agent_cfg.get("system_prompt_append", _DEFAULT_SYSTEM_PROMPT_APPEND)
     return ClaudeAgentOptions(

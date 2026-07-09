@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from dataflow_evolve.core.tree_node import PipelineNode
+from dataflow_evolver.core.tree_node import PipelineNode
 
 
 @dataclass

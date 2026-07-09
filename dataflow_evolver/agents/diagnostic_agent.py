@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import json
 
-from dataflow_evolve.agents.base import AgentABC
-from dataflow_evolve.core.schemas import BadCase, DiagnosticReport
+from dataflow_evolver.agents.base import AgentABC
+from dataflow_evolver.core.schemas import BadCase, DiagnosticReport
 
 
 class DiagnosticAgent(AgentABC):
@@ -15,7 +15,7 @@ class DiagnosticAgent(AgentABC):
         self.max_bad_cases = max_bad_cases
 
     def build_prompt(self, downstream_task: str, bad_cases: list[BadCase]) -> str:
-        from dataflow_evolve.llm.prompts import build_diagnostic_prompt
+        from dataflow_evolver.llm.prompts import build_diagnostic_prompt
 
         sampled = bad_cases[: self.max_bad_cases]
         bad_cases_text = "\n".join(

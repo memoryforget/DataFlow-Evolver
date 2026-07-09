@@ -17,24 +17,24 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dataflow_evolve.core.baseline import (
+from dataflow_evolver.core.baseline import (
     REWARD_ABSOLUTE,
     REWARD_RELATIVE,
     RewardPolicy,
     adapt_baseline_source,
 )
-from dataflow_evolve.core.data_pool import DataPool, PoolConfig
-from dataflow_evolve.core.schemas import (
+from dataflow_evolver.core.data_pool import DataPool, PoolConfig
+from dataflow_evolver.core.schemas import (
     DiagnosticReport,
     PipelineConfig,
     ReviewResult,
     TaskProfile,
     TrainResult,
 )
-from dataflow_evolve.core.tree_manager import TreeManager
-from dataflow_evolve.engine.execution_wrapper import ExecutionResult
-from dataflow_evolve.main import Orchestrator
-from dataflow_evolve.utils.config import Config
+from dataflow_evolver.core.tree_manager import TreeManager
+from dataflow_evolver.engine.execution_wrapper import ExecutionResult
+from dataflow_evolver.main import Orchestrator
+from dataflow_evolver.utils.config import Config
 
 
 # ---------------------------------------------------------------------------

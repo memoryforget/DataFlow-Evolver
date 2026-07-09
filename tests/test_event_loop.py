@@ -7,14 +7,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dataflow_evolve.core.schemas import (
+from dataflow_evolver.core.schemas import (
     DiagnosticReport,
     PipelineConfig,
     ReviewResult,
     TaskProfile,
 )
-from dataflow_evolve.main import Orchestrator
-from dataflow_evolve.utils.config import Config
+from dataflow_evolver.main import Orchestrator
+from dataflow_evolver.utils.config import Config
 
 FAKE_PIPELINE = (
     "import json, pathlib\n"
@@ -104,7 +104,7 @@ def test_event_loop_runs_and_picks_best(tmp_path, monkeypatch):
 
 def test_resolve_pipeline_llm_fallback_and_override():
     """pipeline_llm 段按用途区分多 serving，逐字段回退 api。"""
-    from dataflow_evolve.main import _resolve_pipeline_llm
+    from dataflow_evolver.main import _resolve_pipeline_llm
 
     # 缺省 pipeline_llm → 返回 {"default": ...}，全部回退 api
     llm = Config({"api": {"api_url": "u", "model_name": "m", "api_key": "k", "max_workers": 7}})

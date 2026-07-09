@@ -3,8 +3,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dataflow_evolve.engine.execution_wrapper import SubprocessExecutionWrapper
-from dataflow_evolve.engine.trainer_wrapper import DownstreamTrainerWrapper
+from dataflow_evolver.engine.execution_wrapper import SubprocessExecutionWrapper
+from dataflow_evolver.engine.trainer_wrapper import DownstreamTrainerWrapper
 
 ROOT = Path(__file__).resolve().parents[1]
 REF_SCRIPT = ROOT / "scripts" / "reference_train_eval.py"
@@ -39,7 +39,7 @@ def test_trainer_missing_script_degrades(tmp_path):
 def test_execution_missing_pipeline_file(tmp_path):
     (tmp_path / "node_1").mkdir()
     wrapper = SubprocessExecutionWrapper(agent_root=str(tmp_path), timeout_sec=30)
-    from dataflow_evolve.core.schemas import PipelineConfig
+    from dataflow_evolver.core.schemas import PipelineConfig
 
     cfg = PipelineConfig(operators=[], field_flow="", code="", rationale="")
     result = wrapper.run(cfg, "node_1")
@@ -58,7 +58,7 @@ def test_execution_runs_simple_pipeline(tmp_path):
         encoding="utf-8",
     )
     wrapper = SubprocessExecutionWrapper(agent_root=str(tmp_path), timeout_sec=30)
-    from dataflow_evolve.core.schemas import PipelineConfig
+    from dataflow_evolver.core.schemas import PipelineConfig
 
     cfg = PipelineConfig(operators=[], field_flow="", code="", rationale="")
     result = wrapper.run(cfg, "node_1")
@@ -72,7 +72,7 @@ def test_execution_captures_crash(tmp_path):
     node.mkdir()
     (node / "pipeline.py").write_text("raise ValueError('boom')\n", encoding="utf-8")
     wrapper = SubprocessExecutionWrapper(agent_root=str(tmp_path), timeout_sec=30)
-    from dataflow_evolve.core.schemas import PipelineConfig
+    from dataflow_evolver.core.schemas import PipelineConfig
 
     cfg = PipelineConfig(operators=[], field_flow="", code="", rationale="")
     result = wrapper.run(cfg, "node_1")
@@ -93,7 +93,7 @@ def test_execution_prefers_nonempty_when_last_step_empty(tmp_path):
         encoding="utf-8",
     )
     wrapper = SubprocessExecutionWrapper(agent_root=str(tmp_path), timeout_sec=30)
-    from dataflow_evolve.core.schemas import PipelineConfig
+    from dataflow_evolver.core.schemas import PipelineConfig
 
     cfg = PipelineConfig(operators=[], field_flow="", code="", rationale="")
     result = wrapper.run(cfg, "node_1")
@@ -117,7 +117,7 @@ def test_execution_picks_max_step_over_mtime(tmp_path):
         encoding="utf-8",
     )
     wrapper = SubprocessExecutionWrapper(agent_root=str(tmp_path), timeout_sec=30)
-    from dataflow_evolve.core.schemas import PipelineConfig
+    from dataflow_evolver.core.schemas import PipelineConfig
 
     cfg = PipelineConfig(operators=[], field_flow="", code="", rationale="")
     result = wrapper.run(cfg, "node_1")
@@ -131,7 +131,7 @@ def test_execution_picks_max_step_over_mtime(tmp_path):
 import subprocess  # noqa: E402
 import time  # noqa: E402
 
-from dataflow_evolve.engine.trainer_wrapper import SSHTrainerWrapper  # noqa: E402
+from dataflow_evolver.engine.trainer_wrapper import SSHTrainerWrapper  # noqa: E402
 
 
 def _ssh_wrapper(cmd: str, *, nnodes: int, timeout_sec: int, node1_host: str = "node1") -> SSHTrainerWrapper:

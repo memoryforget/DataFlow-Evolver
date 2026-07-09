@@ -23,26 +23,26 @@ import argparse
 import json
 from pathlib import Path
 
-from dataflow_evolve.agents.diagnostic_agent import DiagnosticAgent
-from dataflow_evolve.agents.pipeline_agent import PipelineAgent
-from dataflow_evolve.agents.review_agent import ReviewAgent
-from dataflow_evolve.agents.task_profiler import TaskProfilerAgent
-from dataflow_evolve.core import checkpoint
-from dataflow_evolve.core.baseline import (
+from dataflow_evolver.agents.diagnostic_agent import DiagnosticAgent
+from dataflow_evolver.agents.pipeline_agent import PipelineAgent
+from dataflow_evolver.agents.review_agent import ReviewAgent
+from dataflow_evolver.agents.task_profiler import TaskProfilerAgent
+from dataflow_evolver.core import checkpoint
+from dataflow_evolver.core.baseline import (
     REWARD_ABSOLUTE,
     REWARD_RELATIVE,
     RewardPolicy,
     adapt_baseline_source,
 )
-from dataflow_evolve.core.data_pool import DataPool, PoolConfig
-from dataflow_evolve.core.schemas import PipelineConfig
-from dataflow_evolve.core.tree_manager import TreeManager
-from dataflow_evolve.core.tree_node import PipelineNode
-from dataflow_evolve.engine.execution_wrapper import SubprocessExecutionWrapper
-from dataflow_evolve.engine.trainer_wrapper import DownstreamTrainerWrapper, SSHTrainerWrapper
-from dataflow_evolve.llm.serving import build_serving
-from dataflow_evolve.utils.config import Config, load_config
-from dataflow_evolve.utils.logging import get_logger, setup_logging
+from dataflow_evolver.core.data_pool import DataPool, PoolConfig
+from dataflow_evolver.core.schemas import PipelineConfig
+from dataflow_evolver.core.tree_manager import TreeManager
+from dataflow_evolver.core.tree_node import PipelineNode
+from dataflow_evolver.engine.execution_wrapper import SubprocessExecutionWrapper
+from dataflow_evolver.engine.trainer_wrapper import DownstreamTrainerWrapper, SSHTrainerWrapper
+from dataflow_evolver.llm.serving import build_serving
+from dataflow_evolver.utils.config import Config, load_config
+from dataflow_evolver.utils.logging import get_logger, setup_logging
 
 logger = get_logger("main")
 

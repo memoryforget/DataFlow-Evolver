@@ -3,11 +3,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dataflow_evolve.agents.diagnostic_agent import DiagnosticAgent
-from dataflow_evolve.agents.review_agent import ReviewAgent
-from dataflow_evolve.agents.task_profiler import TaskProfilerAgent
-from dataflow_evolve.core.schemas import BadCase
-from dataflow_evolve.llm.serving import LLMServingABC
+from dataflow_evolver.agents.diagnostic_agent import DiagnosticAgent
+from dataflow_evolver.agents.review_agent import ReviewAgent
+from dataflow_evolver.agents.task_profiler import TaskProfilerAgent
+from dataflow_evolver.core.schemas import BadCase
+from dataflow_evolver.llm.serving import LLMServingABC
 
 
 class StubServing(LLMServingABC):
@@ -41,7 +41,7 @@ def test_profiler_parses_profile():
 def test_review_threshold_pass_and_fail(tmp_path):
     ds = tmp_path / "ds.jsonl"
     ds.write_text('{"instruction":"a","answer":"b"}\n', encoding="utf-8")
-    from dataflow_evolve.core.schemas import TaskProfile
+    from dataflow_evolver.core.schemas import TaskProfile
 
     profile = TaskProfile("t", {"instruction": "str", "answer": "str"}, "math", [], "sft")
 
@@ -56,7 +56,7 @@ def test_review_threshold_pass_and_fail(tmp_path):
 
 
 def test_review_empty_dataset_fails(tmp_path):
-    from dataflow_evolve.core.schemas import TaskProfile
+    from dataflow_evolver.core.schemas import TaskProfile
 
     profile = TaskProfile("t", {}, "d", [], "sft")
     r = ReviewAgent(StubServing([""]) ).review(str(tmp_path / "missing.jsonl"), profile)
@@ -74,7 +74,7 @@ def test_review_survives_serving_exception(tmp_path):
     """后端抛异常不应冒泡到主循环：Review 须降级为未通过而非崩溃。"""
     ds = tmp_path / "ds.jsonl"
     ds.write_text('{"instruction":"a","answer":"b"}\n', encoding="utf-8")
-    from dataflow_evolve.core.schemas import TaskProfile
+    from dataflow_evolver.core.schemas import TaskProfile
 
     profile = TaskProfile("t", {"instruction": "str"}, "math", [], "sft")
     r = ReviewAgent(_RaisingServing()).review(str(ds), profile)
@@ -110,8 +110,8 @@ def test_diagnostic_parses_report():
 
 def test_pipeline_prompt_injects_review_issues():
     """Phase-1 评审打回的 issues 应注入下一轮生成 prompt；无 issues 则不出现该段。"""
-    from dataflow_evolve.core.schemas import TaskProfile
-    from dataflow_evolve.llm.prompts import build_pipeline_prompt
+    from dataflow_evolver.core.schemas import TaskProfile
+    from dataflow_evolver.llm.prompts import build_pipeline_prompt
 
     profile = TaskProfile("QA", {"q": "str", "a": "str"}, "general", [], "sft")
     base = build_pipeline_prompt(profile, "empty.jsonl", "node_1")
@@ -126,8 +126,8 @@ def test_pipeline_prompt_injects_review_issues():
 
 def test_pipeline_prompt_injects_target_samples():
     """目标产出规模：>0 时注入规模指引（含 num_samples 提示）；默认 0 不注入。"""
-    from dataflow_evolve.core.schemas import TaskProfile
-    from dataflow_evolve.llm.prompts import build_pipeline_prompt
+    from dataflow_evolver.core.schemas import TaskProfile
+    from dataflow_evolver.llm.prompts import build_pipeline_prompt
 
     profile = TaskProfile("QA", {"instruction": "str", "output": "str"}, "math", [], "sft")
     base = build_pipeline_prompt(profile, "empty.jsonl", "node_1")
@@ -140,7 +140,7 @@ def test_pipeline_prompt_injects_target_samples():
 
 def test_review_selfcorrect_prompt_points_to_intermediate_cache():
     """评审自修正 prompt 应告知 Agent：cache 下有每个算子的中间产物，去 Read 定位坏在哪一步。"""
-    from dataflow_evolve.llm.prompts import build_review_selfcorrect_prompt
+    from dataflow_evolver.llm.prompts import build_review_selfcorrect_prompt
 
     p = build_review_selfcorrect_prompt("node_1", ["answer 字段为空"])
     assert "answer 字段为空" in p

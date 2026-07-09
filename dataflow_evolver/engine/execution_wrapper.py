@@ -9,8 +9,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dataflow_evolve.core.schemas import PipelineConfig
-from dataflow_evolve.utils.logging import get_logger
+from dataflow_evolver.core.schemas import PipelineConfig
+from dataflow_evolver.utils.logging import get_logger
 
 logger = get_logger("engine.execution")
 

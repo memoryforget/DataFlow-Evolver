@@ -16,8 +16,8 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from dataflow_evolve.core.schemas import BadCase, TrainResult
-from dataflow_evolve.utils.logging import get_logger
+from dataflow_evolver.core.schemas import BadCase, TrainResult
+from dataflow_evolver.utils.logging import get_logger
 
 logger = get_logger("engine.trainer")
 

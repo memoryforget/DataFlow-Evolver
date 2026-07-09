@@ -2,7 +2,7 @@
 
 多智能体、MCTS 驱动的自动数据工程框架（双反馈环）。
 
-> 说明：仓库/项目名为 **DataFlow-Evolver**；Python 包与入口模块沿用 `dataflow_evolve`（如 `python -m dataflow_evolve.main`），两者不一致是历史命名，导入路径以 `dataflow_evolve` 为准。
+> 说明：仓库/项目名为 **DataFlow-Evolver**；Python 包与入口模块沿用 `dataflow_evolver`（如 `python -m dataflow_evolver.main`），两者不一致是历史命名，导入路径以 `dataflow_evolver` 为准。
 
 根据高层任务描述，自动生成 / 变异 DataFlow 流水线 DAG，并通过 **双反馈环**——
 快速的"左移"数据评审（Phase-1）+ 真实的下游模型训练评估（Phase-2，产出可执行诊断报告）——
@@ -168,7 +168,7 @@ export DF_API_KEY=<你的 key>
 export NCCL_SOCKET_IFNAME=eth5
 export GLOO_SOCKET_IFNAME=eth5
 
-python -m dataflow_evolve.main \
+python -m dataflow_evolver.main \
   --config configs/default.yaml \
   --task "构建一个高质量的数学问答 SFT 数据集" \
   --log-level INFO
@@ -329,7 +329,7 @@ trainer:
 也可用环境变量注入：`NODE1_HOST` / `MASTER_ADDR` / `REMOTE_CWD`。
 其中 `REMOTE_CWD` 只是远端 worker 的工作目录；如果 node0/node1 项目绝对路径完全一致，通常可以直接留空，默认复用 node0 启动时的 cwd。
 
-**2. 在 node0 起编排器**（照常，`python -m dataflow_evolve.main ...`）。node1 上**无需**起任何常驻进程
+**2. 在 node0 起编排器**（照常，`python -m dataflow_evolver.main ...`）。node1 上**无需**起任何常驻进程
 ——训练脚本会在每轮训练时自动 SSH 到 node1 拉起 worker。
 
 编排器只负责给 node0 训练脚本注入 `NODE_RANK=0`、`MASTER_ADDR` / `MASTER_PORT` /
@@ -420,7 +420,7 @@ python -m pytest tests/ -q
 ## 目录结构
 
 ```
-dataflow_evolve/
+dataflow_evolver/
 ├── agents/      # base / task_profiler / pipeline_agent(SDK 驱动) / review / diagnostic
 ├── core/        # schemas / tree_node / tree_manager / global_memory
 ├── engine/      # execution_wrapper / trainer_wrapper

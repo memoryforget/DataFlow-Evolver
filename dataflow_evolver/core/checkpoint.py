@@ -15,9 +15,9 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from dataflow_evolve.core.baseline import RewardPolicy
-from dataflow_evolve.core.data_pool import DataPool, StagedNode
-from dataflow_evolve.core.schemas import (
+from dataflow_evolver.core.baseline import RewardPolicy
+from dataflow_evolver.core.data_pool import DataPool, StagedNode
+from dataflow_evolver.core.schemas import (
     BadCase,
     DiagnosticReport,
     PipelineConfig,
@@ -25,9 +25,9 @@ from dataflow_evolve.core.schemas import (
     TaskProfile,
     TrainResult,
 )
-from dataflow_evolve.core.tree_manager import TreeManager
-from dataflow_evolve.core.tree_node import PipelineNode, reseed_id_counter
-from dataflow_evolve.utils.logging import get_logger
+from dataflow_evolver.core.tree_manager import TreeManager
+from dataflow_evolver.core.tree_node import PipelineNode, reseed_id_counter
+from dataflow_evolver.utils.logging import get_logger
 
 logger = get_logger("core.checkpoint")
 

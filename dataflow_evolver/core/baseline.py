@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from dataflow_evolve.utils.logging import get_logger
+from dataflow_evolver.utils.logging import get_logger
 
 logger = get_logger("core.baseline")
 

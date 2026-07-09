@@ -16,7 +16,7 @@ def setup_logging(level: str = "INFO", log_file: str | Path | None = None) -> No
     if _CONFIGURED:
         return
 
-    root = logging.getLogger("dataflow_evolve")
+    root = logging.getLogger("dataflow_evolver")
     root.setLevel(level.upper())
     root.propagate = False
 
@@ -37,5 +37,5 @@ def setup_logging(level: str = "INFO", log_file: str | Path | None = None) -> No
 
 
 def get_logger(name: str) -> logging.Logger:
-    """返回 dataflow_evolve.<name> 命名空间下的日志器。"""
-    return logging.getLogger(f"dataflow_evolve.{name}")
+    """返回 dataflow_evolver.<name> 命名空间下的日志器。"""
+    return logging.getLogger(f"dataflow_evolver.{name}")

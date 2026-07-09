@@ -12,7 +12,7 @@ Exposes 4 tools for hierarchical operator browsing:
   - get_operator_detail
 
 Usage:
-    from dataflow_evolve.llm.mcp_operators import operator_mcp_server
+    from dataflow_evolver.llm.mcp_operators import operator_mcp_server
 
     options = ClaudeAgentOptions(
         mcp_servers={"dataflow-operators": operator_mcp_server},

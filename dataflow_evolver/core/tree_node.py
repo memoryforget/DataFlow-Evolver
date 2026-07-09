@@ -8,7 +8,7 @@ import math
 from itertools import count
 from typing import Optional
 
-from dataflow_evolve.core.schemas import (
+from dataflow_evolver.core.schemas import (
     DiagnosticReport,
     PipelineConfig,
     ReviewResult,

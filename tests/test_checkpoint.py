@@ -4,10 +4,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dataflow_evolve.core import checkpoint
-from dataflow_evolve.core.baseline import REWARD_RELATIVE, RewardPolicy
-from dataflow_evolve.core.data_pool import DataPool, PoolConfig
-from dataflow_evolve.core.schemas import (
+from dataflow_evolver.core import checkpoint
+from dataflow_evolver.core.baseline import REWARD_RELATIVE, RewardPolicy
+from dataflow_evolver.core.data_pool import DataPool, PoolConfig
+from dataflow_evolver.core.schemas import (
     BadCase,
     DiagnosticReport,
     PipelineConfig,
@@ -15,7 +15,7 @@ from dataflow_evolve.core.schemas import (
     TaskProfile,
     TrainResult,
 )
-from dataflow_evolve.core.tree_manager import TreeManager
+from dataflow_evolver.core.tree_manager import TreeManager
 
 
 def _profile():

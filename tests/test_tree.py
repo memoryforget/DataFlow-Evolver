@@ -4,9 +4,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dataflow_evolve.core.schemas import PipelineConfig
-from dataflow_evolve.core.tree_manager import TreeManager
-from dataflow_evolve.core.tree_node import PipelineNode
+from dataflow_evolver.core.schemas import PipelineConfig
+from dataflow_evolver.core.tree_manager import TreeManager
+from dataflow_evolver.core.tree_node import PipelineNode
 
 
 def _cfg(name: str = "op") -> PipelineConfig:

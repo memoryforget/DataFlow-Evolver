@@ -1,5 +1,5 @@
 [project]
-name = "dataflow-evolve"
+name = "dataflow-evolver"
 version = "0.1.0"
 description = "多智能体、MCTS 驱动的自动数据工程框架（双反馈环）"
 requires-python = ">=3.10"
@@ -51,7 +51,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["dataflow_evolve*"]
+include = ["dataflow_evolver*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -11,8 +11,8 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from dataflow_evolve.utils.config import Config
-from dataflow_evolve.utils.logging import get_logger
+from dataflow_evolver.utils.config import Config
+from dataflow_evolver.utils.logging import get_logger
 
 logger = get_logger("llm.serving")
 

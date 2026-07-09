@@ -12,16 +12,16 @@ import json
 from pathlib import Path
 from typing import Any
 
-from dataflow_evolve.core.schemas import DiagnosticReport, PipelineConfig, TaskProfile
-from dataflow_evolve.llm.agent_sdk import run_pipeline_agent
-from dataflow_evolve.llm.mcp_operators import _recommend_categories
-from dataflow_evolve.llm.prompts import (
+from dataflow_evolver.core.schemas import DiagnosticReport, PipelineConfig, TaskProfile
+from dataflow_evolver.llm.agent_sdk import run_pipeline_agent
+from dataflow_evolver.llm.mcp_operators import _recommend_categories
+from dataflow_evolver.llm.prompts import (
     build_pipeline_prompt,
     build_review_selfcorrect_prompt,
     build_selfcorrect_prompt,
 )
-from dataflow_evolve.utils.config import Config
-from dataflow_evolve.utils.logging import get_logger
+from dataflow_evolver.utils.config import Config
+from dataflow_evolver.utils.logging import get_logger
 
 
 class PipelineAgent:

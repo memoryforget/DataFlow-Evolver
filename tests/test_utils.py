@@ -3,8 +3,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dataflow_evolve.utils.config import load_config
-from dataflow_evolve.utils.parsing import extract_json, extract_code
+from dataflow_evolver.utils.config import load_config
+from dataflow_evolver.utils.parsing import extract_json, extract_code
 
 
 def test_config_loads_and_expands():

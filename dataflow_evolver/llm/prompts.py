@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from dataflow_evolve.core.schemas import DiagnosticReport, TaskProfile
+from dataflow_evolver.core.schemas import DiagnosticReport, TaskProfile
 
 # ---------------------------------------------------------------------------
 # TaskProfilerAgent
