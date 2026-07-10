@@ -717,6 +717,11 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
     env.setdefault("NNODES", "1")  # 单机默认，双机需外部设置为 2
     env["NPROC_PER_NODE"] = str(NUM_GPUS // int(env.get("NNODES", "1")))  # 每机GPU数
     env.setdefault("MASTER_PORT", "29500")
+    # HF datasets 缓存按 node_rank 隔离：多节点共享 vepfs 时若指向同一 datasets 缓存目录，
+    # 首次生成会竞态——两节点各写各的 *.incomplete/，谁先原子 rename 成最终名，另一节点手里
+    # 的 .incomplete 路径就"文件消失"(OSError: Cannot find data file)。给每个节点独立的绝对
+    # 缓存目录即可根治（数据量小，重复预处理开销可忽略）；硬设覆盖外部转发进来的相对/共享路径。
+    env["HF_DATASETS_CACHE"] = str((output_dir / f"hf_datasets_cache_node{rank}").resolve())
 
     logger.info("开始 Full SFT 训练 (LIMO 配置): %s", " ".join(cmd))
     logger.info("分布式配置: NNODES=%s, NPROC_PER_NODE=%s, MASTER_ADDR=%s, MASTER_PORT=%s",
@@ -773,47 +778,44 @@ def _convert_and_cleanup_checkpoint(model_dir: Path, output_dir: Path) -> None:
     save_model 会直接在 model_dir 落出可加载的 HF bf16 safetensors，无需任何后处理转换。
     本函数只做两件事：
     1. 用 base 模型的 tokenizer 文件覆盖 model_dir（消除 5.x/4.x 格式漂移，保证 df-eval 正确加载）；
-    2. 删除占用最大的 global_step*/（DeepSpeed 原始分片，~300GB，推理不需要）。
+    2. 若训练残留了 DeepSpeed 原始分片（latest + global_step*/，~300GB），删除以省磁盘。
 
-    若未找到 HF safetensors（异常情况），保留 global_step* 不删除，避免权重丢失。
+    关键：tokenizer 同步必须与「是否有 DeepSpeed checkpoint 需要清理」解耦。开了
+    stage3_gather_16bit_weights_on_model_save + save_strategy=no 时，save_model 直接落 HF
+    safetensors、**不产生 latest 文件**（那是 save_checkpoint 才有的）；若把同步挂在 latest
+    存在的前提下，正常路径会整个跳过同步，导致 df-eval(transformers 4.x) 加载 5.x tokenizer
+    时崩溃（extra_special_tokens 为 list → 'list' object has no attribute 'keys'）。
     """
-    logger.info("确认 HF bf16 权重并清理 DeepSpeed 分片...")
+    logger.info("确认 HF bf16 权重、同步 tokenizer 并清理 DeepSpeed 分片...")
 
-    # 检查是否存在 DeepSpeed checkpoint
-    latest_file = model_dir / "latest"
-    if not latest_file.exists():
-        logger.warning("未找到 latest 文件，跳过转换")
-        return
-
-    checkpoint_tag = latest_file.read_text(encoding="utf-8").strip()
-    checkpoint_dir = model_dir / checkpoint_tag
-
-    if not checkpoint_dir.exists():
-        logger.warning("Checkpoint 目录不存在：%s，跳过转换", checkpoint_dir)
-        return
-
-    # save_model（ds_config 已开 stage3_gather_16bit_weights_on_model_save）已直接把
-    # HF bf16 safetensors 落在 model_dir。确认权重存在后即可安全清理 DeepSpeed 分片。
+    # 1) 先确认 save_model 已产出可加载的 HF safetensors（正常路径无需 latest/global_step*）。
+    #    缺失 = 训练保存异常：直接抛错让训练这步当场失败、节点按「训练失败」处理，
+    #    而不是任由后续 vLLM 加载空目录 → serve 超时 → 伪装成一次「评测 0 分」（会与
+    #    数据质量差的 0 分混淆）。抛错发生在清理之前，任何 DeepSpeed 分片都会原样保留供人工抢救。
     if not any(model_dir.glob("*.safetensors")):
-        # 未找到 HF 权重（save_model 未按预期产出）——保留 global_step* 不删，避免丢失可恢复权重
-        logger.error(
-            "未在 %s 找到 HF safetensors（应由 save_model + "
-            "stage3_gather_16bit_weights_on_model_save 产出）；保留 %s 不清理。",
-            model_dir, checkpoint_dir)
-        return
+        raise RuntimeError(
+            f"save_model 未产出 HF safetensors，训练保存异常（应由 save_model + "
+            f"stage3_gather_16bit_weights_on_model_save 产出）：{model_dir}；"
+            f"已保留任何 DeepSpeed 分片（global_step*/）供人工抢救。")
 
+    # 2) 用 base tokenizer 覆盖，消除 transformers 5.x/4.x 格式漂移（与有无 DeepSpeed 分片无关）
     logger.info("确认 HF bf16 权重位于 model_dir：%s", model_dir)
     _sync_tokenizer_from_base(model_dir)
 
-    # 清理占用最大的 DeepSpeed checkpoint 目录（权重已确认存在，可安全删除）
-    logger.info("清理大文件...")
-
-    if checkpoint_dir.exists():
-        # 计算删除前的大小
-        checkpoint_size = sum(f.stat().st_size for f in checkpoint_dir.rglob("*") if f.is_file())
-        logger.info("删除 DeepSpeed checkpoint 目录：%s (大小：%.2f GB)",
-                    checkpoint_dir, checkpoint_size / (1024**3))
-        shutil.rmtree(checkpoint_dir)
+    # 3) 清理 DeepSpeed 原始分片（若存在）：latest 指向的目录 + 任何 global_step*/
+    logger.info("清理 DeepSpeed 分片（若有）...")
+    checkpoint_dirs = {p for p in model_dir.glob("global_step*") if p.is_dir()}
+    latest_file = model_dir / "latest"
+    if latest_file.exists():
+        tag = latest_file.read_text(encoding="utf-8").strip()
+        if tag and (model_dir / tag).is_dir():
+            checkpoint_dirs.add(model_dir / tag)
+    for ckpt in checkpoint_dirs:
+        size = sum(f.stat().st_size for f in ckpt.rglob("*") if f.is_file())
+        logger.info("删除 DeepSpeed 分片目录：%s (大小：%.2f GB)", ckpt, size / (1024**3))
+        shutil.rmtree(ckpt)
+    if latest_file.exists():
+        latest_file.unlink()
 
     # 显示清理后的磁盘占用
     total_size = sum(f.stat().st_size for f in model_dir.rglob("*") if f.is_file())
@@ -849,13 +851,18 @@ def main() -> None:
 
     _ensure_nccl_ib_env_from_socket_ifname()
 
+    # 标记失败发生在哪个阶段：训练/准备阶段的致命错误应以非零退出（上层判「训练失败」），
+    # 只有真正进入评测后才允许回写 score=0.0。
+    eval_started = False
+
     try:
         if model_dir is not None:
-            # --model-dir 模式：直接评测已有模型
+            # --model-dir 模式：本质就是纯评测已有模型
             if not model_dir.exists():
                 raise RuntimeError(f"评测模型目录不存在：{model_dir}")
 
             eval_python = _eval_python() or sys.executable
+            eval_started = True
             results = _run_eval_with_standalone_script(model_dir, output_dir, mode, eval_python)
         else:
             if dataset_path is None:
@@ -882,6 +889,7 @@ def main() -> None:
             if rank != 0:
                 logger.info("rank=%d 训练完成，非 rank0 不参与评测，退出。", rank)
                 return
+            eval_started = True
             results = _run_eval_stage(model_dir, output_dir, mode=mode)
 
     except Exception as exc:
@@ -890,12 +898,14 @@ def main() -> None:
             _stop_remote_worker(remote_proc)
         if rank != 0:
             return  # 非 rank0 失败不写 results.json（由 rank0 统一裁决）
-        results = {
-            "score": 0.0,
-            "metric_name": "math_train_accuracy" if mode == "dev" else "math_test_avg_accuracy",
-            "bad_cases": [],
-            "_error": str(exc),
-        }
+        # 走到这里=训练或评测「没跑成」(基础设施/致命错误)：一律非零退出，让上层 TrainerWrapper
+        # 命中 rc!=0 → TrainResult(failed=True) → 节点按「系统级失败」处理。
+        # 关键：真·0 分【绝不】经过此异常路径——评测正常跑完(哪怕全错)会把 score=0.0 写进
+        # results.json 并正常返回(exit 0)。故此处不再回写 score=0.0 伪装成「评测 0 分」，
+        # 从而把「评测基础设施失败(如 vllm serve 起不来)」与「真·0 分」彻底区分开。
+        stage = "评测(基础设施/致命错误)" if eval_started else "训练/准备"
+        logger.error("%s阶段失败，非零退出（判定为系统级失败 failed，非「评测 0 分」）。", stage)
+        sys.exit(1)
 
     # 4. 输出（仅 rank0 到达此处）
     results_path = output_dir / "results.json"

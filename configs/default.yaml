@@ -91,7 +91,7 @@ trainer:
   #   dev：仅给 MCTS 当奖励信号，允许被「刷」；test：全程对 loop 不可见，仅终评一次。
   dev_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode dev     # Full SFT + MATH train 评测（默认抽样 500 题，MATH_TRAIN_SAMPLE_SIZE=0 跑全量 7500）
   test_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode test   # 终评：完整 benchmark suite（GSM8K/AIME/MATH500/AMC23/OlympiadBench/CHMath/Gaokao/Kaoyan/GradeSchool/MinervaMath/GPQA）
-  timeout_sec: 3600                                             # 流水线执行（纯数据合成）超时；约几分钟完成，1h 足够
+  timeout_sec: 7200                                             # 流水线执行（纯数据合成）超时=2h；4算子约30min，5算子(交叉验证+精修)会超1h，留足余量
   train_timeout_sec: 28800                                      # dev/test 评测（含内层 Full SFT 训练 6h + benchmark suite 评测）超时=8h
   # 训练调度方式：
   #   local（默认）：编排器在本机拉起训练子进程，阻塞等待（单机）。

@@ -157,7 +157,7 @@ cd <DataFlow> && pip install -e .
 
 ```bash
 export IS_SANDBOX=1
-export HF_HOME="./hf_cache"
+export HF_HOME="/vepfs-mlp2/c20250602/500050/lh/xqf/DataFlow-Evolver/huggingface"
 export ANTHROPIC_BASE_URL=http://123.129.219.111:3000
 export ANTHROPIC_API_KEY=<你的 key>
 export DF_API_KEY=<你的 key>
