@@ -100,23 +100,36 @@ def _wait_for_server(base_url: str, timeout: int = 300) -> bool:
     return False
 
 
+def _cap_new_tokens(prompt_len: int, max_model_len: int, max_new_tokens: int,
+                    floor: int = 512, margin: int = 16) -> int:
+    """把生成上限收敛到上下文剩余空间：min(max_new_tokens, max_model_len − prompt − margin)。
+
+    Qwen2.5-32B 上下文 = max_model_len；serve 模式下 vLLM 严格校验 prompt+max_tokens≤上下文，
+    故不能直接请求 = max_model_len 的 max_tokens（会 400）。floor 兜底极端长 prompt。
+    """
+    room = max_model_len - prompt_len - margin
+    return max(floor, min(max_new_tokens, room))
+
+
 def _generate_via_api(base_url: str, model: str, messages_list: list[list[dict]],
-                      max_tokens: int, n: int = 1, temperature: float = 0.0,
+                      max_tokens_list: list[int], n: int = 1, temperature: float = 0.0,
                       concurrency: int = 64) -> list[list[str]]:
     """通过 OpenAI Chat Completions API 并发推理。
 
+    max_tokens_list 为每条 prompt 的生成上限（已按上下文剩余空间收敛）。
     每个 prompt 采样 n 个样本，返回 list[list[str]]（每题 n 个预测文本）。
     """
     import urllib.request
     from concurrent.futures import ThreadPoolExecutor
 
+    timeout = int(os.environ.get("EVAL_API_TIMEOUT", "1800"))
     results: list[list[str]] = [[] for _ in messages_list]
 
     def _call(idx: int) -> tuple[int, list[str]]:
         payload = json.dumps({
             "model": model,
             "messages": messages_list[idx],
-            "max_tokens": max_tokens,
+            "max_tokens": max_tokens_list[idx],
             "temperature": temperature,
             "n": n,
         }).encode()
@@ -126,9 +139,15 @@ def _generate_via_api(base_url: str, model: str, messages_list: list[list[dict]]
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            data = json.loads(resp.read())
-        return idx, [c["message"]["content"] for c in data["choices"]]
+        # 单条请求失败（超时/HTTP错误等）不得拖垮整个 benchmark：降级为空预测（判错），
+        # 保证其余已成功的样本仍能被正常打分。
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read())
+            return idx, [c["message"]["content"] for c in data["choices"]]
+        except Exception as exc:  # noqa: BLE001 - 评测健壮性优先
+            logger.warning("样本 %d 推理失败，记为空预测：%s", idx, exc)
+            return idx, [""] * n
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         for idx, texts in pool.map(lambda i: _call(i), range(len(messages_list))):
@@ -219,8 +238,16 @@ def run_eval_offline(model_dir: Path, mode: str, tp_size: int,
             n, temp = _sampling_plan(bench_name)
             logger.info("评测 %s: %d 条样本 (n=%d, temp=%.2f)", bench_name, len(examples), n, temp)
             prompts = _build_prompts(examples, prompt_fn, tokenizer)
-            sp = SamplingParams(temperature=temp, n=n, max_tokens=max_new_tokens)
-            outputs = llm.generate(prompts, sp)
+            sampling_params = [
+                SamplingParams(
+                    temperature=temp, n=n,
+                    max_tokens=_cap_new_tokens(
+                        len(tokenizer(p, add_special_tokens=False).input_ids),
+                        max_model_len, max_new_tokens),
+                )
+                for p in prompts
+            ]
+            outputs = llm.generate(prompts, sampling_params)
             preds_per_example = [[o.text for o in outputs[i].outputs]
                                  for i in range(len(examples))]
             accuracy = _score_benchmark(bench_name, examples, preds_per_example,
@@ -293,6 +320,8 @@ def run_eval_serve(model_dir: Path, mode: str, tp_size: int, dp_size: int,
                 f"vllm serve 启动超时（{serve_timeout}s），详见 {serve_log_path}")
         logger.info("vllm serve 就绪")
 
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_str, trust_remote_code=True)
         benchmarks = _load_benchmarks(mode)
 
         bench_scores = {}
@@ -305,8 +334,16 @@ def run_eval_serve(model_dir: Path, mode: str, tp_size: int, dp_size: int,
                 logger.info("评测 %s: %d 条样本 (n=%d, temp=%.2f)",
                             bench_name, len(examples), n, temp)
                 messages_list = _build_messages(examples, prompt_fn)
+                prompt_lens = [
+                    len(tokenizer.apply_chat_template(m, tokenize=True,
+                                                      add_generation_prompt=True))
+                    for m in messages_list
+                ]
+                max_tokens_list = [
+                    _cap_new_tokens(pl, max_model_len, max_new_tokens) for pl in prompt_lens
+                ]
                 preds_per_example = _generate_via_api(
-                    base_url, model_str, messages_list, max_new_tokens,
+                    base_url, model_str, messages_list, max_tokens_list,
                     n=n, temperature=temp)
                 accuracy = _score_benchmark(bench_name, examples, preds_per_example,
                                             all_bad_cases, max_bad_total)
