@@ -29,11 +29,17 @@ llm:
 # PipelineAgent 使用的 Claude Agent SDK
 agent_sdk:
   model: claude-opus-4-8
+  effort: max                              # Claude 努力/思考档位 low|medium|high(默认)|xhigh(仅Opus4.7)|max；越高思考越深、越慢越贵
   permission_mode: bypassPermissions       # 无头自动化
   setting_sources: [project]               # 从 cwd/.claude 加载技能
   skills: [dataflow-dev]                    # 经 setting_sources(project)+.claude/skills 自动发现；generating-dataflow-pipeline 不再强制使用
   max_turns: 50                            # 单次 SDK 运行最大轮数（MCP发现+读源码+写pipeline+自测修复，需要更多轮次）
   pipeline_filename: pipeline.py           # 约定：Agent 把流水线写到 <node_id>/pipeline.py
+  # 瞬时错误（429/5xx/连接/超时）鲁棒性：指数退避重试 + 单次运行超时
+  max_retries: 4                           # SDK 瞬时错误的最大尝试次数（含首次）；永久错误(CLI缺失/鉴权)不重试
+  retry_base_delay: 10                     # 首次重试等待秒数，之后指数递增（10/20/40s...）
+  run_timeout_sec: 1800                    # 单次 SDK 运行超时(秒)；超时按可重试错误处理，避免挂起时无限阻塞主循环
+  resume_on_retry: true                    # 重试时若上次已建立会话则 resume 续跑(不重跑已完成的 turn)；上次没建起会话则全新重跑
   # 工具：用 claude_code 预设放开全部内置工具（见 llm/agent_sdk.py），不再设白名单
   # 系统提示：保留 claude_code 预设，仅 append DataFlow 指令；可用 system_prompt_append 覆盖该 append 文本
 
@@ -61,6 +67,9 @@ search:
   max_children_per_node: 4
   self_correction_retries: 5               # 流水线执行崩溃后的自修正重试次数
   review_self_correction_retries: 5        # Phase-1 评审打回后的自修正重试次数（看中间 step 产物定位、修复、重审）
+  # Agent 基础设施失败熔断（区别于流水线质量失败：不惩罚节点、不消耗迭代预算）
+  max_consecutive_infra_failures: 5        # 连续基础设施失败达到此数则主动终止（疑似代理/网络不可用）
+  infra_backoff_sec: 30                    # 每次基础设施失败后、重试本轮前的退避秒数
   checkpoint: "./workspace/checkpoint.json"                           # 断点续跑：非空=每轮落盘树状态到该路径，启动时存在则载入续跑；空=关闭
 
 # Phase-1 快反馈：数据评审

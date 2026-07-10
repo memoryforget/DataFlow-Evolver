@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 from dataflow_evolver.agents.diagnostic_agent import DiagnosticAgent
@@ -40,6 +41,7 @@ from dataflow_evolver.core.tree_manager import TreeManager
 from dataflow_evolver.core.tree_node import PipelineNode
 from dataflow_evolver.engine.execution_wrapper import SubprocessExecutionWrapper
 from dataflow_evolver.engine.trainer_wrapper import DownstreamTrainerWrapper, SSHTrainerWrapper
+from dataflow_evolver.llm.agent_sdk import AgentInfraError
 from dataflow_evolver.llm.serving import build_serving
 from dataflow_evolver.utils.config import Config, load_config
 from dataflow_evolver.utils.logging import get_logger, setup_logging
@@ -234,6 +236,9 @@ class Orchestrator:
         self.max_iterations = search.get("max_iterations", 10)
         self.self_correction_retries = search.get("self_correction_retries", 5)
         self.review_self_correction_retries = search.get("review_self_correction_retries", 5)
+        # 基础设施（Agent SDK）失败熔断：连续失败达到阈值则主动终止；每次失败退避后重试本轮
+        self.max_consecutive_infra = int(search.get("max_consecutive_infra_failures", 5))
+        self.infra_backoff_sec = float(search.get("infra_backoff_sec", 30))
         # 断点续跑（默认关闭）：非空路径则每轮落盘树状态，启动时若存在则载入续跑
         self.checkpoint_path = search.get("checkpoint", "")
 
@@ -264,11 +269,39 @@ class Orchestrator:
                     return None
             start_it = 1
 
-        for it in range(start_it, self.max_iterations + 1):
+        it = start_it
+        consecutive_infra = 0
+        while it <= self.max_iterations:
             logger.info("==== 迭代 %d/%d ====", it, self.max_iterations)
             parent = self.tree.select()
-            self._step(parent, profile)
+            status = self._step(parent, profile)
+
+            if status == "infra_fatal":
+                logger.error(
+                    "Agent 基础设施发生不可重试错误（如 CLI 缺失/鉴权失败），主动终止。"
+                    "已完成 %d 轮；请修复后重启。", it - 1,
+                )
+                break
+            if status == "infra_retryable":
+                consecutive_infra += 1
+                if consecutive_infra >= self.max_consecutive_infra:
+                    logger.error(
+                        "连续 %d 次基础设施失败（代理/网络疑似不可用），主动终止。已完成 %d 轮；"
+                        "请确认上游服务恢复后重启（可续跑）。",
+                        consecutive_infra, it - 1,
+                    )
+                    break
+                logger.warning(
+                    "基础设施失败（连续第 %d/%d 次），本轮不计入迭代预算，%.0fs 后重试本轮。",
+                    consecutive_infra, self.max_consecutive_infra, self.infra_backoff_sec,
+                )
+                time.sleep(self.infra_backoff_sec)
+                continue
+
+            # 正常完成（含被惩罚的 dead 节点）：计入预算、落盘 checkpoint、推进迭代
+            consecutive_infra = 0
             self._save_checkpoint(it, profile)
+            it += 1
 
         if self.pool is not None:
             self.pool.dump()
@@ -371,9 +404,42 @@ class Orchestrator:
         return True
 
     # ------------------------------------------------------------------
-    def _step(self, parent: PipelineNode, profile) -> None:
+    def _step(self, parent: PipelineNode, profile) -> str:
+        """跑一轮扩展并返回状态：
+        - "ok"：正常完成（含被惩罚的 dead 节点），计入迭代预算；
+        - "infra_retryable"：Agent 基础设施瞬时失败（429/超时/连接），撤销预留节点、不惩罚、不计入预算，主循环退避后重试本轮；
+        - "infra_fatal"：Agent 基础设施永久失败（CLI 缺失/鉴权等），主循环终止运行。
+        """
         # 预留子节点 → 拿到稳定的 node_dir 名
         child = self.tree.reserve_child(parent)
+        node_dir = child.node_dir_name
+        try:
+            self._run_step(child, parent, profile)
+            return "ok"
+        except AgentInfraError as exc:
+            logger.warning(
+                "Agent 基础设施失败（retryable=%s）：%s；撤销预留节点 %s，不惩罚、不计入本轮迭代。",
+                exc.retryable, exc, node_dir,
+            )
+            self.tree.discard_child(child)
+            self._cleanup_empty_node_dir(node_dir)
+            return "infra_retryable" if exc.retryable else "infra_fatal"
+
+    def _cleanup_empty_node_dir(self, node_dir_name: str) -> None:
+        """撤销基础设施失败的预留节点后，若其 workspace 目录为空则清理，避免留下空目录。"""
+        node_dir_abs = self.agent_root / node_dir_name
+        try:
+            if node_dir_abs.is_dir() and not any(node_dir_abs.iterdir()):
+                node_dir_abs.rmdir()
+        except OSError:
+            pass
+
+    def _run_step(self, child: PipelineNode, parent: PipelineNode, profile) -> None:
+        """一轮扩展的主体：生成→执行(自修正)→评审(自修正)→训练→诊断→回传。
+
+        SDK 基础设施失败会以 AgentInfraError 向上抛出（由 _step 统一处理）；其余失败
+        （生成无产出/执行崩溃/评审不过/训练失败）按既有逻辑置 dead 并回传 penalty。
+        """
         node_dir = child.node_dir_name
         penalty = self.reward_policy.penalty
 
@@ -396,7 +462,7 @@ class Orchestrator:
             parent_code=parent_code,
         )
         if config is None:
-            logger.warning("PipelineAgent 生成失败，惩罚该扩展并跳过。")
+            logger.warning("PipelineAgent 生成失败（agent 跑完但未产出有效流水线），惩罚该扩展并跳过。")
             child.dead = True
             self.tree.backpropagate(child, penalty)
             return

@@ -171,7 +171,7 @@ export GLOO_SOCKET_IFNAME=eth5
 python -m dataflow_evolver.main \
   --config configs/default.yaml \
   --task "构建一个高质量的数学问答 SFT 数据集" \
-  --log-level INFO
+  --log-level INFO 2>&1 | tee workspace/run_$(date +%m%d_%H%M).log
 ```
 
 输出：最优流水线所在节点目录、`field_flow` 与平均奖励。

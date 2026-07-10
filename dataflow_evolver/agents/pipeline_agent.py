@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from dataflow_evolver.core.schemas import DiagnosticReport, PipelineConfig, TaskProfile
-from dataflow_evolver.llm.agent_sdk import run_pipeline_agent
+from dataflow_evolver.llm.agent_sdk import AgentInfraError, run_pipeline_agent
 from dataflow_evolver.llm.mcp_operators import _recommend_categories
 from dataflow_evolver.llm.prompts import (
     build_pipeline_prompt,
@@ -90,8 +90,13 @@ class PipelineAgent:
     def _run_and_assemble(self, prompt: str, node_dir_name: str) -> PipelineConfig | None:
         result = run_pipeline_agent(prompt, cwd=str(self.agent_root), agent_cfg=self.agent_cfg)
         if not result.success:
-            self.logger.error("PipelineAgent SDK 运行失败：%s", result.error)
-            return None
+            # SDK/基础设施级失败（429/5xx/连接/超时/进程崩溃）——非流水线质量问题。
+            # 抛给主循环区分处理：不惩罚节点、不消耗迭代预算（详见 main._step）。
+            self.logger.error(
+                "PipelineAgent SDK 运行失败（基础设施级，retryable=%s）：%s",
+                result.retryable, result.error,
+            )
+            raise AgentInfraError(result.error or "Agent SDK 运行失败", retryable=result.retryable)
 
         node_dir_abs = self.agent_root / node_dir_name
         pipeline_path = node_dir_abs / self.pipeline_filename

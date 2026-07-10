@@ -77,6 +77,17 @@ class TreeManager:
         logger.info("预留节点：parent=node_%s → %s", parent.id, child.node_dir_name)
         return child
 
+    def discard_child(self, child: PipelineNode) -> None:
+        """撤销一个已预留但因基础设施失败未成功扩展的子节点。
+
+        与「生成/执行/评审/训练失败」（置 dead 且回传 penalty）不同：基础设施失败（429/超时/
+        连接等外部原因）不反映流水线质量，故从父节点直接摘除——不置 dead、不回传奖励、不占配额，
+        避免污染 UCB 统计（见 main._step 的 AgentInfraError 处理）。
+        """
+        parent = child.parent
+        if parent is not None and child in parent.children:
+            parent.children.remove(child)
+
     def select(self) -> PipelineNode:
         """自虚拟根沿最大 UCT 下行，返回第一个可扩展节点。
 
