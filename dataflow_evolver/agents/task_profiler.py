@@ -18,7 +18,6 @@ class TaskProfilerAgent(AgentABC):
         return TaskProfile(
             task_description=raw.get("task_description", ""),
             target_schema=raw.get("target_schema", {}),
-            domain=raw.get("domain", "general"),
             quality_criteria=raw.get("quality_criteria", []),
             downstream_task=raw.get("downstream_task", ""),
         )
@@ -33,8 +32,8 @@ class TaskProfilerAgent(AgentABC):
             return None
         profile = self.parse(raw)
         self.logger.info(
-            "TaskProfile 就绪：domain=%s downstream=%s schema=%s",
-            profile.domain, profile.downstream_task, profile.target_schema,
+            "TaskProfile 就绪：downstream=%s schema=%s",
+            profile.downstream_task, profile.target_schema,
         )
         return profile
 

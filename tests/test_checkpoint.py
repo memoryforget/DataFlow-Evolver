@@ -19,10 +19,17 @@ from dataflow_evolver.core.tree_manager import TreeManager
 
 
 def _profile():
-    return TaskProfile("生成", {"instruction": "str"}, "qa", ["非空"], "qa-sft")
+    return TaskProfile("生成", {"instruction": "str"}, ["非空"], "qa-sft")
 
 
-def _build_tree():
+def _write_node_code(agent_root: Path, node_id: int, code: str) -> None:
+    """把节点流水线源码写到磁盘（checkpoint 不再存 code，恢复时从这里重读）。"""
+    d = agent_root / f"node_{node_id}"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "pipeline.py").write_text(code, encoding="utf-8")
+
+
+def _build_tree(agent_root: Path | None = None):
     tm = TreeManager(exploration_constant=1.0)
     tm.set_baseline_root(PipelineConfig([{"name": "B"}], "f", "BASE_CODE", "r"), 0.5)
     c1 = tm.expand(tm.root, PipelineConfig([{"name": "Gen"}], "f1", "C1_CODE", "r1"))
@@ -30,11 +37,15 @@ def _build_tree():
     c1.train_result = TrainResult(0.8, "acc", [BadCase("i", "p", "g", "t")], "log", False, None)
     c1.diagnostic_report = DiagnosticReport("摘要", ["fp1"], ["建议1"])
     tm.backpropagate(c1, 0.3)
+    if agent_root is not None:                       # 落盘 pipeline.py 供 code 重读
+        _write_node_code(agent_root, tm.root.id, "BASE_CODE")
+        _write_node_code(agent_root, c1.id, "C1_CODE")
     return tm, c1
 
 
 def test_checkpoint_roundtrip_tree(tmp_path):
-    tm, c1 = _build_tree()
+    agent_root = tmp_path / "_agent_root"
+    tm, c1 = _build_tree(agent_root)
     rp = RewardPolicy(REWARD_RELATIVE, baseline_dev_score=0.5)
     pool = DataPool(PoolConfig(enabled=True))
     pool.set_warm_gate(0.5, 0.0)
@@ -42,22 +53,24 @@ def test_checkpoint_roundtrip_tree(tmp_path):
 
     path = str(tmp_path / "ckpt.json")
     checkpoint.write(path, checkpoint.serialize(tm, rp, pool, completed_iterations=1, profile=_profile()))
+    # code 不应写进 checkpoint 文件（体积优化）
+    assert "BASE_CODE" not in Path(path).read_text(encoding="utf-8")
     state = checkpoint.read(path)
     assert state is not None
 
     tm2 = TreeManager(exploration_constant=1.0)
-    checkpoint.restore_tree(state, tm2)
+    checkpoint.restore_tree(state, tm2, agent_root=str(agent_root))
 
     # 根：基线 config、visits、reward、baseline_dev
     assert tm2.root.id == tm.root.id
-    assert tm2.root.config.code == "BASE_CODE"
+    assert tm2.root.config.code == "BASE_CODE"          # 从磁盘 pipeline.py 重读
     assert tm2.root.visits == 2 and abs(tm2.root.total_reward - 0.3) < 1e-9
     assert abs(tm2.root.baseline_dev_score - 0.5) < 1e-9
     # 子节点：结构 + 双反馈结果完整恢复
     assert len(tm2.root.children) == 1
     rc1 = tm2.root.children[0]
     assert rc1.id == c1.id and rc1.parent is tm2.root
-    assert rc1.config.code == "C1_CODE"
+    assert rc1.config.code == "C1_CODE"                 # 从磁盘 pipeline.py 重读
     assert rc1.visits == 1 and abs(rc1.total_reward - 0.3) < 1e-9
     assert rc1.review_result.passed is True
     assert rc1.train_result.score == 0.8
@@ -100,7 +113,7 @@ def test_checkpoint_restore_reward_policy_and_pool(tmp_path):
     pool2 = DataPool(PoolConfig(enabled=True))
     checkpoint.restore_pool(state, pool2)
     assert pool2.gate_mode == "relative_baseline"
-    assert len(pool2._staged) == 1 and len(pool2._staged[0].rows) == 2
+    assert len(pool2._staged) == 1 and pool2._staged[0].row_count == 2
     # 恢复后 finalize 仍按严格 > 基线工作（0.8 > 0.5 → 2 行入池）
     pool2.config.max_pool_fraction_per_pipeline = 0
     pool2.finalize()

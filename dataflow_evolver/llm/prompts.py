@@ -22,7 +22,6 @@ PROFILER_PROMPT = """你是一名数据工程任务分析师。根据下面的�
 {{
   "task_description": "对任务的精炼复述",
   "target_schema": {{"字段名": "类型(str/int/float/list/...)", ...}},
-  "domain": "领域，如 math / code / general-QA",
   "quality_criteria": ["高质量数据应满足的要点", ...],
   "downstream_task": "下游训练任务标识，如 math-QA-SFT"
 }}
@@ -266,7 +265,7 @@ DIAGNOSTIC_PROMPT = """你是模型失败归因专家。下面是某数据集训
 请聚类失败模式，并给出"如何改进数据生成流水线"的可执行建议。
 
 下游任务：{downstream_task}
-失败样例（input / prediction / ground_truth / error_type）：
+失败样例（input / prediction=模型完整输出 / extracted_answer=解析出的最终答案 / ground_truth / error_type）：
 {bad_cases}
 
 请只输出一个 JSON 对象：

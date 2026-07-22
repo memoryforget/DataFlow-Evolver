@@ -23,6 +23,7 @@ class DiagnosticAgent(AgentABC):
                 {
                     "input": bc.input,
                     "prediction": bc.prediction,
+                    "extracted_answer": bc.extracted_answer,
                     "ground_truth": bc.ground_truth,
                     "error_type": bc.error_type,
                 },

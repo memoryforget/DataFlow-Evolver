@@ -64,7 +64,7 @@ def _score_benchmark(bench_name: str, examples: list, preds_per_example: list,
             first = preds[0]
             all_bad_cases.append({
                 "input": ex["question"],
-                "prediction": first[:500],
+                "prediction": first,
                 "extracted_answer": extract_answer(first, bench_name),
                 "ground_truth": ex["gold_answer"],
                 "error_type": f"{bench_name}:wrong_answer",

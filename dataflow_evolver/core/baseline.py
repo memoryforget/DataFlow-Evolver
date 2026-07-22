@@ -77,6 +77,40 @@ def _replace_kwarg_literal(src: str, kwarg: str, value: str) -> tuple[str, int]:
     return new_src, n
 
 
+# 非算子类：FileStorage / LLM serving 等基础设施，不计入算子摘要。
+_NON_OPERATOR_CLASSES = frozenset({
+    "FileStorage",
+    "APILLMServing_request",
+    "LocalModelLLMServing",
+    "LocalModelLLMServing_vllm",
+    "LLMServingABC",
+})
+
+# 匹配 `self.xxx = ClassName(` 形式的算子实例化（DataFlow 流水线的惯用写法）。
+_OP_ASSIGN_RE = re.compile(r"self\.\w+\s*=\s*([A-Z]\w+)\s*\(")
+
+
+def summarize_baseline_operators(src: str) -> tuple[list[dict], str]:
+    """从（适配后的）基线流水线源码解析算子清单与 field_flow，保证与实际执行一致。
+
+    背景：基线的真实行为完全由 `src` 决定（`adapt_baseline_source` 只改 4 处运行时常量、
+    不动结构）。因此这里不再手写一份可能与源码不符的算子元数据，而是直接从源码按出现顺序
+    抽取算子类实例化（`self.x = ClassName(...)`），剔除 FileStorage / APILLMServing_request
+    等基础设施类与 `*Prompt` 模板类。产出仅用于展示 / GlobalMemory 渲染，故不解析具体入参
+    （避免像旧实现那样谎报 `num_samples=50` 这类从未真正执行的参数）。
+
+    返回 (operators, field_flow)；解析不到算子时返回 ([], "")，由调用方兜底。
+    """
+    operators: list[dict] = []
+    for m in _OP_ASSIGN_RE.finditer(src):
+        cls = m.group(1)
+        if cls in _NON_OPERATOR_CLASSES or cls.endswith("Prompt"):
+            continue
+        operators.append({"name": cls, "custom": False, "purpose": "", "params": {}})
+    field_flow = " -> ".join(op["name"] for op in operators)
+    return operators, field_flow
+
+
 def adapt_baseline_source(
     src: str,
     *,

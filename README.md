@@ -373,6 +373,22 @@ trainer:
 
 ---
 
+## 暖启动 / 强基线锚点（可选，默认关闭）
+
+`baseline.enabled=false`（默认）= **冷启动**：虚拟空根 + 绝对分奖励。置 `true` = **暖启动**：
+先用一条固定的强基线流水线跑一次得 `baseline_dev_score`，以它作 MCTS 根节点，并切换到
+**Relative Gain 奖励**（`reward = node_dev − baseline_dev`）——即"必须打败强基线才算正向"。
+
+- 基线由 `baseline.baseline_pipeline` 指定，**必须是"从零合成"型**（首个算子为生成类、不依赖输入语料）
+  且产在**目标领域**：框架会把它的 `first_entry` 强制替换为空 `empty.jsonl`，并注入代理 API / key / 缓存路径
+  （`core/baseline.py::adapt_baseline_source`，只改运行时常量、不动结构）。
+  自带示例：`.../api_pipelines/reasoning_math_baseline_pipeline.py`（CondorGenerator 数学题 → CoT）。
+- ⚠️ 该示例文件位于 `workspace/_agent_root/dataflow/` 下，**随 `.gitignore` 不入库**（属上游 DataFlow 源码副本的一部分）；
+  换机器时需与 dataflow 副本一起手动放置。
+- 开启会**额外花一次真实 API/训练预算**跑基线，故默认关闭；启用前留意配额。
+
+---
+
 ## 防数据泄露：dev / test 评测纪律
 
 MCTS 反复用同一 benchmark 当奖励会**对它过拟合**；若再用同一 benchmark 报告结果，分数虚高、不可泛化。
@@ -397,6 +413,8 @@ MCTS 反复用同一 benchmark 当奖励会**对它过拟合**；若再用同一
 - 池价值 = 可直接用的成品 + 回收已花算力 + 承载诊断驱动的累积覆盖（单节点结构上做不到）。
 - **接入状态**：`core/data_pool.py` 的接口/去重/上限**已接入 `main.py`**（启动时按 `data_pool.enabled` 实例化 `DataPool`）。
   当前 `default.yaml` 的 `enabled` 默认值为 **`true`**（随仓库配置）；若做独立性消融或省算力，可手动置 `false`。
+- **落盘暂存**：运行期每个通过节点的数据先写到 `workspace/pool_staging/` 的 sidecar jsonl，内存与 checkpoint 只留元数据；
+  运行结束 `dump()` 时才流式读回统一[门槛筛 → 去重 → 占比裁剪]——避免整份数据集常驻内存或反复写进 checkpoint。
 - ⚠️ 「池 vs 单 pipeline 谁更强」仍是**待受控实验检验的假设**（须等量对比 + 多样性量化），**非既定结论**。
 
 ---
@@ -422,13 +440,13 @@ python -m pytest tests/ -q
 ```
 dataflow_evolver/
 ├── agents/      # base / task_profiler / pipeline_agent(SDK 驱动) / review / diagnostic
-├── core/        # schemas / tree_node / tree_manager / global_memory
+├── core/        # schemas / tree_node / tree_manager / global_memory / data_pool / baseline / checkpoint
 ├── engine/      # execution_wrapper / trainer_wrapper
 ├── llm/         # serving(API/vLLM) / agent_sdk / mcp_operators / prompts
 ├── utils/       # config / logging / parsing
 └── main.py      # 双反馈事件环编排器
 configs/         # default.yaml
-scripts/         # reference_train_eval.py（外部训练脚本契约示例）
-workspace/       # 运行产物 + _agent_root（Agent SDK cwd）
+scripts/         # reference_train_eval.py（契约示例）/ llamafactory_math_sft_eval.py（数学 SFT+评测）/ vllm_eval_standalone.py
+workspace/       # 运行产物 + _agent_root（Agent SDK cwd；dataflow 源码副本随 .gitignore 不入库）
 tests/
 ```

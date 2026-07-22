@@ -28,12 +28,11 @@ class StubServing(LLMServingABC):
 def test_profiler_parses_profile():
     stub = StubServing([
         '{"task_description":"生成数学问答","target_schema":{"instruction":"str","answer":"str"},'
-        '"domain":"math","quality_criteria":["答案正确"],"downstream_task":"math-QA-SFT"}'
+        '"quality_criteria":["答案正确"],"downstream_task":"math-QA-SFT"}'
     ])
     agent = TaskProfilerAgent(stub)
     profile = agent.run("做一个数学问答数据集")
     assert profile is not None
-    assert profile.domain == "math"
     assert profile.target_schema == {"instruction": "str", "answer": "str"}
     assert profile.downstream_task == "math-QA-SFT"
 
@@ -43,7 +42,7 @@ def test_review_threshold_pass_and_fail(tmp_path):
     ds.write_text('{"instruction":"a","answer":"b"}\n', encoding="utf-8")
     from dataflow_evolver.core.schemas import TaskProfile
 
-    profile = TaskProfile("t", {"instruction": "str", "answer": "str"}, "math", [], "sft")
+    profile = TaskProfile("t", {"instruction": "str", "answer": "str"}, [], "sft")
 
     high = StubServing(['{"schema_score":0.9,"relevance_score":0.8,"issues":[]}'])
     r = ReviewAgent(high, schema_threshold=0.6, relevance_threshold=0.6).review(str(ds), profile)
@@ -58,7 +57,7 @@ def test_review_threshold_pass_and_fail(tmp_path):
 def test_review_empty_dataset_fails(tmp_path):
     from dataflow_evolver.core.schemas import TaskProfile
 
-    profile = TaskProfile("t", {}, "d", [], "sft")
+    profile = TaskProfile("t", {}, [], "sft")
     r = ReviewAgent(StubServing([""]) ).review(str(tmp_path / "missing.jsonl"), profile)
     assert r.passed is False
 
@@ -76,7 +75,7 @@ def test_review_survives_serving_exception(tmp_path):
     ds.write_text('{"instruction":"a","answer":"b"}\n', encoding="utf-8")
     from dataflow_evolver.core.schemas import TaskProfile
 
-    profile = TaskProfile("t", {"instruction": "str"}, "math", [], "sft")
+    profile = TaskProfile("t", {"instruction": "str"}, [], "sft")
     r = ReviewAgent(_RaisingServing()).review(str(ds), profile)
     assert r.passed is False
 
@@ -113,7 +112,7 @@ def test_pipeline_prompt_injects_review_issues():
     from dataflow_evolver.core.schemas import TaskProfile
     from dataflow_evolver.llm.prompts import build_pipeline_prompt
 
-    profile = TaskProfile("QA", {"q": "str", "a": "str"}, "general", [], "sft")
+    profile = TaskProfile("QA", {"q": "str", "a": "str"}, [], "sft")
     base = build_pipeline_prompt(profile, "empty.jsonl", "node_1")
     assert "评审打回" not in base
 
@@ -129,7 +128,7 @@ def test_pipeline_prompt_injects_target_samples():
     from dataflow_evolver.core.schemas import TaskProfile
     from dataflow_evolver.llm.prompts import build_pipeline_prompt
 
-    profile = TaskProfile("QA", {"instruction": "str", "output": "str"}, "math", [], "sft")
+    profile = TaskProfile("QA", {"instruction": "str", "output": "str"}, [], "sft")
     base = build_pipeline_prompt(profile, "empty.jsonl", "node_1")
     assert "目标产出规模" not in base                      # 默认 0 → 不注入
 

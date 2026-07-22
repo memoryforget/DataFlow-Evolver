@@ -64,7 +64,7 @@ def test_event_loop_runs_and_picks_best(tmp_path, monkeypatch):
     orch = Orchestrator(cfg)
 
     # 桩：TaskProfiler 直接给出固定 profile
-    profile = TaskProfile("生成问答", {"instruction": "str", "answer": "str"}, "qa", ["答案非空"], "qa-sft")
+    profile = TaskProfile("生成问答", {"instruction": "str", "answer": "str"}, ["答案非空"], "qa-sft")
     monkeypatch.setattr(orch.profiler, "run", lambda *a, **k: profile)
 
     # 桩：ReviewAgent 总是通过

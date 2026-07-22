@@ -31,17 +31,29 @@ from dataflow_evolver.utils.logging import get_logger
 
 logger = get_logger("core.checkpoint")
 
-SCHEMA_VERSION = 1
+# v2：TaskProfile 移除 domain 字段（旧 v1 checkpoint 含 domain，恢复会失败）→ 提版本使其被安全丢弃重跑
+SCHEMA_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
 # 序列化
 # ---------------------------------------------------------------------------
+def _config_to_dict(config) -> dict[str, Any] | None:
+    """序列化 PipelineConfig，但**不含 `code`**：完整流水线源码已落盘于节点目录的
+    pipeline.py，恢复时按需从磁盘重读（见 restore_tree），避免 checkpoint 随代码体积膨胀。
+    """
+    if config is None:
+        return None
+    d = asdict(config)
+    d.pop("code", None)
+    return d
+
+
 def _node_to_dict(node: PipelineNode) -> dict[str, Any]:
     return {
         "id": node.id,
         "parent_id": node.parent.id if node.parent is not None else None,
-        "config": asdict(node.config) if node.config is not None else None,
+        "config": _config_to_dict(node.config),
         "visits": node.visits,
         "total_reward": node.total_reward,
         "dead": node.dead,
@@ -87,7 +99,8 @@ def serialize(
             "baseline_dev": pool.baseline_dev,
             "margin": pool.margin,
             "staged": [
-                {"node_id": s.node_id, "dev_score": s.dev_score, "rows": s.rows}
+                {"node_id": s.node_id, "dev_score": s.dev_score,
+                 "path": s.path, "row_count": s.row_count}
                 for s in pool._staged
             ],
         }
@@ -131,8 +144,26 @@ def restore_reward_policy(state: dict[str, Any]) -> RewardPolicy:
     return RewardPolicy(reward_mode=rp["reward_mode"], baseline_dev_score=rp["baseline_dev_score"])
 
 
-def _config_from_dict(d: dict[str, Any] | None) -> PipelineConfig | None:
-    return PipelineConfig(**d) if d else None
+def _load_node_code(agent_root: str | None, node_id: int, pipeline_filename: str) -> str:
+    """从节点目录重读流水线源码（checkpoint 不再存 code）。找不到则返回 ""（不阻塞续跑）。"""
+    if not agent_root:
+        return ""
+    p = Path(agent_root) / f"node_{node_id}" / pipeline_filename
+    try:
+        return p.read_text(encoding="utf-8") if p.exists() else ""
+    except OSError:
+        return ""
+
+
+def _config_from_dict(d: dict[str, Any] | None, code: str = "") -> PipelineConfig | None:
+    if not d:
+        return None
+    return PipelineConfig(
+        operators=d.get("operators", []),
+        field_flow=d.get("field_flow", ""),
+        code=code,
+        rationale=d.get("rationale", ""),
+    )
 
 
 def _review_from_dict(d: dict[str, Any] | None) -> ReviewResult | None:
@@ -154,12 +185,22 @@ def _diag_from_dict(d: dict[str, Any] | None) -> DiagnosticReport | None:
     return DiagnosticReport(**d) if d else None
 
 
-def restore_tree(state: dict[str, Any], tree: TreeManager) -> None:
-    """把序列化的节点重建进 `tree`：恢复 root、统计、global_memory、step_count、id 计数器。"""
+def restore_tree(
+    state: dict[str, Any],
+    tree: TreeManager,
+    agent_root: str | None = None,
+    pipeline_filename: str = "pipeline.py",
+) -> None:
+    """把序列化的节点重建进 `tree`：恢复 root、统计、global_memory、step_count、id 计数器。
+
+    `code` 不在 checkpoint 内——传入 `agent_root` 时按 `node_<id>/<pipeline_filename>` 从磁盘
+    重读回 config.code（供变异起点 parent_code 注入）；不传或文件缺失则 code 保持 ""。
+    """
     built: dict[int, PipelineNode] = {}
     parent_of: dict[int, int | None] = {}
     for nd in state["nodes"]:
-        node = PipelineNode(config=_config_from_dict(nd["config"]), parent=None)
+        code = _load_node_code(agent_root, nd["id"], pipeline_filename) if nd["config"] else ""
+        node = PipelineNode(config=_config_from_dict(nd["config"], code), parent=None)
         node.id = nd["id"]
         node.visits = nd["visits"]
         node.total_reward = nd["total_reward"]
@@ -201,6 +242,7 @@ def restore_pool(state: dict[str, Any], pool: DataPool) -> None:
     pool.baseline_dev = pd["baseline_dev"]
     pool.margin = pd["margin"]
     pool._staged = [
-        StagedNode(node_id=s["node_id"], dev_score=s["dev_score"], rows=s["rows"])
+        StagedNode(node_id=s["node_id"], dev_score=s["dev_score"],
+                   path=s["path"], row_count=s.get("row_count", 0))
         for s in pd["staged"]
     ]

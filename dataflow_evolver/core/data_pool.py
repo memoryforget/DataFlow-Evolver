@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -67,11 +68,17 @@ class PoolConfig:
 
 @dataclass
 class StagedNode:
-    """运行期暂存的一个候选节点（dump 前才决定是否准入）。"""
+    """运行期暂存的一个候选节点（dump 前才决定是否准入）。
+
+    为避免整份数据集常驻内存 / 写进 checkpoint，行数据落到磁盘 sidecar（`path`），
+    内存 / checkpoint 只保留轻量元数据（node_id / dev_score / path / row_count），
+    finalize 时才从磁盘流式读回。
+    """
 
     node_id: int
     dev_score: float
-    rows: list[dict[str, Any]]
+    path: str                # 该节点数据暂存的 jsonl sidecar 路径
+    row_count: int
 
 
 @dataclass
@@ -109,7 +116,7 @@ class DataPool:
         pool.dump()                     # 运行结束统一 finalize + 落盘
     """
 
-    def __init__(self, config: PoolConfig) -> None:
+    def __init__(self, config: PoolConfig, staging_dir: str | None = None) -> None:
         self.config = config
         self._staged: list[StagedNode] = []
         self._entries: list[PoolEntry] = []      # finalize 后填充
@@ -118,6 +125,35 @@ class DataPool:
         self.baseline_dev: float | None = None
         self.margin: float = 0.0
         self.last_stats: FinalizeStats | None = None
+        # 行数据暂存目录（sidecar）。传入稳定路径（如 workspace 下）可跨进程 checkpoint 续跑；
+        # 未传时首次 stage 惰性建临时目录（仅同进程内有效，够单测/一次性运行用）。
+        self._staging_dir: Path | None = Path(staging_dir) if staging_dir else None
+
+    def _ensure_staging_dir(self) -> Path:
+        if self._staging_dir is None:
+            self._staging_dir = Path(tempfile.mkdtemp(prefix="datapool_staging_"))
+        self._staging_dir.mkdir(parents=True, exist_ok=True)
+        return self._staging_dir
+
+    @staticmethod
+    def _read_rows(path: str) -> list[dict[str, Any]]:
+        """从 sidecar jsonl 流式读回行（跳过空行/坏行）；读失败返回空列表（不阻塞 finalize）。"""
+        rows: list[dict[str, Any]] = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(obj, dict):
+                        rows.append(obj)
+        except OSError as exc:
+            logger.warning("读取暂存 sidecar 失败（跳过该节点）：%s（%s）", path, exc)
+        return rows
 
     # ------------------------------------------------------------------
     def set_warm_gate(self, baseline_dev: float, margin: float = 0.0) -> None:
@@ -148,8 +184,16 @@ class DataPool:
             return False
         if not review_passed or dev_score is None:
             return False
+        # 行数据落磁盘 sidecar，内存只留元数据
+        path = self._ensure_staging_dir() / f"staged_node_{node_id}.jsonl"
+        count = 0
+        with path.open("w", encoding="utf-8") as f:
+            for r in rows:
+                if isinstance(r, dict):
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                    count += 1
         self._staged.append(StagedNode(node_id=node_id, dev_score=float(dev_score),
-                                       rows=[r for r in rows if isinstance(r, dict)]))
+                                       path=str(path), row_count=count))
         return True
 
     # ------------------------------------------------------------------
@@ -186,7 +230,7 @@ class DataPool:
         seen: set[str] = set()
         per_source_rows: dict[int, list[PoolEntry]] = {}
         for node in admitted:
-            for row in node.rows:
+            for row in self._read_rows(node.path):    # 从 sidecar 流式读回
                 stats.rows_before_dedup += 1
                 h = self.content_hash(row)
                 if self.config.dedup == "content_hash" and h in seen:

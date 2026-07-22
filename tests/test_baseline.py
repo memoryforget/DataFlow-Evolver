@@ -22,6 +22,7 @@ from dataflow_evolver.core.baseline import (
     REWARD_RELATIVE,
     RewardPolicy,
     adapt_baseline_source,
+    summarize_baseline_operators,
 )
 from dataflow_evolver.core.data_pool import DataPool, PoolConfig
 from dataflow_evolver.core.schemas import (
@@ -108,6 +109,28 @@ def test_adapt_baseline_source_rewrites_constants_and_injects_key():
     assert 'first_entry_file_name="C:/tmp/node_3/empty.jsonl"' in out
     assert 'cache_path="C:/tmp/node_3/cache"' in out
     assert "example_data" not in out
+
+
+def test_summarize_baseline_operators_from_source():
+    """算子清单/field_flow 从源码解析：只取算子类、按顺序、剔除 storage/serving/*Prompt。"""
+    src = (
+        "self.storage = FileStorage(first_entry_file_name='e', cache_path='c')\n"
+        "self.llm_serving = APILLMServing_request(api_url='u', model_name='m')\n"
+        "self.generator = CondorGenerator(llm_serving=self.llm_serving, num_samples=3, "
+        "prompt_template=CondorQuestionPrompt())\n"
+        "self.refiner = CondorRefiner(llm_serving=self.llm_serving)\n"
+        "self.alpagasus_filter = AlpagasusFilter(min_score=3, max_score=5)\n"
+    )
+    ops, flow = summarize_baseline_operators(src)
+    names = [op["name"] for op in ops]
+    assert names == ["CondorGenerator", "CondorRefiner", "AlpagasusFilter"]  # 无 storage/serving/Prompt
+    assert flow == "CondorGenerator -> CondorRefiner -> AlpagasusFilter"
+    assert all(op["params"] == {} for op in ops)   # 不谎报入参
+
+
+def test_summarize_baseline_operators_empty_on_no_match():
+    ops, flow = summarize_baseline_operators("x = 1\nprint('hi')\n")
+    assert ops == [] and flow == ""
 
 
 def test_adapt_baseline_source_replaces_existing_key_name():
@@ -303,7 +326,7 @@ def _common_stubs(orch, monkeypatch, train_scores):
     train_scores：trainer.run 依次返回的 dev 分（首个为基线分，其后为各节点分）。
     返回记录回传奖励的列表 backprop_log（(node_id, reward)）。
     """
-    profile = TaskProfile("生成问答", {"instruction": "str", "answer": "str"}, "qa", ["答案非空"], "qa-sft")
+    profile = TaskProfile("生成问答", {"instruction": "str", "answer": "str"}, ["答案非空"], "qa-sft")
     monkeypatch.setattr(orch.profiler, "run", lambda *a, **k: profile)
     monkeypatch.setattr(orch.reviewer, "review",
                         lambda dataset_path, prof: ReviewResult(0.9, 0.9, True, []))

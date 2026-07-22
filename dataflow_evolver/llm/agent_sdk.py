@@ -164,6 +164,10 @@ def _build_options(agent_cfg: Config, cwd: str, resume: str | None = None) -> An
     - resume：非空则续跑指定会话（载入其历史对话），用于瞬时失败后接着上次进度跑，
       不 fork（继续同一会话 id，把新 turn 追加进去）。
     - effort：Claude 努力/思考档位（low|medium|high|xhigh|max）。配置留空则用模型默认（high）。
+    - thinking：显式传 adaptive 思考配置。opus-4-8 等新模型**只支持 adaptive thinking + effort**，
+      不接受老式 thinking.enabled（budget）。这里显式指定 {"type":"adaptive"}，从协议层复刻实测
+      可用的请求格式，从而不受环境里 CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1（会退化成 thinking.enabled
+      → Bedrock 400）影响；即项目自带正确配置，不依赖全局/外部 env。配置 thinking: none 可关闭该显式指定。
     SDK 鉴权（ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL）经环境变量传入，子进程默认继承 os.environ。
     """
     from claude_agent_sdk import ClaudeAgentOptions
@@ -172,6 +176,8 @@ def _build_options(agent_cfg: Config, cwd: str, resume: str | None = None) -> An
 
     append_text = agent_cfg.get("system_prompt_append", _DEFAULT_SYSTEM_PROMPT_APPEND)
     effort = agent_cfg.get("effort", None) or None  # 空串/None → 不传，走模型默认
+    thinking_mode = (agent_cfg.get("thinking", "adaptive") or "adaptive").lower()
+    thinking = {"type": "adaptive"} if thinking_mode == "adaptive" else None
     return ClaudeAgentOptions(
         cwd=cwd,
         model=agent_cfg.get("model", None),
@@ -183,6 +189,7 @@ def _build_options(agent_cfg: Config, cwd: str, resume: str | None = None) -> An
         mcp_servers={"dataflow-operators": operator_mcp_server},
         resume=resume,
         effort=effort,
+        thinking=thinking,
     )
 
 
@@ -220,19 +227,24 @@ async def _run(prompt: str, options: Any) -> AgentRunResult:
                         logger.debug("Agent SDK turn %d: tool_use %s", turn, block.name)
             elif isinstance(msg, ResultMessage):
                 result_text = msg.result or ""
-    except CLINotFoundError as exc:
-        return AgentRunResult(False, error=str(exc), error_type="CLINotFoundError", session_id=session_id)
-    except ProcessError as exc:
+    except (
+        CLINotFoundError, ProcessError, CLIJSONDecodeError, CLIConnectionError, Exception,
+    ) as exc:
+        # 关键：CLI 在 turn 中途 API 报错时，真实错误（如 "API Error: 400 ... invalid beta flag"）
+        # 是作为 assistant 文本返回的，而 SDK 抛出的 ProcessError 常被替换成
+        # "Claude Code returned an error result: <subtype>"（subtype 可能是误导性的 "success"）。
+        # 故这里把已收到的末条助手文本并入错误、并把 assistant_texts 带出，供 _is_retryable 判定，
+        # 也让日志能显示真实原因，而非无信息的 "success"。
+        err = str(exc)
+        tail = assistant_texts[-1].strip() if assistant_texts else ""
+        if tail and tail not in err:
+            err = f"{err}｜CLI 末条输出: {tail[:800]}"
+        etype = "ProcessError" if isinstance(exc, ProcessError) else type(exc).__name__
         return AgentRunResult(
-            False, error=str(exc), error_type="ProcessError",
-            exit_code=getattr(exc, "exit_code", None), session_id=session_id,
+            False, error=err, error_type=etype,
+            exit_code=getattr(exc, "exit_code", None),
+            assistant_texts=assistant_texts, session_id=session_id,
         )
-    except CLIJSONDecodeError as exc:
-        return AgentRunResult(False, error=str(exc), error_type="CLIJSONDecodeError", session_id=session_id)
-    except CLIConnectionError as exc:
-        return AgentRunResult(False, error=str(exc), error_type="CLIConnectionError", session_id=session_id)
-    except Exception as exc:
-        return AgentRunResult(False, error=str(exc), error_type=type(exc).__name__, session_id=session_id)
 
     return AgentRunResult(
         success=True,

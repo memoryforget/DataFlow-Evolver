@@ -34,6 +34,7 @@ from dataflow_evolver.core.baseline import (
     REWARD_RELATIVE,
     RewardPolicy,
     adapt_baseline_source,
+    summarize_baseline_operators,
 )
 from dataflow_evolver.core.data_pool import DataPool, PoolConfig
 from dataflow_evolver.core.schemas import PipelineConfig
@@ -202,11 +203,9 @@ class Orchestrator:
             )
 
         self.trainer = _make_trainer(dev_cmd)
-        # test 终评（全程对 MCTS loop 不可见，仅终评一次）。
-        # 注意：run() 不会调用 self.test_trainer；它仅为「手动终评」预留（防泄露纪律见 README §防数据泄露）。
-        # 终评一般直接运行 scripts/llamafactory_math_sft_eval.py --mode test，或另接显式入口调用它。
-        test_cmd = cfg.trainer.get("test_eval_cmd", "")
-        self.test_trainer = _make_trainer(test_cmd)
+        # test 终评（全程对 MCTS loop 不可见，仅终评一次）不由本编排器驱动：防泄露纪律要求它
+        # 只在选出最优 recipe 后手动跑一次（见 README §防数据泄露），直接运行
+        # scripts/llamafactory_math_sft_eval.py --mode test（对应 trainer.test_eval_cmd）。
 
         # 强基线锚点（warm/cold 开关，见 docs/design-decisions.md §2）
         baseline_cfg = cfg.get("baseline") or Config({})
@@ -223,7 +222,12 @@ class Orchestrator:
         # 数据池（可选副产品，与奖励解耦；默认关闭）
         dp_cfg = cfg.get("data_pool")
         pool_config = PoolConfig.from_dict(dp_cfg.to_dict() if dp_cfg else None)
-        self.pool: DataPool | None = DataPool(pool_config) if pool_config.enabled else None
+        # 行数据暂存到 workspace 下的稳定 sidecar 目录（跨进程续跑可复用），
+        # 内存/checkpoint 只留元数据，避免整份数据集常驻/反复写盘（见 data_pool.StagedNode）。
+        self.pool: DataPool | None = (
+            DataPool(pool_config, staging_dir=str(self.workspace / "pool_staging"))
+            if pool_config.enabled else None
+        )
 
         # 树搜索
         search = cfg.search
@@ -248,7 +252,11 @@ class Orchestrator:
         state = checkpoint.read(self.checkpoint_path) if self.checkpoint_path else None
         if state:
             profile = checkpoint.restore_profile(state)
-            checkpoint.restore_tree(state, self.tree)
+            checkpoint.restore_tree(
+                state, self.tree,
+                agent_root=str(self.agent_root),
+                pipeline_filename=self.pipeline_filename,
+            )
             self.reward_policy = checkpoint.restore_reward_policy(state)
             if self.pool is not None:
                 checkpoint.restore_pool(state, self.pool)
@@ -363,18 +371,17 @@ class Orchestrator:
         pipeline_path = node_dir_abs / self.pipeline_filename
         pipeline_path.write_text(adapted, encoding="utf-8")
 
+        # 算子清单 / field_flow 从适配后的源码解析得出（而非手写），保证与实际执行一致：
+        # 基线行为完全由 code 决定，产出规模等参数以源码为准（不再谎报 num_samples 等元数据）。
+        operators, field_flow = summarize_baseline_operators(adapted)
         baseline_config = PipelineConfig(
-            operators=[
-                {"name": "CondorGenerator", "params": {"num_samples": 50, "prompt_template": "MathCondorPrompt"}},
-                {"name": "ReasoningQuestionFilter", "params": {}},
-                {"name": "ReasoningAnswerGenerator", "params": {}},
-                {"name": "ReasoningAnswerFormatterFilter", "params": {}},
-                {"name": "ReasoningAnswerTokenLengthFilter", "params": {"max_answer_token_length": 8192}},
-                {"name": "ReasoningAnswerNgramFilter", "params": {"min_score": 0.1, "max_score": 1.0, "ngrams": 5}},
-            ],
-            field_flow="empty -> condor_generate(math) -> question_filter -> answer_generate(cot) -> format_filter -> token_filter -> ngram_filter",
+            operators=operators,
+            field_flow=field_flow or "(baseline pipeline; 详见 code)",
             code=adapted,
-            rationale="数学推理基线：CondorGenerator(math prompt) 从零合成 + reasoning filters 保质量 + CoT 答案生成",
+            rationale=(
+                f"强基线：导入并适配自 {src_path.name}"
+                "（算子/field_flow 由源码解析得出，与实际执行一致）。"
+            ),
         )
 
         logger.info("跑强基线（seed=%d）：%s", self.baseline_seed, pipeline_path)

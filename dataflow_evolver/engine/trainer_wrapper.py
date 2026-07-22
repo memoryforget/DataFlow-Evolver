@@ -293,6 +293,10 @@ def _parse_results(results_path: Path, log_path: Path) -> TrainResult:
             prediction=str(bc.get("prediction", "")),
             ground_truth=str(bc.get("ground_truth", "")),
             error_type=bc.get("error_type"),
+            extracted_answer=(
+                None if bc.get("extracted_answer") is None
+                else str(bc.get("extracted_answer"))
+            ),
         )
         for bc in data.get("bad_cases", [])
     ]

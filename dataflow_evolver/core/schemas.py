@@ -14,7 +14,6 @@ class TaskProfile:
 
     task_description: str
     target_schema: dict[str, str]          # 期望字段→类型，如 {"instruction": "str", "answer": "str"}
-    domain: str
     quality_criteria: list[str]
     downstream_task: str                   # 例如 "math-QA-SFT"
 
@@ -44,9 +43,10 @@ class BadCase:
     """来自真实下游评估的单条失败样例。"""
 
     input: str
-    prediction: str
+    prediction: str                        # 模型完整输出（不截断，供诊断看清推理与最终答案）
     ground_truth: str
     error_type: str | None = None
+    extracted_answer: str | None = None    # 从 prediction 解析出的最终答案（与 ground_truth 直接对照）
 
 
 @dataclass
