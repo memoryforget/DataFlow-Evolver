@@ -680,15 +680,11 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
                 "weight_decay": "auto",
             },
         },
-        "scheduler": {
-            "type": "WarmupDecayLR",
-            "params": {
-                "warmup_min_lr": "auto",
-                "warmup_max_lr": "auto",
-                "warmup_num_steps": "auto",
-                "total_num_steps": "auto",
-            },
-        },
+        # 刻意不在 ds_config 里放 "scheduler"：HF Trainer 的 DeepSpeed 集成规则是
+        # 「ds_config 有 scheduler → 用 DeepSpeed 调度器、忽略 lr_scheduler_type」
+        # （transformers/integrations/deepspeed.py: `if "scheduler" in config`）。
+        # 省掉它，才会走 HF 分支用下面 sft_config 的 lr_scheduler_type=cosine + warmup_steps
+        # （即 LIMO 的余弦调度）；warmup_max_lr/steps 等 auto 值也由 HF 学习率/warmup_steps 提供。
     }
 
     # 写临时配置文件
