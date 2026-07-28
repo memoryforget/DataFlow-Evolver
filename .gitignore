@@ -15,8 +15,12 @@ workspace/*
 # 2. 放行 _agent_root 目录本身
 !workspace/_agent_root/
 workspace/_agent_root/*
-# 3. 现在可以忽略 dataflow 源码副本了
-workspace/_agent_root/dataflow/
+# 3. 放行 vendored DataFlow 源码副本（已提交进仓库，Apache-2.0，见 dataflow/VENDOR.md）
+!workspace/_agent_root/dataflow/
+!workspace/_agent_root/dataflow/**
+# 3b. 但 vendored 目录内的 Python 编译产物仍忽略（上面的 ** 放行会盖掉顶部规则，需在此重新忽略）
+workspace/_agent_root/dataflow/**/__pycache__/
+workspace/_agent_root/dataflow/**/*.py[cod]
 
 # 4. 放行 _agent_root 下的 .claude 目录
 !workspace/_agent_root/.claude/
