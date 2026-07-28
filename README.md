@@ -2,8 +2,6 @@
 
 多智能体、MCTS 驱动的自动数据工程框架（双反馈环）。
 
-> 说明：仓库/项目名为 **DataFlow-Evolver**；Python 包与入口模块沿用 `dataflow_evolver`（如 `python -m dataflow_evolver.main`），两者不一致是历史命名，导入路径以 `dataflow_evolver` 为准。
-
 根据高层任务描述，自动生成 / 变异 DataFlow 流水线 DAG，并通过 **双反馈环**——
 快速的"左移"数据评审（Phase-1）+ 真实的下游模型训练评估（Phase-2，产出可执行诊断报告）——
 不断自我修正，最终产出高质量训练数据集。
@@ -115,24 +113,22 @@ trainer:
 
 ### 一次性准备 Agent 工作目录 `workspace/_agent_root/`
 
-Agent SDK 的 `cwd` 指向共享的 `workspace/_agent_root/`，其中需并存技能与 DataFlow 源码副本
+Agent SDK 的 `cwd` 指向共享的 `workspace/_agent_root/`，其中并存技能与 DataFlow 源码副本
 （`dataflow-dev` 技能假设 cwd 即 DataFlow 仓库根）。
 
-**技能文件已随仓库提交**（`workspace/_agent_root/.claude/skills/` 下），无需额外拷贝。
+**这些都已随仓库提交，`git clone` 后开箱即用，无需手动准备：**
 
-**需要手动准备的只有 DataFlow 源码副本**（二选一）：
+- **技能文件**：`workspace/_agent_root/.claude/skills/` 下。
+- **DataFlow 源码副本**：vendored 在 `workspace/_agent_root/dataflow/`（Apache-2.0，署名与版本见该目录下
+  `LICENSE` / `VENDOR.md`）。
 
-```bash
-# 方式 A（推荐）：直接拷贝源码目录到 _agent_root 下
-# MCP server 通过 sys.path 自动 import，无需额外安装
-cp -r <DataFlow>/dataflow workspace/_agent_root/dataflow
+注意编排/agent 环境依赖 DataFlow 的地方**仅剩 MCP server 一处**
+（`llm/mcp_operators.py` 加载算子 registry，把已有算子源码作为 PipelineAgent 的编码风格参考）；
 
-# 方式 B：editable install（同时满足 import 和文件浏览需求，但 agent 浏览源码路径不在 cwd 下）
-cd <DataFlow> && pip install -e .
-```
+把源码放在 `_agent_root/` 下同时满足两件事：① MCP server 经 `sys.path` 注入即可 `import dataflow`；
+② 源码就在 agent 的 `cwd` 下，`dataflow-dev` 技能“cwd 即 DataFlow 根目录”的假设成立、agent 可直接浏览源码。
 
-> `_agent_root/dataflow/` 是上游 DataFlow 的拷贝，会随上游更新而变旧，必要时手动重拷同步。
-> MCP server（`llm/mcp_operators.py`）启动时动态加载 registry，提供已有算子源码供 PipelineAgent 作为编码风格参考。
+> vendored 副本会随上游更新而变旧；需要同步时按 `workspace/_agent_root/dataflow/VENDOR.md` 的步骤重拷并更新版本/commit 标记。
 
 ---
 

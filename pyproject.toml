@@ -32,6 +32,12 @@ df-train = [
     # 训练侧基础库
     "numpy>=1.26,<2",
 ]
+serving-vllm = [
+    # 可选：仅当把辅助 Agent（Profiler/Review/Diagnostic）的 llm.backend 设为 vllm 时才需要。
+    # 默认 backend=api 只用 openai（核心依赖），无需安装本组。serving.py 为惰性 import，未装不报错。
+    "vllm>=0.19",
+    "transformers>=4.57",
+]
 df-eval = [
     # --- vLLM 评测环境：单机推理与数学 benchmark，不混装训练栈 ---
     # vLLM 0.19.1：DP>1 通过 vllm serve 模式（自动启动 OpenAI API server）

@@ -1,9 +1,14 @@
-"""非-SDK 模型后端：供辅助 Agent（Profiler/Review/Diagnostic）与 DataFlow 运行时调用。
+"""非-SDK 模型后端：仅供辅助 Agent（Profiler/Review/Diagnostic）批量文本生成使用。
 
 提供统一的 `LLMServingABC.generate(prompts) -> list[str]` 抽象，按 YAML 配置在
-OpenAI-compatible API 与本地 vLLM 之间切换（vLLM 路径惰性依赖 DataFlow）。
+OpenAI-compatible API 与本地 vLLM 之间切换。
+- api 后端惰性依赖 openai 客户端；
+- vllm 后端惰性依赖 vllm + transformers，直接加载本地/HF 模型。
 
-注意：PipelineAgent 不走这里，它走 Claude Agent SDK（见 llm/agent_sdk.py）。
+注意：
+- 本模块与 DataFlow 运行时完全解耦。生成的 pipeline（DataFlow 运行时）用的是
+  DataFlow 自带的 `dataflow.serving.APILLMServing_request`，不走这里；
+- PipelineAgent 也不走这里，它走 Claude Agent SDK（见 llm/agent_sdk.py）。
 """
 from __future__ import annotations
 
@@ -82,19 +87,72 @@ class APILLMServing(LLMServingABC):
 
 
 class VLLMServing(LLMServingABC):
-    """本地 vLLM 后端，惰性桥接 DataFlow 的 LocalModelLLMServing_vllm。"""
+    """本地 vLLM 后端，直接用 vllm + transformers 加载模型。
 
-    def __init__(self, hf_model_name_or_path: str, tensor_parallel_size: int = 1) -> None:
-        from dataflow.serving import LocalModelLLMServing_vllm  # 惰性导入（重依赖）
+    prompts 会经 tokenizer 的 chat template 组装成对话再交给 vLLM 生成，行为与
+    DataFlow 的 LocalModelLLMServing_vllm 一致，但实现自包含。
+    """
 
-        self._impl = LocalModelLLMServing_vllm(
-            hf_model_name_or_path=hf_model_name_or_path,
-            tensor_parallel_size=tensor_parallel_size,
+    def __init__(
+        self,
+        hf_model_name_or_path: str,
+        tensor_parallel_size: int = 1,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 40,
+        max_tokens: int = 1024,
+        repetition_penalty: float = 1.0,
+        seed: int | None = None,
+        max_model_len: int | None = None,
+        gpu_memory_utilization: float = 0.9,
+        system_prompt: str = "You are a helpful assistant",
+    ) -> None:
+        import os
+
+        try:
+            from vllm import LLM, SamplingParams  # 惰性导入（重依赖）
+        except ImportError as e:  # pragma: no cover - 取决于运行环境
+            raise ImportError("使用 vllm 后端需先安装 vllm：`pip install vllm`") from e
+        from transformers import AutoTokenizer
+
+        # vLLM 要求多进程用 spawn；见 https://docs.vllm.ai/en/latest/design/multiprocessing.html
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+        self.system_prompt = system_prompt
+        self._sampling = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            max_tokens=max_tokens,
+            repetition_penalty=repetition_penalty,
+            seed=seed,
         )
+        self._llm = LLM(
+            model=hf_model_name_or_path,
+            tensor_parallel_size=tensor_parallel_size,
+            max_model_len=max_model_len,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
+        self._tokenizer = AutoTokenizer.from_pretrained(hf_model_name_or_path)
         logger.info("VLLMServing 就绪：model=%s tp=%d", hf_model_name_or_path, tensor_parallel_size)
 
     def generate(self, prompts: list[str], **kwargs: Any) -> list[str]:
-        return self._impl.generate_from_input(prompts)
+        if not prompts:
+            return []
+        conversations = [
+            [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": p},
+            ]
+            for p in prompts
+        ]
+        templated = self._tokenizer.apply_chat_template(
+            conversations,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        outputs = self._llm.generate(templated, self._sampling)
+        return [o.outputs[0].text for o in outputs]
 
 
 def build_serving(cfg: Config) -> LLMServingABC:
@@ -119,6 +177,14 @@ def build_serving(cfg: Config) -> LLMServingABC:
         return VLLMServing(
             hf_model_name_or_path=vllm.hf_model_name_or_path,
             tensor_parallel_size=vllm.get("tensor_parallel_size", 1),
+            temperature=vllm.get("temperature", 0.7),
+            top_p=vllm.get("top_p", 0.9),
+            top_k=vllm.get("top_k", 40),
+            max_tokens=vllm.get("max_tokens", 1024),
+            repetition_penalty=vllm.get("repetition_penalty", 1.0),
+            seed=vllm.get("seed", None),
+            max_model_len=vllm.get("max_model_len", None),
+            gpu_memory_utilization=vllm.get("gpu_memory_utilization", 0.9),
         )
     raise ValueError(f"未知的 llm.backend: {backend!r}（应为 'api' 或 'vllm'）")
 
