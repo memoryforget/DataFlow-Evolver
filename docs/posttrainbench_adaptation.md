@@ -36,6 +36,10 @@ top-K 花真实训练/评测预算。
   （经 `DF_TARGET_SAMPLES` env，无需重新调 Agent SDK 生成代码）。
 - **安全阀**：放大重产后重跑 ReviewAgent + 硬指标；若质量塌陷（大面积重复 / null 激增 / 不可解析 / tier1 大幅回退）
   则跳过用次优（backfill）。
+- 该重评回写 `node.tier2_review_result`（与搜索期探针分 `review_result` 分开保存，互不覆盖），
+  并在**塌陷判定之前**回写，塌陷候选同样留证。它与随后的 `train_result.score` 出自同一份放大数据，
+  是检验「tier1 能否预测下游真分」的唯一可比样本对，故终选结束后**补落盘一次 checkpoint**——
+  循环内最后一次落盘早于终选，不补写这两个字段在 checkpoint 里恒为 `null`。
 - 存活候选跑 `dev_eval_cmd`（单卡全量 SFT + 官方 `evaluate.py --limit dev-limit`，**只读聚合 accuracy**），
   取真分最高者 → `workspace/final_model`（符号链接到其 `sft_model/`）。
 - **终评**：对 `final_model` 跑一次官方 `evaluate.py --limit -1`（复用桥接 `--mode test`，只评不训），得最终报告分。
@@ -188,8 +192,8 @@ export PTB_BENCHMARK=gsm8k PTB_DEV_LIMIT=150 PTB_TIME_BUDGET_SEC=1200
 ---
 
 ## 8. 验证状态
-- `python -m pytest tests/ -q` → **121 passed**（含新增项 + 原有全绿）。
-- 覆盖：五维复合分 + 硬指标惩罚数学、F1–F7 失败信号规整/并入 issues、蓄水池采样（确定性 + 非前缀偏置）、
+- `python -m pytest tests/ -q` → **197 passed**（2026-07-29；含父子继承 / 自修正一致性等新增项 + 原有全绿）。
+- 覆盖：五维复合分 + 硬指标惩罚数学、F1–F7 失败信号规整（与 `issues` 分开保存，渲染点按编号查表拼文本）、蓄水池采样（确定性 + 非前缀偏置）、
   reward 开关（review=tier1 且搜索期不训练 / train=真分且训练）、两档规模（probe 200 / 重产 via env）、
   终选 top-K + 安全阀 + K 缩减、`results.json` 契约（bad_cases 空、只读聚合）、格式对齐转换（含 format_requirement
   注入）、时间预算终止。

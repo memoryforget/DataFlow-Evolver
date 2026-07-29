@@ -1,7 +1,7 @@
 # 设计决策：交付物定位、奖励锚点、数据池与防泄露
 
 > 状态：**设计已定；奖励锚点 / baseline 作 root / Relative Gain / 数据池准入已接线（M7，2026-06-26）**
-> 最后更新：2026-06-26
+> 最后更新：2026-07-29（§3 Phase-1 反馈环：跨节点反馈改走 `parent_review`，补记信号/历史/证据落盘）
 > 本文沉淀关于「交付什么、奖励怎么定、要不要数据池、如何防泄露、如何免按任务调参」的全部讨论结论，指导实现与 paper 写作。
 > 实现进度的勾选清单在 [`../TODO.md`](../TODO.md) §M7，本文不重复维护。
 
@@ -145,10 +145,13 @@ baseline 在框架里扮演**三个不同角色**，勿混为一谈：
 **为何不只靠 ReviewAgent**：它是 Phase-1 快筛，只查表面 schema+相关性，**不知道数据能否让模型变强**。只靠它会退化成 ANDES 式「纯合成+启发式打分」，丢掉真实下游反馈这一核心卖点。**正解 = 保留 Phase-2 但评测放 dev、test 严格隔离**。
 
 > **Phase-1 失败也要反馈(已接线,2026-06-23)**：节点被 ReviewAgent 打回时：
-> 1. **同节点立即自修正环**（`review_self_correction_retries`，默认 **5** 次）：把 `review_result.issues` + **各 step 中间产物的行数概览** 喂给 Agent SDK，让它修复后重新执行+重审，过审才进 Phase-2，限次后才扣 0 分；
+> 1. **同节点立即自修正环**（`review_self_correction_retries`，默认 **5** 次）：把 `review_result.issues`（具体证据原文）喂给 Agent SDK，让它修复后重新执行+重审，过审才进 Phase-2，限次后才扣 0 分；
 > 2. 利用 **DataFlow 每个算子落一个 step cache jsonl** 的特性：自修正 prompt **告知 Agent 这些中间产物存在**（`{node_dir}/cache/`，按执行顺序 step1=第1个算子产出…，可对照 `pipeline.py` 的 `forward()`），让它**自己用 Glob/Read 查看中间数据**、逐 step 追踪质量从哪一步（哪个算子）开始变坏——既含行数骤减/变空，也含行数没变但内容劣化（字段变 null/空、跑题等）。框架不预算行数/样例，交由 Agent 判断（保持简单）。
-> 3. 此外 `review_issues` 也会注入"下次在该节点下扩展"的生成 prompt（跨节点指引），与同节点重试互补。
-> 至此**执行环与评审环对称**：执行崩溃喂 traceback（限 `self_correction_retries`），评审失败喂 issues+中间产物（限 `review_self_correction_retries`）。
+> 3. **自修正 prompt 另注入三样（2026-07-29）**：`failure_signals` 按编号查 `FAILURE_SIGNALS` 拼成的标准化标签段落（信号与 `issues` 在 `ReviewResult` 里分开保存，不夹带进同一列表）；`history`＝本节点前几轮的「针对什么 → 观察到什么变化」摘要，避免 Agent 不知道某段逻辑是上一轮为修 X 才加的、改掉后 X 复现而空转掉限次——其中硬指标 delta 标为"确定变化"（全量扫描，阈值 0.02），五维与 tier1 标为"参考变化"（两轮抽样不同，judge 波动本身约 ±0.1，不足以归因到某处改动）；以及 `decision.json` 同步要求（自修正只改 `pipeline.py` / `operators/` 会让算子构成与设计意图停留在旧版本，`_run_and_assemble` 用指纹比对，未更新则告警不阻断）。
+> 4. **证据落盘**：每次评审追加一行到 `node_N/review.jsonl`（`phase` 区分首评 / `search_recheck_N` / `tier2`，含抽样原文与 LLM 原始响应，供事后核验 tier1 是否可信、离线换权重重算）；每轮自修正追加一行到 `node_N/fix_history.jsonl`（`targets` + prompt 里实际喂回的那段文字——它受阈值影响，无法从 `review.jsonl` 还原）。均不进 checkpoint：节点在一次迭代内是原子的，续跑不会接着跑半途的自修正循环。
+> 5. **跨节点反馈走 `parent_review`（2026-07-29 修正）**：父节点的 Tier-1 归因（五维、最弱维点名、硬指标、命中信号、issues 原文）由 `_parent_quality_block` 注入子节点的生成 prompt，**无论父节点评审是否通过都注入**——搜索期（`reward_source=review`）这是唯一存在的质量信号。
+>    原先设想的"打回后把 `review_issues` 注入下次扩展"**从未生效**：评审最终未过的节点会置 `dead`，而 `best_child()` 跳过 dead 节点，故它永远不会被 `select()` 选为父节点，该分支是死代码。已连同 `build_pipeline_prompt` / `PipelineAgent.generate` 的 `review_issues` 参数一并删除（同一语义留两条渲染路径，日后必然改一处忘一处）。
+> 至此**执行环与评审环对称**：执行崩溃喂 traceback（限 `self_correction_retries`），评审失败喂 issues + 信号 + 历史修复轨迹并告知中间产物位置（限 `review_self_correction_retries`）。
 > 注：ReviewAgent 当前是 **0.6 绝对阈值的硬门**，其相对化（兄弟分位数+灾难下限，见 §2.5）仍为设计、未接线。
 
 ---
