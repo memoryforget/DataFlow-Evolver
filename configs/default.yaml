@@ -46,6 +46,9 @@ agent_sdk:
 # 数据生成规模：注入生成 prompt，指导算子产出量（合成式据此设 num_samples，转换式控采样/过滤）
 generation:
   target_samples: 800                      # 目标产出条数（0=不指定）；按下游 SFT 需求调，Condor 建议 <5000
+  # probe_samples:（PostTrainBench 两段式新增，可选）搜索期每节点探针产出条数（如 200）。
+  #   设置后 search.reward_source=review 时，搜索执行注入 DF_TARGET_SAMPLES=probe_samples，
+  #   终选重产注入 DF_TARGET_SAMPLES=target_samples（同一 pipeline.py 复用两档规模）。默认未设=沿用 target_samples。
 
 # 强基线锚点（相对增益奖励 / 池阈值；见 docs/design-decisions.md §2）
 # ✅ 已接入 main.py。锁定决策：Δ=0（node>baseline 即正向）、seed=42、只跑一次基线。
@@ -60,6 +63,16 @@ baseline:
 
 # MCTS 树搜索
 search:
+  # reward_source:（PostTrainBench 两段式新增）每节点 reward 来源。默认 train=沿用现状
+  #   （每节点跑 trainer.dev_eval_cmd 做 SFT+评测取真分，数学 SFT 路径不变）。
+  #   review=Tier-1：每节点只产 generation.probe_samples 条交 ReviewAgent 打复合分作 reward
+  #   （搜索期不训练/不占 GPU），搜索结束再对 top-K 重产 target_samples 做真实 SFT+评测选模。
+  # reward_source: train
+  # 以下三项仅 reward_source=review 生效：
+  # time_budget_sec:  整轮（搜索+终选+终评）总墙钟预算秒；0=只按 max_iterations 停。
+  #                   搜索会预留「终选+终评」时间后停止扩展。
+  # tier2_top_k:      终选按 tier1 取 top-K 做真实 SFT+评测（默认 3）；预算不足自动缩减（极端 K=1）。
+  # tier2_per_run_sec / final_eval_reserve_sec: 单次 Tier-2 与终评的时间估计（默认取 train_timeout_sec），用于预算预留与 K 缩减。
   exploration_constant: 1.414
   exploration_decay: 1.0                    # 探索常数 c 的指数衰减率（按已评估节点数）；1.0=不衰减
   exploration_min: 0.0                      # 衰减下限，防 c 衰减到 0
@@ -77,6 +90,19 @@ review:
   schema_threshold: 0.6
   relevance_threshold: 0.6
   sample_size: 40
+  # 以下为 PostTrainBench Tier-1 升级新增（可选；不设=仅用 schema/relevance 两维，行为不变）：
+  # hard_metrics: true            # 是否启用硬指标惩罚（dup_rate/null_rate/parse_valid_rate 扫全份文件）
+  # sample_seed:                  # 蓄水池采样随机种子（复现用；不设=非确定）
+  # weights:                      # 五维复合分固定权重（缺项回退默认；下为默认值）
+  #   correctness: 0.35
+  #   relevance: 0.20
+  #   difficulty: 0.15
+  #   diversity: 0.15
+  #   schema: 0.15
+  # collapse_dup_rate: 0.5        # 终选安全阀：放大重产后 dup_rate 超过此值判质量塌陷（跳过用次优）
+  # collapse_null_rate: 0.3       # 同上，null_rate 上限
+  # collapse_parse_valid_rate: 0.7  # 同上，parse_valid_rate 下限
+  # collapse_tier1_frac: 0.6      # 同上，tier1 相对探针回退到此比例以下判塌陷
 
 # Phase-2 真实训练：外部脚本桥接
 trainer:

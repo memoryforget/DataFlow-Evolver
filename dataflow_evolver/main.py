@@ -21,6 +21,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shlex
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -37,7 +41,7 @@ from dataflow_evolver.core.baseline import (
     summarize_baseline_operators,
 )
 from dataflow_evolver.core.data_pool import DataPool, PoolConfig
-from dataflow_evolver.core.schemas import PipelineConfig
+from dataflow_evolver.core.schemas import PipelineConfig, ReviewResult
 from dataflow_evolver.core.tree_manager import TreeManager
 from dataflow_evolver.core.tree_node import PipelineNode
 from dataflow_evolver.engine.execution_wrapper import SubprocessExecutionWrapper
@@ -100,12 +104,22 @@ class Orchestrator:
         # 辅助 Agent（非-SDK）
         self.profiler = TaskProfilerAgent(serving)
         review_cfg = cfg.review
+        _w = review_cfg.get("weights", None)
+        review_weights = _w.to_dict() if hasattr(_w, "to_dict") else _w
         self.reviewer = ReviewAgent(
             serving,
             schema_threshold=review_cfg.get("schema_threshold", 0.6),
             relevance_threshold=review_cfg.get("relevance_threshold", 0.6),
-            sample_size=review_cfg.get("sample_size", 40),
+            sample_size=review_cfg.get("sample_size", 80),
+            weights=review_weights,
+            hard_metrics=bool(review_cfg.get("hard_metrics", True)),
+            seed=review_cfg.get("sample_seed", None),
         )
+        # 终选安全阀阈值：4000 放大重产后若质量塌陷则跳过用次优（见 _quality_collapsed）。
+        self.collapse_dup = float(review_cfg.get("collapse_dup_rate", 0.5))
+        self.collapse_null = float(review_cfg.get("collapse_null_rate", 0.3))
+        self.collapse_parse = float(review_cfg.get("collapse_parse_valid_rate", 0.7))
+        self.collapse_tier1_frac = float(review_cfg.get("collapse_tier1_frac", 0.6))
         self.diagnostician = DiagnosticAgent(
             serving, max_bad_cases=cfg.diagnostic.get("max_bad_cases", 30)
         )
@@ -139,15 +153,31 @@ class Orchestrator:
         self.empty_entry_path.parent.mkdir(parents=True, exist_ok=True)
         self.empty_entry_path.write_text("", encoding="utf-8")
 
-        # 目标产出规模（注入生成 prompt 指导算子产出量；0 或缺省=不指定）
+        # reward 来源开关（向后兼容）：
+        #   "train"（默认，数学 SFT 路径不变）：每节点跑 dev_eval_cmd（SFT+评测）取真分作 reward。
+        #   "review"（PostTrainBench 两段式）：搜索期每节点只产 probe_samples 条交 ReviewAgent 打
+        #            tier1 复合分作 reward（不训练、不占 GPU）；搜索结束再对 top-K 重产 target_samples
+        #            条做真实 SFT+评测（见 _final_selection）。
+        self.reward_source = str(cfg.search.get("reward_source", "train")).lower()
+
+        # 目标产出规模（注入生成 prompt 指导算子产出量；0 或缺省=不指定）。
+        # 两档：probe_samples=搜索期探针小规模；target_samples=终选重产大规模。
+        # 生成的 pipeline.py 从环境变量 DF_TARGET_SAMPLES 读取条数，故同一份代码可复用两档规模。
         gen_cfg = cfg.get("generation")
-        target_samples = int(gen_cfg.get("target_samples", 0)) if gen_cfg else 0
+        self.target_samples = int(gen_cfg.get("target_samples", 0)) if gen_cfg else 0
+        self.probe_samples = int(gen_cfg.get("probe_samples", 0)) if gen_cfg else 0
+        # 注入生成 prompt 的「env 缺省回退值」：review 模式用探针值（脱离编排器单跑也便宜），
+        # train 模式沿用 target_samples（与旧行为一致）。
+        prompt_default_samples = (
+            self.probe_samples if (self.reward_source == "review" and self.probe_samples > 0)
+            else self.target_samples
+        )
         self.pipeline_agent = PipelineAgent(
             agent_cfg=cfg.agent_sdk,
             agent_root=str(self.agent_root),
             entry_path=str(self.empty_entry_path),
             llm_block=llm_block,
-            target_samples=target_samples,
+            target_samples=prompt_default_samples,
         )
 
         # 引擎——执行流水线的子进程里把【pipeline 算子 LLM】密钥注入约定的环境变量名
@@ -203,9 +233,16 @@ class Orchestrator:
             )
 
         self.trainer = _make_trainer(dev_cmd)
-        # test 终评（全程对 MCTS loop 不可见，仅终评一次）不由本编排器驱动：防泄露纪律要求它
-        # 只在选出最优 recipe 后手动跑一次（见 README §防数据泄露），直接运行
-        # scripts/llamafactory_math_sft_eval.py --mode test（对应 trainer.test_eval_cmd）。
+        self.dev_eval_cmd = dev_cmd
+        self.train_python = train_python
+        self.eval_python = eval_python
+        self.train_timeout = train_timeout
+        # test 终评命令：train 模式下沿用旧纪律（手动跑，不由编排器驱动）；review 模式下
+        # _final_selection 选出 final_model 后由编排器**自动跑一次**官方全量评测（见 §终评）。
+        # 缺省时由 dev_eval_cmd 把 "--mode dev" 换成 "--mode test" 派生。
+        self.test_eval_cmd = cfg.trainer.get("test_eval_cmd", "") or dev_cmd.replace(
+            "--mode dev", "--mode test"
+        )
 
         # 强基线锚点（warm/cold 开关，见 docs/design-decisions.md §2）
         baseline_cfg = cfg.get("baseline") or Config({})
@@ -238,6 +275,17 @@ class Orchestrator:
             exploration_min=search.get("exploration_min", 0.0),
         )
         self.max_iterations = search.get("max_iterations", 10)
+        # 预算感知（review 两段式专用；0=关闭，仅按 max_iterations 停）：
+        #   time_budget_sec 为整轮（搜索+终选+终评）总墙钟预算。搜索会在预留出「终选+终评」
+        #   所需时间后停止扩展；预留不足时 _final_selection 会自动缩小 K（极端 K=1）。
+        self.time_budget_sec = float(search.get("time_budget_sec", 0) or 0)
+        self.tier2_top_k = int(search.get("tier2_top_k", 3))
+        # 单次 Tier-2（4000 重产 + 全量 SFT + dev 评测）的时间估计，用于预算预留与 K 缩减；
+        # 缺省取 train_timeout（最坏情况）。final_eval_reserve_sec 为终评预留。
+        self.tier2_per_run_sec = float(search.get("tier2_per_run_sec", train_timeout))
+        self.final_eval_reserve_sec = float(
+            search.get("final_eval_reserve_sec", train_timeout)
+        )
         self.self_correction_retries = search.get("self_correction_retries", 5)
         self.review_self_correction_retries = search.get("review_self_correction_retries", 5)
         # 基础设施（Agent SDK）失败熔断：连续失败达到阈值则主动终止；每次失败退避后重试本轮
@@ -248,6 +296,8 @@ class Orchestrator:
 
     # ------------------------------------------------------------------
     def run(self, task_description: str) -> PipelineNode | None:
+        self._run_start = time.time()
+        self.final_result: dict | None = None
         # 0. 若有 checkpoint → 载入续跑；否则正常起步（含暖启动基线）
         state = checkpoint.read(self.checkpoint_path) if self.checkpoint_path else None
         if state:
@@ -280,6 +330,8 @@ class Orchestrator:
         it = start_it
         consecutive_infra = 0
         while it <= self.max_iterations:
+            if self._search_should_stop():
+                break
             logger.info("==== 迭代 %d/%d ====", it, self.max_iterations)
             parent = self.tree.select()
             status = self._step(parent, profile)
@@ -314,12 +366,37 @@ class Orchestrator:
         if self.pool is not None:
             self.pool.dump()
 
+        # review 两段式：搜索结束后对 top-K 做真实 SFT+评测选模，并对 final_model 跑一次官方全量终评。
+        if self.reward_source == "review":
+            self._final_selection(profile)
+
         best = self.tree.best_leaf()
         if best is not None:
             logger.info(
                 "最优节点：%s（mean_reward=%.4f）", best.node_dir_name, best.mean_reward
             )
         return best
+
+    # ------------------------------------------------------------------
+    def _final_reserve_sec(self) -> float:
+        """为搜索后的「终选 + 终评」预留的墙钟时间（review 模式才预留）。"""
+        if self.reward_source != "review":
+            return 0.0
+        return self.tier2_top_k * self.tier2_per_run_sec + self.final_eval_reserve_sec
+
+    def _search_should_stop(self) -> bool:
+        """时间预算触发则停止扩展（预留终选+终评时间）。time_budget_sec<=0 时永不触发。"""
+        if self.time_budget_sec <= 0:
+            return False
+        elapsed = time.time() - self._run_start
+        reserve = self._final_reserve_sec()
+        if elapsed >= self.time_budget_sec - reserve:
+            logger.info(
+                "时间预算触发：已用 %.0fs / 预算 %.0fs（预留终选+终评 %.0fs），停止扩展进入终选。",
+                elapsed, self.time_budget_sec, reserve,
+            )
+            return True
+        return False
 
     # ------------------------------------------------------------------
     def _save_checkpoint(self, completed_iterations: int, profile) -> None:
@@ -449,6 +526,10 @@ class Orchestrator:
         """
         node_dir = child.node_dir_name
         penalty = self.reward_policy.penalty
+        # 搜索期执行环境：review 模式注入探针规模，让生成的 pipeline 只产 probe_samples 条（便宜）。
+        search_env = self._gen_env(self.probe_samples) if self.reward_source == "review" else None
+        # train 模式不注入任何 env（保持对旧执行器/测试桩的调用签名完全不变）。
+        exec_kwargs = {} if search_env is None else {"env_overrides": search_env}
 
         # 3. 生成（沿用 parent 的诊断作为变异指引；若 parent 上轮被评审打回，把 issues 也喂回去；
         #    并把父节点/基线已验证的流水线代码作为变异起点注入）
@@ -476,7 +557,7 @@ class Orchestrator:
         child.config = config
 
         # 4. 执行（含自修正）
-        exec_result = self.executor.run(config, node_dir)
+        exec_result = self.executor.run(config, node_dir, **exec_kwargs)
         retries = 0
         while not exec_result.success and retries < self.self_correction_retries:
             retries += 1
@@ -485,7 +566,7 @@ class Orchestrator:
             if fixed is None:
                 break
             child.config = fixed
-            exec_result = self.executor.run(fixed, node_dir)
+            exec_result = self.executor.run(fixed, node_dir, **exec_kwargs)
 
         if not exec_result.success or exec_result.dataset_path is None:
             logger.warning("执行最终失败，惩罚节点。")
@@ -507,7 +588,7 @@ class Orchestrator:
             if fixed is None:
                 break
             child.config = fixed
-            exec_result = self.executor.run(fixed, node_dir)
+            exec_result = self.executor.run(fixed, node_dir, **exec_kwargs)
             # 评审自修正后执行崩溃：内嵌执行修复循环（复用 self_correction_retries 次数）
             exec_fix_retries = 0
             while not exec_result.success and exec_fix_retries < self.self_correction_retries:
@@ -520,7 +601,7 @@ class Orchestrator:
                 if exec_fixed is None:
                     break
                 child.config = exec_fixed
-                exec_result = self.executor.run(exec_fixed, node_dir)
+                exec_result = self.executor.run(exec_fixed, node_dir, **exec_kwargs)
             if not exec_result.success or exec_result.dataset_path is None:
                 logger.warning("评审自修正后执行最终失败，停止重审。")
                 break
@@ -530,6 +611,18 @@ class Orchestrator:
             logger.info("数据评审最终未通过，不训练，惩罚节点。issues=%s", review.issues)
             child.dead = True
             self.tree.backpropagate(child, penalty)
+            return
+
+        # ---- reward_source=review：Tier-1 复合分即 reward，搜索期不训练/不诊断/不占 GPU ----
+        if self.reward_source == "review":
+            reward = review.tier1_score
+            self.tree.backpropagate(child, reward)
+            logger.info(
+                "节点 %s 完成（Tier-1）：tier1=%.4f reward=%.4f（composite=%.3f, "
+                "dup=%.2f null=%.2f parse=%.2f）",
+                child.node_dir_name, review.tier1_score, reward, review.llm_composite,
+                review.dup_rate, review.null_rate, review.parse_valid_rate,
+            )
             return
 
         # 6. Phase-2 真实训练（dev 评测）+ 诊断
@@ -562,6 +655,181 @@ class Orchestrator:
                 dev_score=train.score,
                 review_passed=review.passed,
             )
+
+
+    # ------------------------------------------------------------------
+    def _gen_env(self, n: int) -> dict[str, str] | None:
+        """构造注入 pipeline 执行子进程的产出规模环境变量（n<=0 时不注入）。"""
+        return {"DF_TARGET_SAMPLES": str(int(n))} if n and n > 0 else None
+
+    def _quality_collapsed(self, orig: "ReviewResult", new: "ReviewResult") -> bool:
+        """大规模重产后的质量塌陷判定（安全阀）：命中任一即视为塌陷，跳过该候选。"""
+        if not new.passed:
+            return True
+        if new.dup_rate > self.collapse_dup:
+            return True
+        if new.null_rate > self.collapse_null:
+            return True
+        if new.parse_valid_rate < self.collapse_parse:
+            return True
+        if (
+            orig is not None and orig.tier1_score > 0
+            and new.tier1_score < self.collapse_tier1_frac * orig.tier1_score
+        ):
+            return True
+        return False
+
+    def _final_selection(self, profile) -> None:
+        """搜索结束后的 Tier-2 选模 + 终评（仅 reward_source=review）。
+
+        1) 按 tier1 取 top-K 候选；
+        2) 各自用 target_samples（4000）重跑**同一** pipeline.py（env 注入，不重新生成代码）；
+        3) 安全阀：重跑 ReviewAgent + 硬指标，质量塌陷则跳过用次优（backfill）；
+        4) 对存活候选跑 dev_eval_cmd（单卡全量 SFT + 官方 evaluate.py --limit dev-limit），取真分最高者；
+        5) 其 sft_model 落为 final_model/，再跑一次官方 evaluate.py --limit -1 终评。
+        """
+        if self.trainer is None:
+            logger.warning("未配置 dev_eval_cmd（trainer 为空），跳过终选/终评。")
+            return
+        candidates = [
+            n for n in self.tree.all_nodes()
+            if (not n.dead) and n.review_result is not None
+            and n.config is not None and n.visits > 0
+        ]
+        candidates.sort(key=lambda n: n.review_result.tier1_score, reverse=True)
+        if not candidates:
+            logger.warning("无可终选的候选节点。")
+            return
+
+        k = self.tier2_top_k
+        if self.time_budget_sec > 0:
+            remaining = (
+                self.time_budget_sec - (time.time() - self._run_start)
+                - self.final_eval_reserve_sec
+            )
+            affordable = max(1, int(remaining // max(self.tier2_per_run_sec, 1.0)))
+            k = max(1, min(self.tier2_top_k, affordable))
+        logger.info(
+            "终选：%d 个候选，目标跑通 top-%d 个 Tier-2（4000 重产 + 单卡全量 SFT + dev 评测）。",
+            len(candidates), k,
+        )
+
+        best: tuple[float, str, PipelineNode] | None = None
+        successes = 0
+        for node in candidates:
+            if successes >= k:
+                break
+            if self.time_budget_sec > 0 and (
+                (time.time() - self._run_start)
+                >= self.time_budget_sec - self.final_eval_reserve_sec
+            ):
+                logger.info("预算耗尽，停止 Tier-2 尝试。")
+                break
+
+            node_dir = node.node_dir_name
+            logger.info(
+                "Tier-2 候选：%s（tier1=%.4f）", node_dir, node.review_result.tier1_score
+            )
+            # 1) 大规模重产同一 pipeline.py
+            exec_result = self.executor.run(
+                node.config, node_dir, env_overrides=self._gen_env(self.target_samples)
+            )
+            if not exec_result.success or exec_result.dataset_path is None:
+                logger.warning("候选 %s 放大重产失败，改用次优。", node_dir)
+                continue
+            # 2) 安全阀
+            re_review = self.reviewer.review(exec_result.dataset_path, profile)
+            if self._quality_collapsed(node.review_result, re_review):
+                logger.warning(
+                    "候选 %s 放大后质量塌陷（dup=%.2f null=%.2f parse=%.2f tier1=%.3f passed=%s），改用次优。",
+                    node_dir, re_review.dup_rate, re_review.null_rate,
+                    re_review.parse_valid_rate, re_review.tier1_score, re_review.passed,
+                )
+                continue
+            # 3) 单卡全量 SFT + dev 评测
+            out_dir = str(self.agent_root / node_dir / "tier2_out")
+            train = self.trainer.run(exec_result.dataset_path, out_dir)
+            node.train_result = train
+            if train.failed:
+                logger.warning("候选 %s Tier-2 失败：%s，改用次优。", node_dir, train.error_msg)
+                continue
+            successes += 1
+            sft_model = str(Path(out_dir) / "sft_model")
+            logger.info("候选 %s Tier-2 dev=%.4f（%s）", node_dir, train.score, train.metric_name)
+            if best is None or train.score > best[0]:
+                best = (train.score, sft_model, node)
+
+        if best is None:
+            logger.error("终选未产出任何有效模型（候选全失败/塌陷）。")
+            return
+        dev_score, sft_model, node = best
+        final_model = self._materialize_final_model(sft_model)
+        logger.info(
+            "终选完成：最优候选 %s，dev=%.4f，final_model=%s",
+            node.node_dir_name, dev_score, final_model,
+        )
+        # 5) 终评：官方 evaluate.py --limit -1（只评测不训练；不计入搜索预算）
+        test_score = self._run_final_eval(final_model)
+        self.final_result = {
+            "final_model": final_model,
+            "best_node": node.node_dir_name,
+            "dev_score": dev_score,
+            "test_score": test_score,
+            "metric_name": node.train_result.metric_name if node.train_result else "score",
+        }
+
+    def _materialize_final_model(self, sft_model: str) -> str:
+        """把最优候选的 sft_model 落到 workspace/final_model（符号链接；失败则回退原路径）。"""
+        target = self.workspace / "final_model"
+        src = Path(sft_model)
+        try:
+            if target.is_symlink() or target.exists():
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.symlink_to(src, target_is_directory=True)
+            return str(target)
+        except OSError as exc:
+            logger.warning("创建 final_model 符号链接失败（%s），回退用原路径。", exc)
+            return str(src)
+
+    def _run_final_eval(self, final_model: str) -> float | None:
+        """对 final_model 跑一次官方 evaluate.py --limit -1（复用桥接 --mode test，只评不训）。"""
+        out_dir = self.workspace / "final_eval"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        tokens = shlex.split(self.test_eval_cmd)
+        if tokens and tokens[0] in ("python", "python3") and self.train_python:
+            tokens[0] = self.train_python
+        cmd = [*tokens, "--model-dir", str(final_model), "--output", str(out_dir)]
+        env = {**os.environ, **self.pipeline_extra_env}
+        if self.eval_python:
+            env["SFT_EVAL_PYTHON"] = self.eval_python
+        logger.info("终评命令：%s", " ".join(cmd))
+        try:
+            proc = subprocess.run(
+                cmd, env=env, timeout=self.train_timeout,
+                capture_output=True, text=True,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("终评超时（>%ds）。", self.train_timeout)
+            return None
+        results_path = out_dir / "results.json"
+        if proc.returncode != 0 or not results_path.exists():
+            logger.error(
+                "终评失败（rc=%s，results.json 存在=%s）。stderr 尾部：\n%s",
+                proc.returncode, results_path.exists(), (proc.stderr or "")[-1500:],
+            )
+            return None
+        try:
+            data = json.loads(results_path.read_text(encoding="utf-8"))
+            score = float(data.get("score", 0.0))
+            logger.info("终评分数：%s=%.4f", data.get("metric_name", "score"), score)
+            return score
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
+            logger.error("终评结果解析失败：%s", exc)
+            return None
 
 
 def _read_jsonl_rows(path: str) -> list[dict]:
@@ -603,6 +871,18 @@ def main() -> None:
         print(f"mean_reward: {best.mean_reward:.4f}")
     else:
         print("\n未产出有效流水线。")
+
+    final = getattr(orchestrator, "final_result", None)
+    if final:
+        print("\n==== PostTrainBench 终选/终评 ====")
+        print(f"最优候选节点：{final['best_node']}")
+        print(f"final_model：{final['final_model']}")
+        print(f"dev 分（Tier-2 选模，metric={final['metric_name']}, --limit dev）：{final['dev_score']:.4f}")
+        test_score = final.get("test_score")
+        if test_score is not None:
+            print(f"终评分（官方 evaluate.py --limit -1 全量）：{test_score:.4f}")
+        else:
+            print("终评分：未获得（终评失败，见日志）")
 
 
 if __name__ == "__main__":
