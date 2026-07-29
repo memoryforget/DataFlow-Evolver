@@ -44,17 +44,6 @@ agent-runtime = [
     "pandas>=2.0",
     "colorlog>=6.0",
     "rich>=13.0",
-]
-agent-operators = [
-    # --- 解锁 vendored DataFlow 的**内置算子**（装在 df-agent，可选但推荐）---
-    # 不装：202 个内置算子里只有 129 个可导入。registry 是容错加载的，导入失败者会被
-    # 静默跳过、不进 MCP 目录，因此多数情况下 Claude 看不到它们；但 mcp_operators 的
-    # CATEGORY_GUIDE examples 是**硬编码**的，会点名推荐 13 个当时并不可导入的算子
-    # （且 text2sql 整类可用算子为 0）。Claude 照单使用即 ModuleNotFoundError，而这类
-    # 缺依赖的崩溃**自纠循环修不好**（问题在环境不在代码），只会白烧自修正次数与迭代。
-    # 装齐后：202/202 可导入，MCP 目录 124 → 197，guide examples 全部有效。
-    #
-    # 刻意不钉版本：这些只是拓宽算子可选面的广度依赖，钉死反而容易与主栈打架。
     "nltk",
     "spacy",
     "presidio-analyzer",
