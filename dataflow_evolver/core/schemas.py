@@ -30,12 +30,35 @@ class PipelineConfig:
 
 @dataclass
 class ReviewResult:
-    """Phase-1 快反馈：训练前的数据评审结果。"""
+    """Phase-1 快反馈：训练前的数据评审结果。
+
+    历史上仅有 schema/relevance 两维 + passed 门槛。PostTrainBench 适配把它升级为
+    Tier-1 复合打分器：新增 correctness/difficulty/diversity 三个 LLM 维度，以及纯代码
+    扫描得到的硬指标（dup_rate/null_rate/parse_valid_rate），并合成 tier1_score 作为
+    MCTS 每节点 reward。所有新增字段均带默认值，旧的两维调用与数学 SFT 路径保持不变。
+    """
 
     schema_score: float                    # 0-1
     relevance_score: float                 # 0-1
     passed: bool
     issues: list[str] = field(default_factory=list)
+
+    # --- Tier-1 升级：新增 LLM 维度（0-1，缺省 0 便于向后兼容）---
+    correctness_score: float = 0.0         # 解答/标签正确性、推理-答案一致性
+    difficulty_score: float = 0.0          # 对目标模型的非平凡且可学难度（中间难度带最高）
+    diversity_score: float = 0.0           # 抽样批内多样性、非近重复
+
+    # --- 硬指标（纯代码扫全份文件，不花 LLM）---
+    dup_rate: float = 0.0                  # 内容哈希去重率（重复占比）
+    null_rate: float = 0.0                 # schema 关键字段空缺率
+    parse_valid_rate: float = 1.0          # 可解析（合法 JSON + 字段齐全）占比
+
+    # --- 复合分：作为 Tier-1 reward 回传 MCTS ---
+    llm_composite: float = 0.0             # 五维加权（固定权重）
+    tier1_score: float = 0.0               # llm_composite * (1-dup) * (1-null) * parse_valid
+
+    # --- 失败信号（借鉴 ANDES F1-F7 坏味道分类；仅观测/可解释，不参与打分）---
+    failure_signals: list[str] = field(default_factory=list)  # 命中的信号编号，如 ["F3", "F5"]
 
 
 @dataclass

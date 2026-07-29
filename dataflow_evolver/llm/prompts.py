@@ -111,13 +111,22 @@ def build_pipeline_prompt(
     recommended_categories: dict | None = None,
 ) -> str:
     # 目标产出规模：注入后让 Agent 据此设置算子参数（合成式调 num_samples / 转换式控采样过滤）。
+    # 关键：产出条数必须【从环境变量 DF_TARGET_SAMPLES 运行时读取】，不要写死——这样同一份
+    # pipeline.py 可被复用两档规模：搜索期小规模探针（便宜、给 Tier-1 打分），终选期大规模重产
+    # （用于真实 SFT+评测），无需重新调用 Agent SDK 生成代码（见 docs/posttrainbench_adaptation.md）。
     # 默认 0 = 不指定（避免 CondorGenerator 默认仅 3 条这种意外的小数据集，见 review）。
     size_block = ""
     if target_samples and target_samples > 0:
         size_block = (
-            f"\n【目标产出规模】最终数据集约需 {target_samples} 条。请据此设置算子参数：\n"
-            f"   - 生成类算子：设置 num_samples 或循环次数使产出接近 {target_samples} 条；\n"
-            f"   - 过滤/验证类算子：确保不会过度过滤导致最终产出远低于该规模。\n"
+            f"\n【目标产出规模 / 运行时可调，务必遵守】最终数据集条数**必须从环境变量 "
+            f"DF_TARGET_SAMPLES 读取，不要写死具体数字**。在生成类算子里这样取值：\n"
+            f"       import os\n"
+            f"       num_samples = int(os.environ.get('DF_TARGET_SAMPLES', '{target_samples}'))\n"
+            f"   然后用 num_samples 控制产出条数（或循环/批次次数），使最终产出接近该值。\n"
+            f"   - 生成类算子：num_samples 直接作为生成条数；若算子内部会对 prompt 数做倍乘/除"
+            f"（如 CondorGenerator 每 prompt 产多题），请换算使最终落盘条数≈num_samples；\n"
+            f"   - 过滤/验证类算子：确保不会过度过滤导致最终产出远低于 num_samples；\n"
+            f"   - 环境变量缺省时回退 {target_samples}，保证脱离编排器单独运行也能出数据。\n"
         )
     # 父节点（暖启动时首层父为基线）pipeline.py 代码作为变异起点：
     # 让 Agent「在父节点基础上做有的放矢的变异」，而非每次从零冷启动（见 docs/design-decisions.md §2.4）。
@@ -230,8 +239,26 @@ def build_review_selfcorrect_prompt(node_dir: str, issues: list[str]) -> str:
 # ---------------------------------------------------------------------------
 # ReviewAgent（Phase-1 快反馈）
 # ---------------------------------------------------------------------------
-REVIEW_PROMPT = """你是数据质量评审员。下面是某条流水线生成数据集的抽样，以及目标任务画像。\
-请评估数据是否满足要求。
+# ANDES F1-F7 失败信号分类。让 Tier-1 评审在打分之外标注命中的
+# 信号编号，得到标准化、可解释的问题标签；随后并入 ReviewResult.issues，供 PipelineAgent 自纠
+# prompt 复用。仅作观测/反馈，不改变 tier1_score 的打分公式（见 docs/posttrainbench_adaptation.md）。
+FAILURE_SIGNALS: dict[str, str] = {
+    "F1": "描述过窄：生成围绕极少数结构展开，能力维度单一",
+    "F2": "华而不实：表面花哨但逻辑塌陷，缺乏实质数据多样性",
+    "F3": "模板锁定：大规模近重复 / 模板化雷同",
+    "F4": "覆盖塌陷：未覆盖目标任务相关的关键能力维度",
+    "F5": "约束漂移：偏离目标任务/领域的要求或答案格式",
+    "F6": "有形无实：形式满足但训练价值低（过易/无信息量）",
+    "F7": "描述空泛：生成结果语义松散、逐渐跑题",
+}
+
+
+def _failure_signals_block() -> str:
+    return "\n".join(f"  - {sid}：{desc}" for sid, desc in FAILURE_SIGNALS.items())
+
+
+REVIEW_PROMPT = """你是数据质量评审员。下面是某条流水线生成数据集的抽样，\
+以及目标任务画像。请从五个维度评估这批**合成数据**用于微调目标模型的价值（各维 0.0-1.0）。
 
 目标任务：{task_description}
 期望 schema（字段→类型）：{target_schema}
@@ -240,11 +267,25 @@ REVIEW_PROMPT = """你是数据质量评审员。下面是某条流水线生成�
 数据抽样（每行一条 JSON）：
 {samples}
 
+评分维度说明：
+- correctness_score：解答/标签是否正确、推理过程与最终答案是否自洽一致（错误答案、推理与答案矛盾都要扣分）。
+- relevance_score：与目标任务/领域的相关性。
+- difficulty_score：对目标模型是否**非平凡且可学**——中间难度带最高；过于简单（无学习价值）或超纲无法学都要扣分。
+- diversity_score：抽样批内的多样性、是否存在大量近重复/模板化雷同。
+- schema_score：字段齐全度与类型符合度。
+
+常见失败信号（若明确命中，请在 failure_signals 中列出对应编号；没有则留空数组）：
+{failure_signal_block}
+
 请只输出一个 JSON 对象：
 {{
-  "schema_score": 0.0-1.0,        // 字段齐全度/类型符合度
-  "relevance_score": 0.0-1.0,     // 与目标任务的相关性
-  "issues": ["发现的问题", ...]
+  "correctness_score": 0.0-1.0,
+  "relevance_score": 0.0-1.0,
+  "difficulty_score": 0.0-1.0,
+  "diversity_score": 0.0-1.0,
+  "schema_score": 0.0-1.0,
+  "failure_signals": ["F3", ...],
+  "issues": ["发现的问题（尽量具体，可引用样本）", ...]
 }}
 不要输出 JSON 以外的内容。"""
 
@@ -255,6 +296,7 @@ def build_review_prompt(profile: TaskProfile, samples_text: str) -> str:
         target_schema=profile.target_schema,
         quality_criteria=profile.quality_criteria,
         samples=samples_text,
+        failure_signal_block=_failure_signals_block(),
     )
 
 
