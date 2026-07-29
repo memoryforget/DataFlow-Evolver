@@ -22,6 +22,9 @@ class TreeManager:
         max_children_per_node: int = 4,
         exploration_decay: float = 1.0,
         exploration_min: float = 0.0,
+        memory_top_k: int = 5,
+        memory_max_issues: int = 3,
+        memory_issue_maxlen: int = 120,
     ) -> None:
         self.root = PipelineNode()  # 虚拟根，config=None
         self.exploration_constant = exploration_constant
@@ -31,7 +34,11 @@ class TreeManager:
         self.exploration_decay = exploration_decay
         self.exploration_min = exploration_min
         self._step_count = 0        # 已回传(评估)次数，驱动衰减
-        self.global_memory = GlobalMemory()
+        self.global_memory = GlobalMemory(
+            top_k=memory_top_k,
+            max_issues_per_entry=memory_max_issues,
+            issue_maxlen=memory_issue_maxlen,
+        )
 
     def current_exploration(self) -> float:
         """当前有效探索常数 c（随已评估节点数指数衰减，下限 exploration_min）。"""
