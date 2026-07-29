@@ -182,7 +182,12 @@ def test_normalize_signals_filters_and_dedups():
     assert _normalize_signals([]) == []
 
 
-def test_parse_folds_signals_into_issues():
+def test_parse_keeps_signals_separate_from_issues():
+    """信号与 issues 是异质数据，必须分开保存。
+
+    曾把 "[Fx] 描述" 追加进 issues，结果每个消费点都要再过滤回来（共享过滤函数 + 属性 +
+    四处调用 + 一处"有意的不对称"）。信号文本由需要它的渲染点按编号查 FAILURE_SIGNALS 拼。
+    """
     agent = _agent()
     r = agent.parse({
         "correctness_score": 0.8, "relevance_score": 0.8, "difficulty_score": 0.8,
@@ -191,10 +196,9 @@ def test_parse_folds_signals_into_issues():
         "issues": ["答案与推理不一致"],
     })
     assert r.failure_signals == ["F3", "F5"]
-    # 原有 issue 保留，且失败信号以 [Fx] 描述 追加进 issues
-    assert "答案与推理不一致" in r.issues
-    assert any(s.startswith("[F3]") and FAILURE_SIGNALS["F3"] in s for s in r.issues)
-    assert any(s.startswith("[F5]") for s in r.issues)
+    assert r.issues == ["答案与推理不一致"]                  # 未被信号污染
+    assert not any(s.startswith("[F") for s in r.issues)
+    assert FAILURE_SIGNALS["F3"] not in "".join(r.issues)
     # 打分不受影响（仍是五维加权）
     assert r.llm_composite == pytest.approx(0.8)
 

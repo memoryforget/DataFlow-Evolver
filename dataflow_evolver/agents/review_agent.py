@@ -18,6 +18,8 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import time
+from dataclasses import asdict
 from pathlib import Path
 
 from dataflow_evolver.agents.base import AgentABC
@@ -82,11 +84,12 @@ class ReviewAgent(AgentABC):
             schema_score >= self.schema_threshold
             and relevance_score >= self.relevance_threshold
         )
-        # ANDES F1-F7 失败信号：规整为合法编号并去重，再把人类可读描述并入 issues
-        # 供 PipelineAgent 自纠 prompt 复用（不参与打分）。
+        # ANDES F1-F7 失败信号：只规整为合法编号并去重，**不并入 issues**。
+        # 两者是异质数据——issues 是针对本份数据的具体证据，信号是标准化标签。混进一个列表后，
+        # 每个消费点都得再把它们过滤出来（曾为此写了共享过滤函数 + 属性 + 四处调用）；
+        # 保持分离后，需要信号文本的渲染点自己查 FAILURE_SIGNALS 拼即可。
         signals = _normalize_signals(raw.get("failure_signals", []))
         issues = list(raw.get("issues", []))
-        issues.extend(f"[{sid}] {FAILURE_SIGNALS[sid]}" for sid in signals)
         result = ReviewResult(
             schema_score=schema_score,
             relevance_score=relevance_score,
@@ -125,15 +128,31 @@ class ReviewAgent(AgentABC):
         )
         return result
 
-    def review(self, dataset_path: str, profile: TaskProfile) -> ReviewResult:
-        """随机抽样 → LLM 五维打分 → 硬指标惩罚 → ReviewResult。失败时保守返回未通过。"""
+    def review(
+        self,
+        dataset_path: str,
+        profile: TaskProfile,
+        evidence_path: str | None = None,
+        phase: str = "search",
+    ) -> ReviewResult:
+        """随机抽样 → LLM 五维打分 → 硬指标惩罚 → ReviewResult。失败时保守返回未通过。
+
+        `evidence_path`：给定则把本次评审的证据（抽样原文 + LLM 原始响应 + 解析结果）**追加**
+        写入该 JSONL。tier1 是搜索期唯一的 MCTS reward，但过去只留下一个标量分：抽样和原始
+        响应用完即弃，事后既无法判断这个分是否可信，也无法离线复算/换权重重打。
+        `phase`：区分同一节点的多次评审（首评 / 自纠后重评 / Tier-2 放大后重评）。
+        """
         samples_text = _sample_jsonl(dataset_path, self.sample_size, seed=self.seed)
         if not samples_text:
-            return ReviewResult(0.0, 0.0, False, ["数据集为空或不可读"])
+            result = ReviewResult(0.0, 0.0, False, ["数据集为空或不可读"])
+            self._dump_evidence(evidence_path, phase, dataset_path, "", None, result)
+            return result
         prompt = self.build_prompt(profile, samples_text)
         raw = self.run_json(prompt)
         if raw is None:
-            return ReviewResult(0.0, 0.0, False, ["评审 LLM 未返回有效 JSON"])
+            result = ReviewResult(0.0, 0.0, False, ["评审 LLM 未返回有效 JSON"])
+            self._dump_evidence(evidence_path, phase, dataset_path, samples_text, None, result)
+            return result
         result = self.parse(raw)
         if self.hard_metrics:
             self.apply_hard_metrics(result, dataset_path, profile)
@@ -146,7 +165,44 @@ class ReviewAgent(AgentABC):
             result.llm_composite, result.tier1_score, result.passed,
             ",".join(result.failure_signals) or "-",
         )
+        self._dump_evidence(evidence_path, phase, dataset_path, samples_text, raw, result)
         return result
+
+    def _dump_evidence(
+        self,
+        evidence_path: str | None,
+        phase: str,
+        dataset_path: str,
+        samples_text: str,
+        parsed: dict | None,
+        result: ReviewResult,
+    ) -> None:
+        """把一次评审的完整证据追加为一行 JSON。落盘失败绝不影响主流程。
+
+        用**追加**而非覆盖：同一节点会被评审多次（首评、自纠后重评、Tier-2 放大后重评），
+        覆盖会丢掉自纠轨迹——而"改了之后哪一维真的涨了"正是最需要留存的证据。
+        """
+        if not evidence_path:
+            return
+        record = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "phase": phase,
+            "dataset_path": dataset_path,
+            "sample_size": self.sample_size,
+            "seed": self.seed,
+            "weights": self.weights,
+            "samples_jsonl": samples_text,     # 抽样原文：LLM 实际看到的字节，本身即合法 JSONL
+            "raw_response": self.last_raw_response,
+            "parsed": parsed,                  # 抽取后的 JSON（None = 未返回有效 JSON）
+            "result": asdict(result),
+        }
+        try:
+            path = Path(evidence_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        except (OSError, TypeError, ValueError) as exc:
+            self.logger.warning("评审证据落盘失败（不影响主流程）：%s", exc)
 
 
 def _normalize_weights(weights: dict[str, float] | None) -> dict[str, float]:

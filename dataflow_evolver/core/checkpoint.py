@@ -59,6 +59,9 @@ def _node_to_dict(node: PipelineNode) -> dict[str, Any]:
         "dead": node.dead,
         "baseline_dev_score": node.baseline_dev_score,
         "review_result": asdict(node.review_result) if node.review_result else None,
+        "tier2_review_result": (
+            asdict(node.tier2_review_result) if node.tier2_review_result else None
+        ),
         "train_result": asdict(node.train_result) if node.train_result else None,
         "diagnostic_report": asdict(node.diagnostic_report) if node.diagnostic_report else None,
     }
@@ -207,6 +210,8 @@ def restore_tree(
         node.dead = nd.get("dead", False)
         node.baseline_dev_score = nd["baseline_dev_score"]
         node.review_result = _review_from_dict(nd["review_result"])
+        # .get()：旧 checkpoint 没有这个键，续跑不应因此报错
+        node.tier2_review_result = _review_from_dict(nd.get("tier2_review_result"))
         node.train_result = _train_from_dict(nd["train_result"])
         node.diagnostic_report = _diag_from_dict(nd["diagnostic_report"])
         built[node.id] = node
@@ -227,7 +232,8 @@ def restore_tree(
 
     tree.root = root
     tree._step_count = state.get("step_count", 0)
-    tree.global_memory = type(tree.global_memory)()   # 清空后从节点重建
+    # 就地清空后从节点重建（不可整体替换实例：那会把 top_k 等渲染配置重置回默认值）
+    tree.global_memory.clear()
     for nid in sorted(built):
         if built[nid].config is not None:
             tree.global_memory.update(built[nid])

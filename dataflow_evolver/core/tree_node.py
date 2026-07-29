@@ -50,6 +50,10 @@ class PipelineNode:
 
         # 双反馈结果（回写）
         self.review_result: ReviewResult | None = None
+        # Tier-2 放大重产后的重评结果。与 review_result（搜索期探针小样本）分开保存：
+        # 它和 train_result.score 出自同一份放大数据，是检验 tier1 与下游真分相关性的
+        # 唯一可比样本对；此前这个结果只用于塌陷安全阀，算完即弃。
+        self.tier2_review_result: ReviewResult | None = None
         self.train_result: TrainResult | None = None
         self.diagnostic_report: DiagnosticReport | None = None
 

@@ -22,6 +22,9 @@ class AgentABC(ABC):
         self.serving = serving
         self.max_retries = max_retries
         self.logger = get_logger(f"agents.{self.name}")
+        # 最近一次 LLM 的原始文本响应。run_json 只返回抽取后的 dict，原文此前仅在解析失败时
+        # 截 200 字打进日志；留在这里供调用方落盘存证（判断打分是否可信、离线复算）。
+        self.last_raw_response: str | None = None
 
     @abstractmethod
     def build_prompt(self, *args: Any, **kwargs: Any) -> str:
@@ -46,11 +49,13 @@ class AgentABC(ABC):
                 raw = self.serving.generate_one(prompt)
             except Exception as exc:  # noqa: BLE001 —— 故意兜底所有后端异常
                 last_err = exc
+                self.last_raw_response = None
                 self.logger.warning(
                     "[%s] LLM 调用异常（第 %d/%d 次），重试中：%s",
                     self.name, attempt + 1, self.max_retries + 1, exc,
                 )
                 continue
+            self.last_raw_response = raw
             parsed = extract_json(raw)
             if parsed is not None:
                 return parsed
