@@ -66,6 +66,14 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
 
         import os
         env = {**os.environ, **self.extra_env}
+        # `python <node_dir>/pipeline.py` 的 sys.path[0] 是**脚本所在目录**（node_dir），
+        # cwd=agent_root 并不会进 sys.path，因此 vendored 的 agent_root/dataflow 导入不到。
+        # 不补这一项，每个节点首跑必定 ModuleNotFoundError('dataflow')，只能靠自纠回合补
+        # sys.path，白烧一次 Agent 往返与一次自纠额度。
+        prev_pp = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(self.agent_root), *(p for p in prev_pp.split(os.pathsep) if p)]
+        )
         start = time.time()
         try:
             proc = subprocess.run(
