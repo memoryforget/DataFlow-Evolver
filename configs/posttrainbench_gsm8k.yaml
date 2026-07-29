@@ -1,0 +1,119 @@
+# PostTrainBench 本地自测配置（两段式：Tier-1 ReviewAgent 复合分作 reward + Tier-2 全量 SFT+官方评测选模）。
+#
+# 相对 configs/default.yaml 的关键差异（见 docs/posttrainbench_adaptation.md）：
+#   - search.reward_source: review（每节点 reward=ReviewAgent tier1，搜索期不训练/不占 GPU）
+#   - generation: probe_samples(搜索) / target_samples(终选) 两档，pipeline 从 env DF_TARGET_SAMPLES 读条数
+#   - trainer.dev_eval_cmd 换成 scripts/posttrainbench_sft_eval.py（单卡全量 SFT + 官方 evaluate.py）
+#   - dispatch: local；data_pool/baseline 关闭
+#
+# 本配置**环境变量参数化**，可被 scripts/run_posttrainbench_local.sh 复用到任意 benchmark：
+#   PTB_BASE_MODEL   本地 base model 路径（由 runner export，桥接脚本从 env 读取）
+#   PTB_TASK_DIR     .../PostTrainBench/src/eval/tasks/<bench>（桥接脚本从 env 读取）
+#   PTB_BENCHMARK    benchmark 名（默认 gsm8k）
+#   PTB_DEV_LIMIT    dev 评测采样上限（默认 150）
+#   PTB_TIME_BUDGET_SEC / PTB_TRAIN_PYTHON / PTB_EVAL_PYTHON / DF_API_KEY / DF_API_URL
+
+project:
+  workspace_dir: ./workspace
+  agent_root: ./workspace/_agent_root
+  seed_data: ./data/seed.jsonl
+
+llm:
+  backend: api
+  api:
+    # 辅助 Agent（Profiler / ReviewAgent / Diagnostic）用 gpt-5.4
+    api_url: ${DF_API_URL:http://123.129.219.111:3000/v1/chat/completions}
+    model_name: gpt-5.4
+    api_key: ${DF_API_KEY:}
+    max_workers: 100
+  # 流水线【算子运行时】数据合成 LLM = gpt-4o（省略字段逐字段回退到上面的 api 段）
+  pipeline_llm:
+    generation:
+      model_name: gpt-4o
+    reasoning:
+      model_name: gpt-4o
+
+agent_sdk:
+  model: claude-opus-4-8
+  effort: max
+  permission_mode: bypassPermissions
+  setting_sources: [project]
+  skills: [dataflow-dev]
+  max_turns: 50
+  pipeline_filename: pipeline.py
+  max_retries: 4
+  retry_base_delay: 10
+  run_timeout_sec: 1800
+  resume_on_retry: true
+
+# 两档产出规模：搜索期探针 200；终选重产 4000（同一 pipeline.py 经 env DF_TARGET_SAMPLES 复用）
+generation:
+  target_samples: 4000
+  probe_samples: 200
+
+# 冷启动（无强基线锚点）
+baseline:
+  enabled: false
+
+search:
+  # ★ reward 来源：review = Tier-1 复合分驱动 MCTS（本适配核心开关）
+  reward_source: review
+  exploration_constant: 1.414
+  exploration_decay: 1.0
+  exploration_min: 0.0
+  # 30 轮：与 time_budget_sec 取「谁先到谁停」。1.7B 单节点 Tier-1 约 5-12min，30 轮≈2.5-6h，
+  # 通常由迭代数先收口（时间预算作为兜底，避免异常拖尾）。每轮都 checkpoint，可续跑。
+  max_iterations: 30
+  max_children_per_node: 2
+  self_correction_retries: 5
+  review_self_correction_retries: 5
+  max_consecutive_infra_failures: 5
+  infra_backoff_sec: 30
+  checkpoint: "./workspace/checkpoint_ptb.json"
+  # 预算感知（review 两段式专用；0=仅按 max_iterations 停）。默认 ~8h，快速试可用 env 调小。
+  time_budget_sec: ${PTB_TIME_BUDGET_SEC:28800}
+  # 终选：按 tier1 取 top-K 做真实 SFT+评测；预留/缩减 K 用下面两项。
+  # tier2_per_run_sec：单个 top-K 候选的 Tier-2（4000 重产 + 全量 SFT + dev-150 部分评测）预留，1.7B 约 30-45min。
+  # final_eval_reserve_sec：**仅**为搜索后那**一次**终评（final_model 上 evaluate.py --limit -1 全量 gsm8k ~1319 题）预留；
+  #   Tier-2 本身只跑 --limit 150 的部分 dev，不做全量。1.7B 全量终评实测约 15-30min，取 2400s(40min) 足够；
+  #   终评子进程真正的超时仍是 trainer.train_timeout_sec=5400（安全网）。
+  tier2_top_k: 3
+  tier2_per_run_sec: 3000
+  final_eval_reserve_sec: 2400
+
+# Phase-1 / Tier-1：ReviewAgent 五维复合分 + 硬指标惩罚
+review:
+  schema_threshold: 0.6
+  relevance_threshold: 0.6
+  sample_size: 80
+  hard_metrics: true
+  weights:
+    correctness: 0.35
+    relevance: 0.20
+    difficulty: 0.15
+    diversity: 0.15
+    schema: 0.15
+  # 终选安全阀：4000 放大重产后若质量塌陷则跳过用次优
+  collapse_dup_rate: 0.5
+  collapse_null_rate: 0.3
+  collapse_parse_valid_rate: 0.7
+  collapse_tier1_frac: 0.6
+
+# Phase-2 / Tier-2：单卡全量 SFT + 官方 evaluate.py（只取聚合 accuracy）
+trainer:
+  train_python: ${PTB_TRAIN_PYTHON:/workspace/xiaqifeng/miniconda3/envs/df-train/bin/python}
+  eval_python: ${PTB_EVAL_PYTHON:/workspace/xiaqifeng/miniconda3/envs/df-eval/bin/python}
+  # base-model / ptb-task-dir 由桥接脚本从 env（PTB_BASE_MODEL / PTB_TASK_DIR）读取，
+  # 故这里不放进命令（避免 env 未设时展开成空串顶掉后一个 flag）。框架会自动追加 --dataset/--output。
+  dev_eval_cmd: python scripts/posttrainbench_sft_eval.py --mode dev --dev-limit ${PTB_DEV_LIMIT:150} --benchmark ${PTB_BENCHMARK:gsm8k}
+  test_eval_cmd: python scripts/posttrainbench_sft_eval.py --mode test --benchmark ${PTB_BENCHMARK:gsm8k}
+  timeout_sec: 1200            # 流水线执行（纯数据合成，探针 200 条）超时
+  train_timeout_sec: 5400      # 单次 Tier-2（4000 重产的全量 SFT + dev 评测）超时
+  dispatch: local
+
+diagnostic:
+  max_bad_cases: 30            # 本适配下 Phase-2 诊断关闭（无 bad_cases），此项无效
+
+# 数据池关闭（本适配不产副产品池）
+data_pool:
+  enabled: false
