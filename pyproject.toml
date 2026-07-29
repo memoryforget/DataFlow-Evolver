@@ -21,12 +21,6 @@ agent = [
 ]
 agent-runtime = [
     # --- 运行 vendored DataFlow 流水线所需（装在 df-agent 环境）---
-    # 流水线子进程用的解释器就是编排器自身的 sys.executable（见 SubprocessExecutionWrapper）
-    #
-    # dataflow/serving/__init__.py 会**急切导入全部 14 个后端**，因此即使只用
-    # APILLMServing_request，也要满足其余后端的顶层导入（vllm/sglang/litellm/lightrag/
-    # sentence_transformers 是函数内延迟导入，不必安装）。
-    #
     # torch 仅为满足导入，df-agent 不做 GPU 计算 —— 装 CPU-only 轮子即可（~200MB 而非 ~2.5GB）：
     #   pip install torch --index-url https://download.pytorch.org/whl/cpu
     "torch>=2.5",
