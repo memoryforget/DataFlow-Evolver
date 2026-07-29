@@ -63,6 +63,11 @@ uv pip install -e ".[agent]"     # openai / pyyaml / pydantic / claude-agent-sdk
 uv pip install torch --index-url https://download.pytorch.org/whl/cpu
 uv pip install -e ".[agent-runtime]"
 
+# 可选但推荐：解锁全部内置算子（202/202 可导入，MCP 目录 124 → 197）。
+# 不装则 MCP 的 CATEGORY_GUIDE 会点名推荐若干不可导入的算子，Claude 用了就撞
+# ModuleNotFoundError，而缺依赖的崩溃自纠循环修不好，只会白烧自修正次数。
+uv pip install -e ".[agent-operators]"
+
 uv pip install -e ".[dev]"       # pytest（可选）
 ```
 
