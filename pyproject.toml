@@ -9,8 +9,8 @@ dependencies = [
     "pydantic>=2.0",
 ]
 
-# 注意：本地 DataFlow 包需单独安装（editable），见 README。
-# 它会引入 torch/transformers 等重依赖，故不放进本项目的 dependencies。
+# 注意：DataFlow 源码以 vendored 方式置于 workspace/_agent_root/dataflow（非 pip 安装），
+# 但**运行**它生成的流水线仍需其第三方依赖，见 optional-dependencies 的 agent-runtime 组。
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
@@ -18,6 +18,32 @@ agent = [
     # claude-agent-sdk 依赖 mcp -> pydantic>=2.11，与 llamafactory 冲突
     # 编排层单独装，不要和 SFT / eval 混装
     "claude-agent-sdk>=0.2",
+]
+agent-runtime = [
+    # --- 运行 vendored DataFlow 流水线所需（装在 df-agent 环境）---
+    # 流水线子进程用的解释器就是编排器自身的 sys.executable（见 SubprocessExecutionWrapper）
+    #
+    # dataflow/serving/__init__.py 会**急切导入全部 14 个后端**，因此即使只用
+    # APILLMServing_request，也要满足其余后端的顶层导入（vllm/sglang/litellm/lightrag/
+    # sentence_transformers 是函数内延迟导入，不必安装）。
+    #
+    # torch 仅为满足导入，df-agent 不做 GPU 计算 —— 装 CPU-only 轮子即可（~200MB 而非 ~2.5GB）：
+    #   pip install torch --index-url https://download.pytorch.org/whl/cpu
+    "torch>=2.5",
+    "transformers>=5.6",
+    "huggingface_hub>=1.0",
+    "librosa>=0.11",              # localmodel_lalm_serving 顶层 import
+    "google-api-python-client>=2.0",  # google_api_serving 顶层 from googleapiclient import discovery
+    "google-cloud-aiplatform>=1.55",  # api_google_vertexai_serving 在模块级硬 raise ImportError
+    "google-cloud-bigquery>=3.0",
+    "google-genai>=1.0",
+    "fsspec>=2024.0",
+    "pillow>=10.0",
+    # 存储 / API serving / 日志
+    "requests>=2.31",
+    "pandas>=2.0",
+    "colorlog>=6.0",
+    "rich>=13.0",
 ]
 df-train = [
     # --- SFT 环境：双机训练栈，不混装 vLLM / benchmark grader ---
