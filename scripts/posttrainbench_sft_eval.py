@@ -288,6 +288,7 @@ def run_sft(base_model: str, data_dir: Path, output_dir: Path, template: str) ->
     cmd = [sys.executable, "-u", "-m", "llamafactory.cli", "train", str(sft_yaml)]
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    apply_env_prefix_fixups(env, sys.executable)
     env.setdefault("CUDA_VISIBLE_DEVICES", os.environ.get("SFT_CUDA_VISIBLE_DEVICES", "0"))
     if NUM_GPUS > 1:
         env["FORCE_TORCHRUN"] = "1"
@@ -306,6 +307,29 @@ def run_sft(base_model: str, data_dir: Path, output_dir: Path, template: str) ->
         raise RuntimeError(f"SFT 未产出 HF safetensors 权重：{model_dir}")
     logger.info("SFT 完成，模型目录：%s", model_dir)
     return model_dir
+
+
+def apply_env_prefix_fixups(env: dict, python_exe: str) -> dict:
+    """按目标解释器所属 conda env 补齐 `conda activate` 才会设置的变量（原地改 env 并返回）。
+
+    框架用**绝对路径**直接调 df-train / df-eval 的 python，不经过 conda activate，因此
+    两类隐式依赖会缺失：
+      - LD_LIBRARY_PATH：env 自带的 libstdc++ 比系统新，缺路径时 sqlite3/vllm 会因
+        `CXXABI_1.3.15 not found` 导入失败；
+      - CUDA_HOME：DeepSpeed 找不到 env 内的 nvcc，会回退到不存在的 /usr/local/cuda。
+    """
+    prefix = Path(python_exe).resolve().parent.parent
+    lib_dir = prefix / "lib"
+    if lib_dir.is_dir():
+        prev = env.get("LD_LIBRARY_PATH", "")
+        parts = [p for p in prev.split(os.pathsep) if p]
+        if str(lib_dir) not in parts:
+            env["LD_LIBRARY_PATH"] = os.pathsep.join([str(lib_dir), *parts])
+    nvcc = prefix / "bin" / "nvcc"
+    if nvcc.exists() and not Path(env.get("CUDA_HOME", "/nonexistent"), "bin", "nvcc").exists():
+        env["CUDA_HOME"] = str(prefix)
+        env["CUDA_PATH"] = str(prefix)
+    return env
 
 
 def _stream_subprocess(cmd: list[str], *, cwd: str, env: dict, log_path: Path, timeout_sec: int) -> int:
@@ -368,6 +392,7 @@ def run_official_eval(
     cmd = [eval_python, str(evaluate_py), *argv]
 
     env = os.environ.copy()
+    apply_env_prefix_fixups(env, eval_python)
     env["VLLM_API_KEY"] = VLLM_API_KEY
     env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     if EVAL_CUDA_VISIBLE_DEVICES:

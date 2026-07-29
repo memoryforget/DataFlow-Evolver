@@ -154,6 +154,47 @@ def test_convert_dataset_empty_raises(tmp_path):
         bridge.convert_dataset(src, tmp_path / "data", "gsm8k", base_model="dummy-qwen")
 
 
+# --------------------------- 跨 conda env 子进程修正 ---------------------------
+def _fake_env(root: Path, *, with_nvcc: bool) -> str:
+    """造一个假 conda env 前缀，返回其 python 路径。"""
+    (root / "lib").mkdir(parents=True, exist_ok=True)
+    (root / "bin").mkdir(parents=True, exist_ok=True)
+    py = root / "bin" / "python"
+    py.write_text("", encoding="utf-8")
+    if with_nvcc:
+        (root / "bin" / "nvcc").write_text("", encoding="utf-8")
+    return str(py)
+
+
+def test_env_fixups_prepend_own_lib_and_set_cuda_home(tmp_path):
+    py = _fake_env(tmp_path / "df-x", with_nvcc=True)
+    env = {"LD_LIBRARY_PATH": "/other/lib"}
+    bridge.apply_env_prefix_fixups(env, py)
+    # 自己的 lib 必须在最前，才能压过父进程继承来的旧 libstdc++
+    assert env["LD_LIBRARY_PATH"] == f"{tmp_path / 'df-x' / 'lib'}:/other/lib"
+    assert env["CUDA_HOME"] == str(tmp_path / "df-x")
+    assert env["CUDA_PATH"] == str(tmp_path / "df-x")
+
+
+def test_env_fixups_without_nvcc_leaves_cuda_home_unset(tmp_path):
+    py = _fake_env(tmp_path / "df-y", with_nvcc=False)
+    env = {}
+    bridge.apply_env_prefix_fixups(env, py)
+    assert env["LD_LIBRARY_PATH"] == str(tmp_path / "df-y" / "lib")
+    assert "CUDA_HOME" not in env
+
+
+def test_env_fixups_are_idempotent_and_respect_valid_cuda_home(tmp_path):
+    py = _fake_env(tmp_path / "df-z", with_nvcc=True)
+    other = _fake_env(tmp_path / "df-w", with_nvcc=True)
+    env = {"CUDA_HOME": str(Path(other).parent.parent)}
+    bridge.apply_env_prefix_fixups(env, py)
+    bridge.apply_env_prefix_fixups(env, py)       # 二次调用不应重复追加
+    assert env["LD_LIBRARY_PATH"] == str(tmp_path / "df-z" / "lib")
+    # 已有可用 CUDA_HOME（含 nvcc）不被覆盖
+    assert env["CUDA_HOME"] == str(tmp_path / "df-w")
+
+
 # --------------------------- results.json 契约 ---------------------------
 def test_write_results_contract(tmp_path):
     bridge._write_results(tmp_path, 0.7321, "gsm8k")
