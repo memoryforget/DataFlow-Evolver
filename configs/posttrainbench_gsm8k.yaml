@@ -65,6 +65,12 @@ search:
   # 通常由迭代数先收口（时间预算作为兜底，避免异常拖尾）。每轮都 checkpoint，可续跑。
   max_iterations: 30
   max_children_per_node: 2
+  # 本模式下搜索期没有 Tier-2 真分，global memory 是唯一的跨节点反馈通道，故把 ReviewAgent
+  # 的 issues **完整**带上（不限条数、不截断）；相应把节点数收窄到 4，控制 prompt 体积
+  # （实测约 1.9k 字/节点，4 节点≈8k 字）。
+  memory_top_k: 4
+  memory_max_issues: -1
+  memory_issue_maxlen: 0
   self_correction_retries: 5
   review_self_correction_retries: 5
   max_consecutive_infra_failures: 5
@@ -86,6 +92,11 @@ review:
   schema_threshold: 0.6
   relevance_threshold: 0.6
   sample_size: 80
+  # 固定蓄水池采样种子。不设时（默认）连"同一份未改动文件的两次重评"抽样都不同，
+  # 于是 passed 门槛和 tier1（=MCTS reward）都带纯 RNG 噪声：边界节点可能靠换抽样而非
+  # 靠修好数据通过。硬指标 dup/null/parse 扫全份文件，不受影响。
+  # 代价是固定切片会有系统性偏差；搜索期抽 80/200=40% 可接受。
+  sample_seed: 42
   hard_metrics: true
   weights:
     correctness: 0.35

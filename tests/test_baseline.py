@@ -329,12 +329,11 @@ def _common_stubs(orch, monkeypatch, train_scores):
     profile = TaskProfile("生成问答", {"instruction": "str", "answer": "str"}, ["答案非空"], "qa-sft")
     monkeypatch.setattr(orch.profiler, "run", lambda *a, **k: profile)
     monkeypatch.setattr(orch.reviewer, "review",
-                        lambda dataset_path, prof: ReviewResult(0.9, 0.9, True, []))
+                        lambda dataset_path, prof, **kwargs: ReviewResult(0.9, 0.9, True, []))
     monkeypatch.setattr(orch.diagnostician, "analyze",
                         lambda bad, downstream="": DiagnosticReport(summary="ok"))
 
-    def fake_generate(profile, node_dir_name, diagnostic=None, memory_summary=None,
-                      review_issues=None, parent_code=None):
+    def fake_generate(profile, node_dir_name, diagnostic=None, memory_summary=None, **kwargs):
         node_dir = orch.agent_root / node_dir_name
         node_dir.mkdir(parents=True, exist_ok=True)
         return PipelineConfig(operators=[{"name": "Gen", "params": {}}],

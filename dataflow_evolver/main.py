@@ -273,6 +273,9 @@ class Orchestrator:
             max_children_per_node=search.get("max_children_per_node", 4),
             exploration_decay=search.get("exploration_decay", 1.0),
             exploration_min=search.get("exploration_min", 0.0),
+            memory_top_k=search.get("memory_top_k", 5),
+            memory_max_issues=search.get("memory_max_issues", 3),
+            memory_issue_maxlen=search.get("memory_issue_maxlen", 120),
         )
         self.max_iterations = search.get("max_iterations", 10)
         # 预算感知（review 两段式专用；0=关闭，仅按 max_iterations 停）：
@@ -369,6 +372,10 @@ class Orchestrator:
         # review 两段式：搜索结束后对 top-K 做真实 SFT+评测选模，并对 final_model 跑一次官方全量终评。
         if self.reward_source == "review":
             self._final_selection(profile)
+            # 终选把 tier2_review_result 与 train_result 回写到候选节点，而循环内最后一次落盘
+            # 早于此。不在这里补写，这两份数据就只剩 run.log 里的日志行——而它们正是检验
+            # 「tier1 能否预测下游真分」的唯一可比样本对，落不进结构化终态等于白留字段。
+            self._save_checkpoint(it - 1, profile)
 
         best = self.tree.best_leaf()
         if best is not None:
@@ -509,6 +516,36 @@ class Orchestrator:
             self._cleanup_empty_node_dir(node_dir)
             return "infra_retryable" if exc.retryable else "infra_fatal"
 
+    def _review_evidence_path(self, node_dir_name: str) -> str:
+        """节点评审证据的落盘位置（追加式 JSONL，每行一次评审）。
+
+        结构化终态在 checkpoint、过程在 run.log，但**证据**（抽样与 LLM 原始响应）此前无处可寻，
+        导致无法事后核验 tier1 是否可信。
+        """
+        return str(self.agent_root / node_dir_name / "review.jsonl")
+
+    def _append_fix_history(
+        self, node_dir_name: str, round_idx: int, targets: list[str], rendered: str
+    ) -> None:
+        """把一轮自修正的意图与渲染结果落盘到 `node_N/fix_history.jsonl`。
+
+        review.jsonl 里有各轮的原始评审，逐轮 delta 可以事后重算；但"这一轮是针对哪几条 issue
+        去改的"以及"prompt 里实际喂回去的那段文字"（受阈值影响）无法从中还原。落盘失败只告警。
+        """
+        record = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "round": round_idx,
+            "targets": targets,
+            "rendered": rendered,
+        }
+        path = self.agent_root / node_dir_name / "fix_history.jsonl"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning("自修正历史落盘失败（不影响主流程）：%s", exc)
+
     def _cleanup_empty_node_dir(self, node_dir_name: str) -> None:
         """撤销基础设施失败的预留节点后，若其 workspace 目录为空则清理，避免留下空目录。"""
         node_dir_abs = self.agent_root / node_dir_name
@@ -531,23 +568,26 @@ class Orchestrator:
         # train 模式不注入任何 env（保持对旧执行器/测试桩的调用签名完全不变）。
         exec_kwargs = {} if search_env is None else {"env_overrides": search_env}
 
-        # 3. 生成（沿用 parent 的诊断作为变异指引；若 parent 上轮被评审打回，把 issues 也喂回去；
-        #    并把父节点/基线已验证的流水线代码作为变异起点注入）
-        memory_summary = self.tree.global_memory.render()
-        parent_review = parent.review_result
-        review_issues = (
-            parent_review.issues
-            if parent_review is not None and not parent_review.passed
-            else None
+        # 3. 生成。父节点信息分三路注入：已验证代码作变异起点、设计意图避免误改取舍、Tier-1 归因
+        #    指明该攻哪一维；再加同父兄弟的负面清单促使分散探索。
+        #    父节点与已列出的兄弟在 prompt 里都有专属块，故从全局记忆里排除：父是为了避免同一份
+        #    issues 重复注入，兄弟是因为两处角色相反（记忆"参考它" vs 兄弟清单"别跟它一样"）。
+        siblings = _sibling_summaries(parent, exclude=child)
+        memory_summary = self.tree.global_memory.render(
+            exclude_node_ids={parent.id, *(sid for sid, _ in siblings)}
         )
+        parent_review = parent.review_result
         parent_code = parent.config.code if parent.config else None
+        parent_rationale = parent.config.rationale if parent.config else None
         config = self.pipeline_agent.generate(
             profile=profile,
             node_dir_name=node_dir,
             diagnostic=parent.diagnostic_report,
             memory_summary=memory_summary,
-            review_issues=review_issues,
             parent_code=parent_code,
+            parent_rationale=parent_rationale,
+            parent_review=parent_review,
+            siblings=[line for _, line in siblings],
         )
         if config is None:
             logger.warning("PipelineAgent 生成失败（agent 跑完但未产出有效流水线），惩罚该扩展并跳过。")
@@ -575,16 +615,27 @@ class Orchestrator:
             return
 
         # 5. Phase-1 快反馈（含立即自修正：失败则看中间 step 产物定位、修复、重审，限次）
-        review = self.reviewer.review(exec_result.dataset_path, profile)
+        evidence_path = self._review_evidence_path(node_dir)
+        review = self.reviewer.review(
+            exec_result.dataset_path, profile, evidence_path=evidence_path, phase="search"
+        )
         child.review_result = review
         r_retries = 0
+        # 各轮修复的目标与成效。只把最新一轮 issues 喂回去，LLM 不知道某段逻辑是上一轮为修 X
+        # 才加的，容易改掉它导致 X 复现，在节点内部震荡空转掉有限的自修正次数。
+        fix_history: list[str] = []
         while not review.passed and r_retries < self.review_self_correction_retries:
             r_retries += 1
             logger.info(
                 "数据评审未通过，自修正第 %d/%d 次。issues=%s",
                 r_retries, self.review_self_correction_retries, review.issues,
             )
-            fixed = self.pipeline_agent.self_correct_review(node_dir, review.issues)
+            fixed = self.pipeline_agent.self_correct_review(
+                node_dir,
+                review.issues,
+                history=fix_history,
+                failure_signals=review.failure_signals,
+            )
             if fixed is None:
                 break
             child.config = fixed
@@ -605,7 +656,16 @@ class Orchestrator:
             if not exec_result.success or exec_result.dataset_path is None:
                 logger.warning("评审自修正后执行最终失败，停止重审。")
                 break
-            review = self.reviewer.review(exec_result.dataset_path, profile)
+            new_review = self.reviewer.review(
+                exec_result.dataset_path,
+                profile,
+                evidence_path=evidence_path,
+                phase=f"search_recheck_{r_retries}",
+            )
+            summary = _fix_round_summary(r_retries, review, new_review)
+            fix_history.append(summary)
+            self._append_fix_history(node_dir, r_retries, review.issues, summary)
+            review = new_review
             child.review_result = review
         if not review.passed:
             logger.info("数据评审最终未通过，不训练，惩罚节点。issues=%s", review.issues)
@@ -737,8 +797,15 @@ class Orchestrator:
             if not exec_result.success or exec_result.dataset_path is None:
                 logger.warning("候选 %s 放大重产失败，改用次优。", node_dir)
                 continue
-            # 2) 安全阀
-            re_review = self.reviewer.review(exec_result.dataset_path, profile)
+            # 2) 安全阀。重评结果回写节点：它与随后的 train.score 出自同一份放大数据，
+            #    是事后检验「tier1 是否真能预测下游真分」的唯一可比样本对。
+            re_review = self.reviewer.review(
+                exec_result.dataset_path,
+                profile,
+                evidence_path=self._review_evidence_path(node_dir),
+                phase="tier2",
+            )
+            node.tier2_review_result = re_review
             if self._quality_collapsed(node.review_result, re_review):
                 logger.warning(
                     "候选 %s 放大后质量塌陷（dup=%.2f null=%.2f parse=%.2f tier1=%.3f passed=%s），改用次优。",
@@ -830,6 +897,86 @@ class Orchestrator:
         except (json.JSONDecodeError, OSError, ValueError) as exc:
             logger.error("终评结果解析失败：%s", exc)
             return None
+
+
+# 两类指标的可信度差一个量级，阈值必须分开：
+# - 硬指标扫**全份文件**得出，两轮之间的 delta 是确定量，0.02 已足够滤掉浮点噪声；
+# - 五维与 tier1 是 LLM 对两批**不同抽样**打的分，judge 在不同样本上本身就有 ±0.05~0.1 的
+#   波动，阈值若取 0.02 等于不过滤，会把纯抽样噪声渲染成"多样性 0.20→0.60"，再配上因果语气
+#   喂回 LLM，反而让它确信某个无效改动见效并在后续轮次里保护它——比什么都不给更糟。
+_HARD_DELTA_MIN = 0.02
+_LLM_DELTA_MIN = 0.10
+
+
+def _fix_round_summary(
+    round_idx: int, before: ReviewResult, after: ReviewResult, max_targets: int = 3
+) -> str:
+    """一轮评审自修正的「针对什么 → 观察到什么变化」摘要，喂回下一轮 prompt 作为锚。
+
+    确定量与参考量分开表述，让 LLM 知道哪些 delta 能当证据、哪些不能。
+    """
+    targets = "；".join(before.issues[:max_targets]) or "（未给出具体条目）"
+    hard_dims = (
+        ("重复率", before.dup_rate, after.dup_rate),
+        ("空值率", before.null_rate, after.null_rate),
+        ("可解析率", before.parse_valid_rate, after.parse_valid_rate),
+    )
+    llm_dims = (
+        ("正确性", before.correctness_score, after.correctness_score),
+        ("相关性", before.relevance_score, after.relevance_score),
+        ("难度", before.difficulty_score, after.difficulty_score),
+        ("多样性", before.diversity_score, after.diversity_score),
+        ("schema", before.schema_score, after.schema_score),
+        ("Tier-1 复合分", before.tier1_score, after.tier1_score),
+    )
+    moved_hard = [f"{n} {b:.2f}→{a:.2f}" for n, b, a in hard_dims if abs(a - b) > _HARD_DELTA_MIN]
+    moved_llm = [f"{n} {b:.2f}→{a:.2f}" for n, b, a in llm_dims if abs(a - b) > _LLM_DELTA_MIN]
+
+    lines = [f"第 {round_idx} 轮针对：{targets}"]
+    if moved_hard:
+        lines.append("    确定变化（全量扫描，可据此判断改动是否见效）：" + "、".join(moved_hard))
+    if moved_llm:
+        lines.append(
+            "    参考变化（两轮评审看的是不同抽样，judge 波动本身约 ±0.1，"
+            "不能据此断定是哪处改动见效）：" + "、".join(moved_llm)
+        )
+    if not moved_hard and not moved_llm:
+        lines.append("    未观察到超出噪声量级的变化")
+    lines.append(f"    重评结论：{'通过' if after.passed else '仍未通过'}")
+    return "\n".join(lines)
+
+
+def _sibling_summaries(
+    parent: PipelineNode, exclude: PipelineNode | None = None, max_items: int = 6
+) -> list[tuple[int, str]]:
+    """同父兄弟已试过的方向摘要（供 prompt 做负面清单），返回 (node_id, 摘要行)。
+
+    同一父节点下要长出 max_children_per_node 个子节点，若每次 prompt 完全一致，多次昂贵扩展
+    很可能收敛到同一种变异。这里给出"谁试过什么、得分多少"，让后续子节点另择方向。
+    被 exclude 的是本轮正在生成的预留节点（它已在 parent.children 里但还没有内容）。
+    连 node_id 一起返回，是为了让调用方按**实际渲染出的**兄弟去排除全局记忆里的重复条目——
+    若两处各自判断该渲染谁，规则迟早分叉。
+    """
+    out: list[tuple[int, str]] = []
+    for sib in parent.children:
+        if sib is exclude or sib.config is None:
+            continue
+        ops = ", ".join(str(op.get("name", "?")) for op in sib.config.operators) or "未记录算子"
+        parts = [f"{sib.node_dir_name}: ops=[{ops}]"]
+        review = sib.review_result
+        if review is not None:
+            parts.append(f"tier1={review.tier1_score:.3f}")
+        if sib.train_result is not None:
+            parts.append(f"dev={sib.train_result.score:.3f}")
+        if sib.dead:
+            parts.append("已判失败")
+        if sib.config.rationale:
+            intent = sib.config.rationale.replace("\n", " ")
+            parts.append(f"意图: {intent[:80]}{'…' if len(intent) > 80 else ''}")
+        out.append((sib.id, " | ".join(parts)))
+        if len(out) >= max_items:
+            break
+    return out
 
 
 def _read_jsonl_rows(path: str) -> list[dict]:

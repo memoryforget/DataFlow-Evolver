@@ -28,7 +28,7 @@ class StubPipelineAgent:
     def self_correct(self, node_dir, tb):
         return None
 
-    def self_correct_review(self, node_dir, issues):
+    def self_correct_review(self, node_dir, issues, **kwargs):
         return None
 
 
@@ -59,7 +59,7 @@ class StubReviewer:
         self._i = 0
         self.calls = 0
 
-    def review(self, dataset_path, profile):
+    def review(self, dataset_path, profile, **kwargs):
         self.calls += 1
         r = self._results[min(self._i, len(self._results) - 1)]
         self._i += 1

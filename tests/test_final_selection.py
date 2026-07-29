@@ -1,4 +1,5 @@
 """终选 Tier-2 单测：top-K 排序、放大重产 env、安全阀跳过用次优、按 dev 选最优、终评触发。"""
+import json
 import sys
 import time
 from pathlib import Path
@@ -127,3 +128,84 @@ def test_budget_reduces_k_to_one(tmp_path):
     o._final_selection(PROFILE)
     assert o.trainer.calls == 1                         # 缩到 K=1
     assert o.final_result["best_node"] == a.node_dir_name
+
+
+def test_tier2_review_written_back_to_node(tmp_path):
+    """放大后的重评必须回写节点：它与 train.score 出自同一份数据，是唯一可比的样本对。
+
+    历史实现只把 re_review 用于塌陷安全阀，算完即弃，导致 tier1 与下游真分的相关性无从检验。
+    """
+    o = bare_orchestrator(tmp_path, tier2_top_k=1, time_budget_sec=0.0)
+    o._run_start = time.time()
+    o.final_result = None
+    node = _add_candidate(o, tier1=0.9)
+
+    o.executor = StubExecutor(tmp_path / "ds")
+    o.reviewer = StubReviewer([make_review_result(tier1=0.62)])
+    o.trainer = StubTrainer([TrainResult(0.71, "gsm8k")])
+    _patch_final_eval(o, [])
+
+    o._final_selection(PROFILE)
+
+    assert node.tier2_review_result is not None
+    assert node.tier2_review_result.tier1_score == pytest.approx(0.62)
+    assert node.review_result.tier1_score == pytest.approx(0.9)   # 搜索期探针分不被覆盖
+    assert node.train_result.score == pytest.approx(0.71)          # 与之配对的下游真分
+
+
+def test_tier2_review_written_back_even_when_collapsed(tmp_path):
+    """质量塌陷而被跳过的候选也要留下重评结果，否则塌陷案例的证据同样丢失。"""
+    o = bare_orchestrator(tmp_path, tier2_top_k=1, time_budget_sec=0.0)
+    o._run_start = time.time()
+    o.final_result = None
+    node = _add_candidate(o, tier1=0.9)
+
+    o.executor = StubExecutor(tmp_path / "ds")
+    o.reviewer = StubReviewer([make_review_result(tier1=0.1, dup=0.9)])
+    o.trainer = StubTrainer([TrainResult(0.71, "gsm8k")])
+    _patch_final_eval(o, [])
+
+    o._final_selection(PROFILE)
+
+    assert node.tier2_review_result is not None
+    assert node.tier2_review_result.dup_rate == pytest.approx(0.9)
+    assert o.trainer.calls == 0                                    # 塌陷候选不训练
+
+
+def test_review_evidence_path_lands_in_node_dir(tmp_path):
+    o = bare_orchestrator(tmp_path)
+    assert o._review_evidence_path("node_7") == str(tmp_path / "node_7" / "review.jsonl")
+
+
+class _StubProfiler:
+    def run(self, task_description, seed_path=None):
+        return PROFILE
+
+
+def test_checkpoint_written_after_final_selection(tmp_path):
+    """终选产出的 tier2 重评与下游真分必须落进 checkpoint。
+
+    循环内最后一次落盘早于终选，若不在终选后补写一次，这两个字段在真实运行的 checkpoint 里
+    永远是 null——而它们正是检验「tier1 能否预测下游真分」的那一对样本。
+    """
+    ck = tmp_path / "ck.json"
+    o = bare_orchestrator(tmp_path, tier2_top_k=1, time_budget_sec=0.0)
+    o.max_iterations = 0                    # 跳过搜索循环，只验证终选后的落盘
+    o.baseline_enabled = False
+    o.profiler = _StubProfiler()
+    o.seed_path = ""
+    o.checkpoint_path = str(ck)
+    node = _add_candidate(o, tier1=0.9)
+
+    o.executor = StubExecutor(tmp_path / "ds")
+    o.reviewer = StubReviewer([make_review_result(tier1=0.62)])
+    o.trainer = StubTrainer([TrainResult(0.71, "gsm8k")])
+    _patch_final_eval(o, [])
+
+    o.run("任务")
+
+    state = json.loads(ck.read_text(encoding="utf-8"))
+    nd = next(n for n in state["nodes"] if n["id"] == node.id)
+    assert nd["tier2_review_result"]["tier1_score"] == pytest.approx(0.62)
+    assert nd["train_result"]["score"] == pytest.approx(0.71)
+    assert nd["review_result"]["tier1_score"] == pytest.approx(0.9)   # 探针分仍在
