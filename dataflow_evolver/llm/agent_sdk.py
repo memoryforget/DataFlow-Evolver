@@ -6,6 +6,8 @@ PipelineAgent 通过它启动一次无头 Agent 运行，让 SDK 内的 Claude �
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -154,6 +156,25 @@ class AgentRunResult:
     session_id: str | None = None          # 本次运行的会话 id（用于失败后 resume 续跑，见 run_pipeline_agent）
 
 
+def _agent_env(agent_cfg: Config) -> dict[str, str]:
+    """给 SDK 子进程叠加环境变量：把**正式执行流水线所用解释器**的目录前置到 PATH。
+
+    Claude 用裸 `python` 跑 `DF_COMPILE_ONLY=1 python <node_dir>/pipeline.py` 自检，
+    而 SubprocessExecutionWrapper 正式执行用的是 sys.executable。二者若解析到不同环境，
+    自检会在依赖齐备的那个环境里通过、正式执行却因缺包崩溃（假绿灯，且 Claude 无从察觉）。
+    这里把两者统一到同一解释器，使自检结论对执行真正有效。
+    SDK 的 options.env 是叠加在 os.environ 之上的，故只需给出 PATH。
+    """
+    bin_dir = os.path.dirname(sys.executable)
+    path = os.environ.get("PATH", "")
+    env = {"PATH": f"{bin_dir}{os.pathsep}{path}" if path else bin_dir}
+    # 配置可追加/覆盖任意 env（如需给 agent 额外变量）；Config.get 对 dict 会回包成 Config
+    extra = agent_cfg.get("env", {})
+    extra = extra.to_dict() if isinstance(extra, Config) else (extra or {})
+    env.update({str(k): str(v) for k, v in extra.items()})
+    return env
+
+
 def _build_options(agent_cfg: Config, cwd: str, resume: str | None = None) -> Any:
     """据 agent_sdk 配置段构造 ClaudeAgentOptions。
 
@@ -168,6 +189,7 @@ def _build_options(agent_cfg: Config, cwd: str, resume: str | None = None) -> An
       不接受老式 thinking.enabled（budget）。这里显式指定 {"type":"adaptive"}，从协议层复刻实测
       可用的请求格式，从而不受环境里 CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1（会退化成 thinking.enabled
       → Bedrock 400）影响；即项目自带正确配置，不依赖全局/外部 env。配置 thinking: none 可关闭该显式指定。
+    - env：叠加 PATH，令 agent 自检用的裸 `python` 与正式执行的 sys.executable 一致（见 _agent_env）。
     SDK 鉴权（ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL）经环境变量传入，子进程默认继承 os.environ。
     """
     from claude_agent_sdk import ClaudeAgentOptions
@@ -190,6 +212,7 @@ def _build_options(agent_cfg: Config, cwd: str, resume: str | None = None) -> An
         resume=resume,
         effort=effort,
         thinking=thinking,
+        env=_agent_env(agent_cfg),
     )
 
 

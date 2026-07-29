@@ -57,6 +57,11 @@ conda create -n df-agent python=3.11 -y
 conda activate df-agent
 
 uv pip install -e ".[agent]"     # openai / pyyaml / pydantic / claude-agent-sdk
+
+# df-agent 不做 GPU 计算 —— CPU-only 轮子即可（~200MB）。
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+uv pip install -e ".[agent-runtime]"
+
 uv pip install -e ".[dev]"       # pytest（可选）
 ```
 
@@ -122,11 +127,18 @@ Agent SDK 的 `cwd` 指向共享的 `workspace/_agent_root/`，其中并存技�
 - **DataFlow 源码副本**：vendored 在 `workspace/_agent_root/dataflow/`（Apache-2.0，署名与版本见该目录下
   `LICENSE` / `VENDOR.md`）。
 
-注意编排/agent 环境依赖 DataFlow 的地方**仅剩 MCP server 一处**
-（`llm/mcp_operators.py` 加载算子 registry，把已有算子源码作为 PipelineAgent 的编码风格参考）；
+编排/agent 环境依赖 DataFlow 的地方有**两处**：
+
+1. **MCP server**（`llm/mcp_operators.py` 加载算子 registry，把已有算子源码作为 PipelineAgent 的编码风格参考）——只需能 `import dataflow`。
+2. **流水线执行**（`SubprocessExecutionWrapper` 用 `sys.executable` 起子进程跑生成的 `pipeline.py`）——需要其第三方运行时依赖，即 `.[agent-runtime]`。
 
 把源码放在 `_agent_root/` 下同时满足两件事：① MCP server 经 `sys.path` 注入即可 `import dataflow`；
 ② 源码就在 agent 的 `cwd` 下，`dataflow-dev` 技能“cwd 即 DataFlow 根目录”的假设成立、agent 可直接浏览源码。
+
+> **解释器一致性**：Claude 会用裸 `python` 跑 `DF_COMPILE_ONLY=1 python <node_dir>/pipeline.py` 自检，
+> 而正式执行用的是编排器的 `sys.executable`。二者若解析到不同环境，自检会在依赖齐备的那个环境里通过、
+> 正式执行却因缺包崩溃。`llm/agent_sdk.py::_agent_env()` 通过 `ClaudeAgentOptions.env`
+> 把 `sys.executable` 所在目录前置到 SDK 子进程的 `PATH`，使两者始终一致。
 
 > vendored 副本会随上游更新而变旧；需要同步时按 `workspace/_agent_root/dataflow/VENDOR.md` 的步骤重拷并更新版本/commit 标记。
 
@@ -418,7 +430,7 @@ MCTS 反复用同一 benchmark 当奖励会**对它过拟合**；若再用同一
 ## 测试
 
 ```bash
-# 单元测试只需 agent 环境（不依赖 torch/llamafactory）
+# 单元测试只需 agent 环境
 conda activate df-agent
 python -m pytest tests/ -q
 ```
