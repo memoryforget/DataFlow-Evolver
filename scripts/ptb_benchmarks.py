@@ -43,7 +43,7 @@ FORMAT_REQUIREMENTS: dict[str, str] = {
     ),
 }
 
-# limit=-1 表示官方全量（evaluate.py 不传 limit）。dev 阶段用小采样省算力；终评一律 -1。
+# limit=-1 表示官方全量（evaluate.py 显式接受 -1）。dev 阶段用小采样省算力；终评一律 -1。
 BENCHMARKS: dict[str, dict[str, Any]] = {
     "gsm8k": {
         "task_dir": "gsm8k",
@@ -251,11 +251,14 @@ def build_eval_argv(
     json_output_file: str,
     gpu_memory_utilization: float | None = None,
     judge_workers: int | None = None,
+    max_connections: int | None = None,
 ) -> list[str]:
     """构造官方 evaluate.py 的命令行参数（不含解释器与脚本路径本身）。
 
     - inspect 家族用 ``--max-tokens``；server 家族用 ``--max-new-tokens``（并可带 ``--judge-workers``）。
-    - limit=-1（全量）时不传 ``--limit``（evaluate.py 语义：不传=全量）。
+    - ``--limit`` 始终显式传：各 benchmark 的 evaluate.py 都把 -1 解释为全量，而**不传**会落到它们
+      各自的默认值（gsm8k/humaneval=150、arenahardwriting=32 等），把全量静默降级成部分评测。
+    - ``--max-connections`` 只有 inspect 家族的 evaluate.py 接受（server 家族没有该参数）。
     """
     bench = get_benchmark(name)
     argv = [
@@ -263,7 +266,7 @@ def build_eval_argv(
         "--templates-dir", str(templates_dir),
         "--json-output-file", str(json_output_file),
     ]
-    if limit is not None and int(limit) != -1:
+    if limit is not None:
         argv += ["--limit", str(int(limit))]
 
     if bench["family"] == FAMILY_SERVER:
@@ -273,6 +276,8 @@ def build_eval_argv(
             argv += ["--judge-workers", str(int(jw))]
     else:
         argv += ["--max-tokens", str(bench["max_tokens"])]
+        if max_connections is not None:
+            argv += ["--max-connections", str(int(max_connections))]
 
     if gpu_memory_utilization is not None:
         argv += ["--gpu-memory-utilization", str(gpu_memory_utilization)]

@@ -33,7 +33,19 @@ def test_build_eval_argv_server_family_and_full_limit():
                                limit=-1, json_output_file="/o.json")
     assert "--max-new-tokens" in argv and "--max-tokens" not in argv
     assert "--judge-workers" in argv
-    assert "--limit" not in argv                # limit=-1 → 全量，不传 --limit
+    # limit=-1（全量）也必须显式传：省略会落到 evaluate.py 自己的默认值（部分评测）
+    assert argv[argv.index("--limit") + 1] == "-1"
+
+
+def test_build_eval_argv_max_connections_inspect_family_only():
+    argv = ptb.build_eval_argv("gsm8k", model_path="/m", templates_dir="/t", limit=-1,
+                               json_output_file="/o.json", max_connections=32)
+    assert argv[argv.index("--max-connections") + 1] == "32"
+
+    # server 家族的 evaluate.py 没有 --max-connections 参数
+    argv = ptb.build_eval_argv("healthbench", model_path="/m", templates_dir="/t", limit=-1,
+                               json_output_file="/o.json", max_connections=32)
+    assert "--max-connections" not in argv
 
 
 def test_resolve_benchmark_name():

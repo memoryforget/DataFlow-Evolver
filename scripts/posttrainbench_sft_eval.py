@@ -59,6 +59,8 @@ SFT_TEMPLATE_OVERRIDE = os.environ.get("SFT_TEMPLATE", "").strip()
 # --- 评测参数 ---
 EVAL_GPU_MEM_UTIL = os.environ.get("EVAL_GPU_MEM_UTIL", "").strip()
 EVAL_CUDA_VISIBLE_DEVICES = os.environ.get("EVAL_CUDA_VISIBLE_DEVICES", "0").strip()
+# inspect 家族 evaluate.py 的并发（官方默认仅 2，全量评测会极慢）；只影响吞吐，不影响分数。
+EVAL_MAX_CONNECTIONS = os.environ.get("EVAL_MAX_CONNECTIONS", "").strip()
 VLLM_API_KEY = os.environ.get("VLLM_API_KEY", "inspectai")
 
 
@@ -313,12 +315,20 @@ def apply_env_prefix_fixups(env: dict, python_exe: str) -> dict:
     """按目标解释器所属 conda env 补齐 `conda activate` 才会设置的变量（原地改 env 并返回）。
 
     框架用**绝对路径**直接调 df-train / df-eval 的 python，不经过 conda activate，因此
-    两类隐式依赖会缺失：
+    三类隐式依赖会缺失：
       - LD_LIBRARY_PATH：env 自带的 libstdc++ 比系统新，缺路径时 sqlite3/vllm 会因
         `CXXABI_1.3.15 not found` 导入失败；
-      - CUDA_HOME：DeepSpeed 找不到 env 内的 nvcc，会回退到不存在的 /usr/local/cuda。
+      - CUDA_HOME：DeepSpeed 找不到 env 内的 nvcc，会回退到不存在的 /usr/local/cuda；
+      - PATH：inspect_ai 以子进程形式起 `vllm` 命令行，env 的 bin 不在 PATH 时报
+        `No such file or directory: 'vllm'`。
     """
     prefix = Path(python_exe).resolve().parent.parent
+    bin_dir = prefix / "bin"
+    if bin_dir.is_dir():
+        prev = env.get("PATH", "")
+        parts = [p for p in prev.split(os.pathsep) if p]
+        if str(bin_dir) not in parts:
+            env["PATH"] = os.pathsep.join([str(bin_dir), *parts])
     lib_dir = prefix / "lib"
     if lib_dir.is_dir():
         prev = env.get("LD_LIBRARY_PATH", "")
@@ -388,6 +398,7 @@ def run_official_eval(
         limit=limit,
         json_output_file=str(metrics_file.resolve()),
         gpu_memory_utilization=(float(EVAL_GPU_MEM_UTIL) if EVAL_GPU_MEM_UTIL else None),
+        max_connections=(int(EVAL_MAX_CONNECTIONS) if EVAL_MAX_CONNECTIONS else None),
     )
     cmd = [eval_python, str(evaluate_py), *argv]
 
