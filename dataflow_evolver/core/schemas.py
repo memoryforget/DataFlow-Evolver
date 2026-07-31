@@ -49,7 +49,7 @@ class ReviewResult:
     diversity_score: float = 0.0           # 抽样批内多样性、非近重复
 
     # --- 硬指标（纯代码扫全份文件，不花 LLM）---
-    dup_rate: float = 0.0                  # 内容哈希去重率（重复占比）
+    dup_rate: float = 0.0                  # 重复占比 = max(整记录哈希重复, 训练字段级重复)
     null_rate: float = 0.0                 # schema 关键字段空缺率
     parse_valid_rate: float = 1.0          # 可解析（合法 JSON + 字段齐全）占比
 

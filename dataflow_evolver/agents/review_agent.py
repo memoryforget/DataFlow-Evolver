@@ -8,6 +8,8 @@ PostTrainBench 适配后升级为 **Tier-1 复合打分器**（1 次 LLM 调用 
   + 0.15·difficulty + 0.15·diversity + 0.15·schema``。
 - 硬指标惩罚（扫全份文件，不花 LLM）：``dup_rate`` / ``null_rate`` / ``parse_valid_rate``，
   ``tier1 = llm_composite * (1-dup_rate) * (1-null_rate) * parse_valid_rate``。
+  其中 ``dup_rate`` 取「整记录哈希」与「训练字段级」两种口径的较大值——只看整记录会漏掉
+  同一道题配不同措辞 CoT 的情形（详见 ``_scan_hard_metrics``）。
 - 抽样从「取前 N 行」改为**随机蓄水池采样**（一趟遍历、O(k) 内存、全份等概率）。
 - ``passed`` 门槛保留（schema/relevance 阈值），用于剔除垃圾节点。
 
@@ -18,9 +20,11 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import statistics
 import time
 from dataclasses import asdict
 from pathlib import Path
+from typing import NamedTuple
 
 from dataflow_evolver.agents.base import AgentABC
 from dataflow_evolver.core.schemas import ReviewResult, TaskProfile
@@ -110,21 +114,27 @@ class ReviewAgent(AgentABC):
     ) -> ReviewResult:
         """扫全份文件得硬指标并叠加惩罚，写回 result 并返回。"""
         required = list(profile.target_schema.keys()) if profile.target_schema else []
-        dup_rate, null_rate, parse_valid_rate, total = _scan_hard_metrics(
-            dataset_path, required
-        )
-        result.dup_rate = dup_rate
-        result.null_rate = null_rate
-        result.parse_valid_rate = parse_valid_rate
-        if total == 0:
+        metrics = _scan_hard_metrics(dataset_path, required)
+        result.dup_rate = metrics.dup_rate
+        result.null_rate = metrics.null_rate
+        result.parse_valid_rate = metrics.parse_valid_rate
+        if metrics.field_dup_rate > metrics.record_dup_rate:
+            self.logger.info(
+                "重复率由字段 %s 主导：字段级 %.3f > 整记录 %.3f"
+                "（同一内容配不同措辞时整记录哈希会失效）",
+                metrics.dup_field,
+                metrics.field_dup_rate,
+                metrics.record_dup_rate,
+            )
+        if metrics.total == 0:
             # 空文件：复合分再高也没有可训练数据，tier1 直接归零。
             result.tier1_score = 0.0
             return result
         result.tier1_score = (
             result.llm_composite
-            * (1.0 - dup_rate)
-            * (1.0 - null_rate)
-            * parse_valid_rate
+            * (1.0 - metrics.dup_rate)
+            * (1.0 - metrics.null_rate)
+            * metrics.parse_valid_rate
         )
         return result
 
@@ -266,26 +276,52 @@ def _sample_jsonl(path: str, n: int, seed: int | None = None) -> str:
     return "\n".join(reservoir)
 
 
-def _scan_hard_metrics(
-    path: str, required_fields: list[str]
-) -> tuple[float, float, float, int]:
-    """扫全份 jsonl，返回 (dup_rate, null_rate, parse_valid_rate, total_nonempty_rows)。
+class HardMetrics(NamedTuple):
+    """``_scan_hard_metrics`` 的返回值。dup_rate 是对外口径，另两个 dup 仅供日志溯源。"""
 
-    - dup_rate: 内容哈希重复占比 = 1 - unique/total（对可解析行用规范化 JSON 哈希，
-      不可解析行用原始串哈希）。
+    dup_rate: float
+    record_dup_rate: float
+    field_dup_rate: float
+    dup_field: str
+    null_rate: float
+    parse_valid_rate: float
+    total: int
+
+
+# 内容字段判定门槛：中位长度低于此值的一律当标签字段看待。answer 常常只是一个数字、
+# difficulty_level 只有 easy/medium/hard，这类字段天然大量重复，算进重复率会把每份数据集
+# 都判成重灾区。40 字符落在标签字段（个位数长度）和题干/推理链（数百字符）之间的空档里。
+CONTENT_FIELD_MIN_MEDIAN_LEN = 40
+
+# 求中位数需要留样本。只留前 N 条：区分「3 字符的答案」和「300 字符的题干」根本不需要
+# 无偏样本，而阈值离两种量级都很远，前缀偏置翻不动这个判定。
+_LENGTH_SAMPLE_CAP = 4096
+
+
+def _scan_hard_metrics(path: str, required_fields: list[str]) -> HardMetrics:
+    """扫全份 jsonl 得硬指标。
+
+    - dup_rate: 重复占比，取 ``max(整记录哈希重复率, 训练字段级重复率)``。
+      整记录哈希只抓「整行一模一样」，会漏掉同一道题配不同措辞 CoT 的情形——两行哈希不同，
+      但对模型而言是同一份监督信号。实测某份 4000 条数据整记录只报 0.06，而 question
+      字段唯一率仅 0.518。反过来字段级也补不了整记录：题干各异而整行重复同样是重复。
+      两种口径互不覆盖，所以取较大值。
     - null_rate: 关键字段空缺率（字段级）= 空缺槽位 / (可解析行数 × 字段数)；无 required
       字段时为 0。
     - parse_valid_rate: 合法 JSON 对象行 / total。
     """
     p = Path(path)
     if not p.exists():
-        return 0.0, 0.0, 1.0, 0
+        return HardMetrics(0.0, 0.0, 0.0, "", 0.0, 1.0, 0)
 
     total = 0
     parseable = 0
     hashes: set[str] = set()
     null_slots = 0
     field_slots = 0
+    # 只对 required_fields 逐字段留哈希，字段数有界，仍是一趟流式扫描。
+    field_hashes: dict[str, set[str]] = {fld: set() for fld in required_fields}
+    field_lengths: dict[str, list[int]] = {fld: [] for fld in required_fields}
 
     with p.open("r", encoding="utf-8") as f:
         for line in f:
@@ -303,21 +339,72 @@ def _scan_hard_metrics(
                 parseable += 1
                 canonical = json.dumps(obj, sort_keys=True, ensure_ascii=False)
                 hashes.add(hashlib.md5(canonical.encode("utf-8")).hexdigest())
-                if required_fields:
-                    for fld in required_fields:
-                        field_slots += 1
-                        if _is_empty(obj.get(fld)):
-                            null_slots += 1
+                for fld in required_fields:
+                    field_slots += 1
+                    value = obj.get(fld)
+                    if _is_empty(value):
+                        null_slots += 1
+                    text = _as_text(value)
+                    field_hashes[fld].add(
+                        hashlib.md5(text.encode("utf-8")).hexdigest()
+                    )
+                    if len(field_lengths[fld]) < _LENGTH_SAMPLE_CAP:
+                        field_lengths[fld].append(len(text))
             else:
                 hashes.add(hashlib.md5(line.encode("utf-8")).hexdigest())
 
     if total == 0:
-        return 0.0, 0.0, 0.0, 0
+        return HardMetrics(0.0, 0.0, 0.0, "", 0.0, 0.0, 0)
 
-    dup_rate = 1.0 - (len(hashes) / total)
+    record_dup = _clip01(1.0 - (len(hashes) / total))
+    field_dup, dup_field = _worst_content_field_dup(
+        field_hashes, field_lengths, parseable
+    )
     parse_valid_rate = parseable / total
     null_rate = (null_slots / field_slots) if field_slots > 0 else 0.0
-    return _clip01(dup_rate), _clip01(null_rate), _clip01(parse_valid_rate), total
+    return HardMetrics(
+        dup_rate=max(record_dup, field_dup),
+        record_dup_rate=record_dup,
+        field_dup_rate=field_dup,
+        dup_field=dup_field,
+        null_rate=_clip01(null_rate),
+        parse_valid_rate=_clip01(parse_valid_rate),
+        total=total,
+    )
+
+
+def _worst_content_field_dup(
+    field_hashes: dict[str, set[str]],
+    field_lengths: dict[str, list[int]],
+    rows: int,
+) -> tuple[float, str]:
+    """训练字段里塌陷最严重那一维的重复率，返回 (dup_rate, 字段名)。
+
+    只看内容字段（中位长度 ≥ CONTENT_FIELD_MIN_MEDIAN_LEN），标签字段一律跳过。
+    """
+    if rows <= 0:
+        return 0.0, ""
+    worst = 0.0
+    worst_field = ""
+    for fld, hashes in field_hashes.items():
+        lengths = field_lengths.get(fld) or []
+        if not lengths or statistics.median(lengths) < CONTENT_FIELD_MIN_MEDIAN_LEN:
+            continue
+        dup = 1.0 - (len(hashes) / rows)
+        if dup > worst:
+            worst, worst_field = dup, fld
+    return _clip01(worst), worst_field
+
+
+def _as_text(value) -> str:
+    """把字段值折成可哈希、可量长度的字符串。"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, sort_keys=True, ensure_ascii=False)
+    return str(value)
 
 
 def _is_empty(value) -> bool:

@@ -1,4 +1,5 @@
 """Tier-1 ReviewAgent 升级单测：五维复合分、硬指标惩罚、随机蓄水池采样。"""
+import json
 import sys
 from pathlib import Path
 
@@ -77,11 +78,77 @@ def test_hard_metric_penalty_math(tmp_path):
         'not-json\n'                             # 不可解析
         , encoding="utf-8",
     )
-    dup, null, parse_valid, total = _scan_hard_metrics(str(ds), ["instruction", "answer"])
-    assert total == 4
-    assert parse_valid == pytest.approx(0.75)        # 3/4 可解析
-    assert dup == pytest.approx(0.25)                # unique=3 / total=4
-    assert null == pytest.approx(1 / 6, abs=1e-6)    # 空槽 1 / (3 行 × 2 字段)
+    m = _scan_hard_metrics(str(ds), ["instruction", "answer"])
+    assert m.total == 4
+    assert m.parse_valid_rate == pytest.approx(0.75)     # 3/4 可解析
+    assert m.dup_rate == pytest.approx(0.25)             # unique=3 / total=4
+    assert m.null_rate == pytest.approx(1 / 6, abs=1e-6)  # 空槽 1 / (3 行 × 2 字段)
+
+
+def _long(text: str) -> str:
+    """凑到内容字段门槛之上，同时保持不同 text 之间内容不同。"""
+    return f"{text} " + "padding text to push this field above the content-field length threshold."
+
+
+def test_field_dup_catches_same_question_with_varied_cot(tmp_path):
+    """整记录哈希看不见「同一道题配不同 CoT」，字段级必须抓到。"""
+    ds = tmp_path / "d.jsonl"
+    rows = [
+        {"question": _long("同一道题"), "cot": _long(f"推理链 {i}")}
+        for i in range(3)
+    ] + [
+        {"question": _long(f"独立题目 {i}"), "cot": _long(f"推理链 {i}")}
+        for i in range(3, 5)
+    ]
+    ds.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows), encoding="utf-8"
+    )
+    m = _scan_hard_metrics(str(ds), ["question", "cot"])
+    assert m.record_dup_rate == 0.0          # 5 行各不相同
+    assert m.field_dup_rate == pytest.approx(0.4)   # question 唯一 3/5
+    assert m.dup_field == "question"
+    assert m.dup_rate == pytest.approx(0.4)
+
+
+def test_short_label_fields_do_not_inflate_dup(tmp_path):
+    """answer/difficulty 这类短标签天然重复，纳入会把每份数据都判成重灾区。"""
+    ds = tmp_path / "d.jsonl"
+    rows = [
+        {"question": _long(f"题目 {i}"), "answer": "42", "difficulty": "easy"}
+        for i in range(5)
+    ]
+    ds.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows), encoding="utf-8"
+    )
+    m = _scan_hard_metrics(str(ds), ["question", "answer", "difficulty"])
+    assert m.field_dup_rate == 0.0   # answer 唯一率只有 1/5，但它不是内容字段
+    assert m.dup_rate == 0.0
+
+
+def test_record_dup_still_counted_without_content_fields(tmp_path):
+    """字段全是短标签时退化回整记录口径，不能因为跳过字段级就漏报。"""
+    ds = tmp_path / "d.jsonl"
+    ds.write_text(
+        '{"q":"1+1","a":"2"}\n'
+        '{"q":"1+1","a":"2"}\n'
+        '{"q":"2+2","a":"4"}\n', encoding="utf-8",
+    )
+    m = _scan_hard_metrics(str(ds), ["q", "a"])
+    assert m.field_dup_rate == 0.0
+    assert m.dup_rate == pytest.approx(1 / 3, abs=1e-6)
+
+
+def test_non_string_field_values_do_not_crash(tmp_path):
+    """字段值可能是 dict/list/数字/缺失，折成文本后照常参与去重。"""
+    ds = tmp_path / "d.jsonl"
+    ds.write_text(
+        '{"messages":[{"role":"user","content":"x"}],"n":1}\n'
+        '{"messages":[{"role":"user","content":"x"}],"n":2}\n'
+        '{"n":3}\n', encoding="utf-8",
+    )
+    m = _scan_hard_metrics(str(ds), ["messages", "n"])
+    assert m.total == 3
+    assert 0.0 <= m.dup_rate <= 1.0
 
 
 def test_apply_hard_metrics_tier1(tmp_path):
