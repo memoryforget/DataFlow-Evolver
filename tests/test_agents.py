@@ -108,18 +108,26 @@ def test_diagnostic_parses_report():
 
 
 def test_pipeline_prompt_injects_review_issues():
-    """Phase-1 评审打回的 issues 应注入下一轮生成 prompt；无 issues 则不出现该段。"""
-    from dataflow_evolver.core.schemas import TaskProfile
+    """评审 issues 经 parent_review 注入；父未被评审过（如基线/虚拟根）则不出现该段。
+
+    曾另有一条只收 issues 列表的 elif 分支，与 parent_review 表达同一语义、格式却不同。
+    生产代码从不走它，测试却在测它——绿灯不代表真实路径可用，故删掉分支、用例改走这里。
+    """
+    from dataflow_evolver.core.schemas import ReviewResult, TaskProfile
     from dataflow_evolver.llm.prompts import build_pipeline_prompt
 
     profile = TaskProfile("QA", {"q": "str", "a": "str"}, [], "sft")
     base = build_pipeline_prompt(profile, "empty.jsonl", "node_1")
-    assert "评审打回" not in base
+    assert "父节点数据质量" not in base
 
-    with_issues = build_pipeline_prompt(
-        profile, "empty.jsonl", "node_1", review_issues=["qa 字段为空", "与任务不相关"]
+    review = ReviewResult(
+        schema_score=0.7, relevance_score=0.7, passed=True,
+        issues=["qa 字段为空", "与任务不相关"],
     )
-    assert "评审打回" in with_issues
+    with_issues = build_pipeline_prompt(
+        profile, "empty.jsonl", "node_1", parent_review=review
+    )
+    assert "父节点数据质量归因" in with_issues
     assert "qa 字段为空" in with_issues and "与任务不相关" in with_issues
 
 

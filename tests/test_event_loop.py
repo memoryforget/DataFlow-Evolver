@@ -70,7 +70,7 @@ def test_event_loop_runs_and_picks_best(tmp_path, monkeypatch):
     # 桩：ReviewAgent 总是通过
     monkeypatch.setattr(
         orch.reviewer, "review",
-        lambda dataset_path, prof: ReviewResult(0.9, 0.9, True, []),
+        lambda dataset_path, prof, **kwargs: ReviewResult(0.9, 0.9, True, []),
     )
     # 桩：DiagnosticAgent 返回空报告
     monkeypatch.setattr(
@@ -79,7 +79,7 @@ def test_event_loop_runs_and_picks_best(tmp_path, monkeypatch):
     )
 
     # 桩：PipelineAgent.generate 写出一个能跑的 pipeline.py 并返回 config
-    def fake_generate(profile, node_dir_name, diagnostic=None, memory_summary=None, review_issues=None, parent_code=None):
+    def fake_generate(profile, node_dir_name, diagnostic=None, memory_summary=None, **kwargs):
         node_dir = orch.agent_root / node_dir_name
         node_dir.mkdir(parents=True, exist_ok=True)
         (node_dir / "pipeline.py").write_text(FAKE_PIPELINE, encoding="utf-8")

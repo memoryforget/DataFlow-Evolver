@@ -31,8 +31,18 @@ class ExecutionWrapperABC(ABC):
     """流水线执行器接口。"""
 
     @abstractmethod
-    def run(self, config: PipelineConfig, node_dir: str) -> ExecutionResult:
-        """在 `node_dir` 下执行 `config.code`，返回数据集路径或崩溃栈。"""
+    def run(
+        self,
+        config: PipelineConfig,
+        node_dir: str,
+        env_overrides: dict[str, str] | None = None,
+    ) -> ExecutionResult:
+        """在 `node_dir` 下执行 `config.code`，返回数据集路径或崩溃栈。
+
+        `env_overrides` 为本次执行追加/覆盖的环境变量（在 `extra_env` 之上再覆盖），
+        用于两档生成规模：搜索期注入 ``DF_TARGET_SAMPLES=probe_samples``，终选重产时注入
+        ``DF_TARGET_SAMPLES=target_samples``，无需重新生成 pipeline.py。
+        """
         raise NotImplementedError
 
 
@@ -58,7 +68,12 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
         self.python_exe = python_exe or sys.executable
         self.extra_env = extra_env or {}
 
-    def run(self, config: PipelineConfig, node_dir: str) -> ExecutionResult:
+    def run(
+        self,
+        config: PipelineConfig,
+        node_dir: str,
+        env_overrides: dict[str, str] | None = None,
+    ) -> ExecutionResult:
         node_path = (self.agent_root / node_dir).resolve()
         pipeline_path = node_path / self.pipeline_filename
         if not pipeline_path.exists():
@@ -74,6 +89,8 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
         env["PYTHONPATH"] = os.pathsep.join(
             [str(self.agent_root), *(p for p in prev_pp.split(os.pathsep) if p)]
         )
+        if env_overrides:
+            env.update(env_overrides)
         start = time.time()
         try:
             proc = subprocess.run(

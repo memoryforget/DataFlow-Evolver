@@ -15,7 +15,7 @@ from dataflow_evolver.engine.execution_wrapper import SubprocessExecutionWrapper
 
 
 def _cfg() -> PipelineConfig:
-    return PipelineConfig(operators=[], field_flow="", code="", rationale="t")
+    return PipelineConfig(operators=[], rationale="t", field_flow="", code="")
 
 
 def _make_node(agent_root: Path, name: str, body: str) -> None:
@@ -64,3 +64,20 @@ def test_pythonpath_preserves_inherited_entries_and_puts_agent_root_first(tmp_pa
     parts = json.loads(Path(result.dataset_path).read_text(encoding="utf-8"))["pp"].split(os.pathsep)
     assert parts[0] == str(agent_root.resolve())
     assert "/inherited/one" in parts
+
+
+def test_env_overrides_win_over_defaults(tmp_path):
+    """env_overrides（如 DF_TARGET_SAMPLES）仍然生效，不被 PYTHONPATH 处理干扰。"""
+    agent_root = tmp_path / "_agent_root"
+    agent_root.mkdir(parents=True)
+    _make_node(agent_root, "node_1", (
+        "import json, os, pathlib\n"
+        "p = pathlib.Path(__file__).parent / 'out_step1.jsonl'\n"
+        "p.write_text(json.dumps({'n': os.environ.get('DF_TARGET_SAMPLES')}) + '\\n')\n"
+    ))
+
+    ex = SubprocessExecutionWrapper(agent_root=str(agent_root), timeout_sec=120)
+    result = ex.run(_cfg(), "node_1", env_overrides={"DF_TARGET_SAMPLES": "4000"})
+
+    assert result.success, result.traceback
+    assert json.loads(Path(result.dataset_path).read_text(encoding="utf-8"))["n"] == "4000"
