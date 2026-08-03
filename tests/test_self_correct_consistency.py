@@ -195,7 +195,6 @@ def test_history_accumulates_across_rounds(tmp_path, monkeypatch):
     monkeypatch.setattr(o.pipeline_agent, "self_correct_review", fake_self_correct_review)
 
     parent = o.tree.root
-    parent.baseline_dev_score = None
     child = o.tree.reserve_child(parent)
     child.config = None
     monkeypatch.setattr(

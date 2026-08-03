@@ -19,6 +19,22 @@ agent = [
     # 编排层单独装，不要和 SFT / eval 混装
     "claude-agent-sdk>=0.2",
 ]
+external-data = [
+    # --- dataset-search / data-discovery 两台 in-process MCP（`agent_sdk.external_data: true`）---
+    # 这些工具跑在编排器进程里，所以装在 df-agent。全部惰性导入：缺哪个只让对应工具返回一条
+    # 说明，不影响主循环，因此本组是可选的。
+    "huggingface_hub>=1.0",       # HF 搜索 / 元信息；1.x 起 list_datasets 不再接受 direction
+    "datasets>=4.0",              # 两个 hub 的流式读取都经由它
+    "requests>=2.31",             # data-discovery 三个工具（Serper / GitHub / arXiv）
+    # ModelScope：国内 HF 直连不通时的取数通道。
+    # **不要写成 `modelscope[datasets]`**——那个 extra 把 datasets 钉在 <=4.8.4，会把上面这条
+    # 降级掉，连带影响 HF 侧与 vendored DataFlow。下面三个是实测跑通 MsDataset 流式加载所需的
+    # 最小补集（modelscope 核心包不声明它们，只在 [datasets] extra 里带）。
+    "modelscope>=1.39",
+    "addict",                     # modelscope.utils.config 顶层 import
+    "simplejson>=3.3",            # modelscope.fileio.format.jsonplus
+    "sortedcontainers>=1.5.9",    # 同上
+]
 agent-runtime = [
     # --- 运行 vendored DataFlow 流水线所需（装在 df-agent 环境）---
     # torch 仅为满足导入，df-agent 不做 GPU 计算 —— 装 CPU-only 轮子即可（~200MB 而非 ~2.5GB）：

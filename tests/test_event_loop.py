@@ -2,6 +2,7 @@
 
 不依赖 ANTHROPIC_API_KEY、不依赖已安装的 DataFlow——验证编排逻辑本身正确接线。
 """
+import json
 import sys
 from pathlib import Path
 
@@ -27,14 +28,24 @@ FAKE_PIPELINE = (
 def _make_config(tmp_path: Path) -> Config:
     agent_root = tmp_path / "_agent_root"
     agent_root.mkdir(parents=True)
-    seed = tmp_path / "seed.jsonl"
-    seed.write_text('{"text": "hello"}\n', encoding="utf-8")
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "seed.jsonl").write_text('{"text": "hello"}\n', encoding="utf-8")
     ref_script = Path(__file__).resolve().parents[1] / "scripts" / "reference_train_eval.py"
+    # dev 题集来源：一半题能被 FAKE_PIPELINE 产出的 q0..q4 答上，一半答不上 → score=0.5
+    dev_source = tmp_path / "dev_source.jsonl"
+    dev_source.write_text(
+        "".join(
+            json.dumps({"instruction": q, "answer": q.replace("q", "a")}) + "\n"
+            for q in ("q0", "q1", "q7", "q8")
+        ),
+        encoding="utf-8",
+    )
     raw = {
         "project": {
             "workspace_dir": str(tmp_path / "workspace"),
             "agent_root": str(agent_root),
-            "seed_data": str(seed),
+            "input_dir": str(input_dir),
         },
         "llm": {"backend": "api", "api": {
             "api_url": "https://example.invalid/v1/chat/completions",
@@ -45,7 +56,13 @@ def _make_config(tmp_path: Path) -> Config:
         "search": {"exploration_constant": 1.414, "max_iterations": 3,
                    "max_children_per_node": 2, "self_correction_retries": 1},
         "review": {"schema_threshold": 0.6, "relevance_threshold": 0.6, "sample_size": 5},
-        "trainer": {"dev_eval_cmd": f'{sys.executable} "{ref_script}"', "timeout_sec": 60, "train_timeout_sec": 60},
+        "trainer": {
+            "dev_eval_cmd": f'{sys.executable} "{ref_script}"',
+            "timeout_sec": 60,
+            "train_timeout_sec": 60,
+            # 框架物化 dev 题集并经 --dev-set 下传；参考脚本拿不到会直接非零退出
+            "dev_set": {"source": str(dev_source), "size": 0, "seed": 42},
+        },
         "diagnostic": {"max_bad_cases": 10},
     }
     return Config(raw)
@@ -78,8 +95,8 @@ def test_event_loop_runs_and_picks_best(tmp_path, monkeypatch):
         lambda bad, downstream="": DiagnosticReport(summary="ok"),
     )
 
-    # 桩：PipelineAgent.generate 写出一个能跑的 pipeline.py 并返回 config
-    def fake_generate(profile, node_dir_name, diagnostic=None, memory_summary=None, **kwargs):
+    # 桩：PipelineAgent 写出一个能跑的 pipeline.py 并返回 config（Init node 与变异节点同一桩）
+    def fake_generate(profile, node_dir_name, **kwargs):
         node_dir = orch.agent_root / node_dir_name
         node_dir.mkdir(parents=True, exist_ok=True)
         (node_dir / "pipeline.py").write_text(FAKE_PIPELINE, encoding="utf-8")
@@ -91,13 +108,20 @@ def test_event_loop_runs_and_picks_best(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(orch.pipeline_agent, "generate", fake_generate)
+    monkeypatch.setattr(orch.pipeline_agent, "generate_initial", fake_generate)
 
     best = orch.run("生成问答数据集")
     assert best is not None
     assert best.train_result is not None
     assert best.train_result.failed is False
-    # 参考脚本：5 条非空 answer → score=1.0
-    assert abs(best.train_result.score - 1.0) < 1e-9
+    # 参考脚本在框架物化的 dev 题集上评测：4 题里 q0/q1 被 FAKE_PIPELINE 产出的数据覆盖，
+    # q7/q8 没有 → exact_match=0.5。分数来自题集而非训练数据自身的某个属性。
+    assert best.train_result.metric_name == "exact_match"
+    assert abs(best.train_result.score - 0.5) < 1e-9
+    assert {bc.input for bc in best.train_result.bad_cases} == {"q7", "q8"}
+    # dev 题集确实被物化并下传（而不是脚本自己挑的题）
+    assert orch.dev_set is not None
+    assert Path(orch.dev_set.path).exists()
     # 跑了 3 次迭代，应有若干已评估节点
     assert len(orch.tree.all_nodes()) >= 1
 

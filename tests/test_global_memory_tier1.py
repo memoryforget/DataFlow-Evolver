@@ -169,7 +169,6 @@ def test_tree_manager_wires_memory_top_k():
 def test_checkpoint_restore_preserves_memory_top_k(tmp_path):
     """restore_tree 曾整体替换 GlobalMemory 实例，会静默把 top_k 打回默认 5。"""
     from dataflow_evolver.core import checkpoint
-    from dataflow_evolver.core.baseline import RewardPolicy
     from dataflow_evolver.core.schemas import TaskProfile
     from dataflow_evolver.core.tree_manager import TreeManager
 
@@ -179,7 +178,7 @@ def test_checkpoint_restore_preserves_memory_top_k(tmp_path):
     src.backpropagate(child, 0.66)
 
     state = checkpoint.serialize(
-        src, RewardPolicy(), None, completed_iterations=1,
+        src, completed_iterations=1,
         profile=TaskProfile("生成", {"instruction": "str"}, ["非空"], "qa-sft"),
     )
     dst = TreeManager(memory_top_k=8)

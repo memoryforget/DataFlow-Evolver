@@ -11,7 +11,6 @@ import regex
 import multiprocessing
 from math import isclose
 from typing import Union
-from collections import defaultdict
 
 from sympy import simplify, N
 from sympy.parsing.sympy_parser import parse_expr
@@ -19,15 +18,6 @@ from sympy.parsing.latex import parse_latex
 from latex2sympy2 import latex2sympy
 
 from .parser import strip_string
-# from parser import choice_answer_clean, strip_string
-
-from .math_normalization import check_sympy_equivalence
-
-import signal
-from concurrent.futures import ThreadPoolExecutor
-
-def timeout_handler(signum, frame):
-    raise TimeoutError("Function execution timed out")
 
 
 def choice_answer_clean(pred: str):
@@ -338,10 +328,6 @@ def math_equal(
     return False
 
 
-def math_equal_process(param):
-    return math_equal(param[-2], param[-1])
-
-
 def numeric_equal(prediction: float, reference: float):
     # Note that relative tolerance has significant impact
     # on the result of the synthesized GSM-Hard dataset
@@ -462,58 +448,3 @@ def check_is_correct(pred, gt, timeout=True):
     if pred is None:
         return False
     return math_equal(strip_string(pred), strip_string(gt), timeout=timeout)
-
-
-def math_equal_simple(pred, gt):
-    pred = strip_string(pred)
-    gt = strip_string(gt)
-    flag = False
-    
-    try:
-        pred_expr = latex2sympy(pred)
-    except:
-        pred_expr = pred
-        flag = True
-        
-    try:  
-        gt_expr = latex2sympy(gt)
-    except:
-        gt_expr = gt
-        flag = True
-        
-    if flag == True:
-        return pred == gt
-    
-    try:
-        if abs(N(pred_expr) - N(gt_expr)) <= 1e-5:
-            return True
-    except:
-        return False
-
-    return False
-    
-
-def check_is_correct_simple(pred, gt, timeout=True):
-    if timeout:
-        return call_with_timeout(math_equal_simple, pred, gt, timeout=1)
-    else:
-        return math_equal_simple(pred, gt)
-
-def _test_math_equal():
-
-    # gt = "\\begin{pmatrix} -10 \\\\ 6 \\end{pmatrix}"
-    # pred = "\\begin{pmatrix}-10\\\\6\\end{pmatrix}"
-
-    # gt = "(6, -\\frac{3}{8})"
-    # pred = "\left( 6, -\\frac{3}{8} \\right)"
-
-    # print(math_equal(strip_string(pred), strip_string(gt), timeout=False))
-    
-    s = "(A) 3"
-    print(choice_answer_clean(s))
-    
-
-
-
-if __name__ == "__main__":
-    _test_math_equal()

@@ -6,14 +6,16 @@ PostTrainBench 适配后升级为 **Tier-1 复合打分器**（1 次 LLM 调用 
 - 五维 LLM-judge（各 0-1）：correctness / relevance / difficulty / diversity / schema。
 - 固定权重复合分：``llm_composite = 0.35·correctness + 0.20·relevance
   + 0.15·difficulty + 0.15·diversity + 0.15·schema``。
-- 硬指标惩罚（扫全份文件，不花 LLM）：``dup_rate`` / ``null_rate`` / ``parse_valid_rate``，
-  ``tier1 = llm_composite * (1-dup_rate) * (1-null_rate) * parse_valid_rate``。
+- 硬指标惩罚（扫全份文件，不花 LLM）：``dup_rate`` / ``null_rate`` / ``parse_valid_rate``
+  / ``contamination_rate``，``tier1 = llm_composite × (1-dup)(1-null)(1-contam) × parse_valid``。
   其中 ``dup_rate`` 取「整记录哈希」与「训练字段级」两种口径的较大值——只看整记录会漏掉
-  同一道题配不同措辞 CoT 的情形（详见 ``_scan_hard_metrics``）。
+  同一道题配不同措辞 CoT 的情形（详见 ``_scan_hard_metrics``）；``contamination_rate``
+  是与 benchmark 测试集的 n-gram 重合率，超阈值直接判 ``passed=False``（见 core/decontamination.py）。
 - 抽样从「取前 N 行」改为**随机蓄水池采样**（一趟遍历、O(k) 内存、全份等概率）。
 - ``passed`` 门槛保留（schema/relevance 阈值），用于剔除垃圾节点。
 
-合规：五维 + 硬指标只看我们**自己合成**的数据，不接触任何 benchmark test。
+合规：五维 + 硬指标只看我们**自己合成**的数据。唯一"接触" benchmark test 的是去污染扫描，
+且只做 n-gram 命中判定、不读分数、不把测试内容回流给任何 Agent——它的作用恰恰是阻止泄露。
 """
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from dataflow_evolver.agents.base import AgentABC
+from dataflow_evolver.core.decontamination import ContaminationIndex
 from dataflow_evolver.core.schemas import ReviewResult, TaskProfile
 from dataflow_evolver.llm.prompts import FAILURE_SIGNALS, build_review_prompt
 
@@ -53,14 +56,21 @@ class ReviewAgent(AgentABC):
         weights: dict[str, float] | None = None,
         hard_metrics: bool = True,
         seed: int | None = None,
+        contamination: ContaminationIndex | None = None,
+        null_threshold: float = 0.5,
     ) -> None:
         super().__init__(serving, max_retries=max_retries)
         self.schema_threshold = schema_threshold
         self.relevance_threshold = relevance_threshold
+        # 关键字段空缺率的一票否决线。字段名整体对不上时空缺率≈1，取 0.5 能果断拦住，
+        # 又不会因个别行缺字段就毙掉整个节点（那种情况仍按比例扣 tier1）。
+        self.null_threshold = null_threshold
         self.sample_size = sample_size
         self.weights = _normalize_weights(weights)
         self.hard_metrics = hard_metrics
         self.seed = seed
+        # 未配置基准参考集时是一个 disabled 的空索引，扫描恒返回干净——调用点无需分支。
+        self.contamination = contamination or ContaminationIndex()
 
     def build_prompt(self, profile: TaskProfile, samples_text: str) -> str:
         return build_review_prompt(profile, samples_text)
@@ -130,10 +140,41 @@ class ReviewAgent(AgentABC):
             # 空文件：复合分再高也没有可训练数据，tier1 直接归零。
             result.tier1_score = 0.0
             return result
+
+        # schema 契约：字段名对不上时，训练脚本会把整份数据丢光并非零退出，而那时 GPU 已经
+        # 烧完，报错还会被记成"训练脚本非零退出"，看不出根因是字段名。这里用纯代码提前拦下，
+        # 并把缺失的字段名写进 issues——评审自修正循环据此就能改对，不必等训练。
+        if required and metrics.null_rate >= self.null_threshold:
+            result.passed = False
+            result.issues.append(
+                f"产出字段与下游训练脚本的契约不符：要求 {required}，"
+                f"实测关键字段空缺率 {metrics.null_rate:.1%}（上限 {self.null_threshold:.1%}）。"
+                f"请让流水线最终产出**恰好这些字段名**（可用算子做字段映射），"
+                f"字段名不同的话训练脚本会一条都读不到。"
+            )
+
+        # 去污染：与 benchmark 测试集重合的数据不是"质量差"，是把评测答案抄进了训练集。
+        # 既按比例打折（少量疑似重合可能是假阳，不该一票否决），又设硬门槛（超过阈值就是
+        # 在刷分，必须判不通过并把证据喂回 Agent，否则搜索会持续往这个方向走）。
+        contam = self.contamination.scan(dataset_path)
+        result.contamination_rate = contam.rate
+        if contam.hits:
+            self.logger.warning(
+                "数据与基准测试集重合 %d/%d（%.2f%%）", contam.hits, contam.total, contam.rate * 100
+            )
+            if contam.rate > self.contamination.max_rate:
+                result.passed = False
+                result.issues.append(
+                    f"检出与评测基准测试集重合 {contam.rate:.1%}（上限 "
+                    f"{self.contamination.max_rate:.1%}）：这是数据泄露。命中片段示例："
+                    f"{'；'.join(contam.examples)}。请去掉直接取自基准测试集的数据来源。"
+                )
+
         result.tier1_score = (
             result.llm_composite
             * (1.0 - metrics.dup_rate)
             * (1.0 - metrics.null_rate)
+            * (1.0 - contam.rate)
             * metrics.parse_valid_rate
         )
         return result

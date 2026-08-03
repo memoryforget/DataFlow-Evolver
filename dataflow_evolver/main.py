@@ -1,7 +1,7 @@
 """DataFlow-Evolve 主事件环：MCTS 驱动的双反馈环编排器（TODO.md §5.8）。
 
     1. TaskProfilerAgent → TaskProfile（一次）
-    1b.（暖启动 baseline.enabled=true）跑一次强基线得 baseline_dev_score，basline 作 root
+    1b. Init node：产出第一条可跑通的流水线与第一个分数，作为树根（node_0）
     2. node = TreeManager.select()
     3. config = PipelineAgent.generate(profile, parent.diagnostic_report, global_memory, parent_code)
     4. dataset = ExecutionWrapper.run(config)
@@ -10,12 +10,11 @@
          └ 未过 → 惩罚节点，不训练，回 2
     6. train = TrainerWrapper.run(dataset)               # Phase-2 真实训练（dev 评测，驱动 MCTS）
        report = DiagnosticAgent.analyze(train.bad_cases)
-    7. TreeManager.backpropagate(node, reward=RewardPolicy.reward(train.score))
-    8. （可选）DataPool.stage(当前节点数据)；回到 2。运行结束 dump() 统一筛/去重/裁剪
+    7. TreeManager.backpropagate(node, reward=节点分数)；回到 2
 
-奖励/惩罚随 `baseline.enabled` 切换：
-    - 冷启动（false）：虚拟空根 + 绝对分奖励 + penalty=0（行为与历史一致）。
-    - 暖启动（true）：baseline 作 root + Relative Gain 奖励 + penalty=−baseline_dev（见 §2.8）。
+奖励即节点分数本身（review 模式取 tier1 复合分，train 模式取 dev 真分），失败节点取
+PENALTY_REWARD。Init node 与其余节点同口径评分、不享特殊地位，故无需任何奖励平移；
+"相对初始流水线提升了多少"在报告层用 `node_score − node_0_score` 算即可。
 """
 from __future__ import annotations
 
@@ -32,26 +31,32 @@ from dataflow_evolver.agents.diagnostic_agent import DiagnosticAgent
 from dataflow_evolver.agents.pipeline_agent import PipelineAgent
 from dataflow_evolver.agents.review_agent import ReviewAgent
 from dataflow_evolver.agents.task_profiler import TaskProfilerAgent
-from dataflow_evolver.core import checkpoint
-from dataflow_evolver.core.baseline import (
-    REWARD_ABSOLUTE,
-    REWARD_RELATIVE,
-    RewardPolicy,
-    adapt_baseline_source,
-    summarize_baseline_operators,
+from dataflow_evolver.core import (
+    checkpoint,
+    decontamination,
+    dev_set,
+    evaluation,
+    input_corpus,
+    provenance,
 )
-from dataflow_evolver.core.data_pool import DataPool, PoolConfig
-from dataflow_evolver.core.schemas import PipelineConfig, ReviewResult
+from dataflow_evolver.core.schemas import ReviewResult
 from dataflow_evolver.core.tree_manager import TreeManager
 from dataflow_evolver.core.tree_node import PipelineNode
 from dataflow_evolver.engine.execution_wrapper import SubprocessExecutionWrapper
-from dataflow_evolver.engine.trainer_wrapper import DownstreamTrainerWrapper, SSHTrainerWrapper
+from dataflow_evolver.engine.trainer_wrapper import (
+    CappedTrainer,
+    DownstreamTrainerWrapper,
+)
 from dataflow_evolver.llm.agent_sdk import AgentInfraError
 from dataflow_evolver.llm.serving import build_serving
 from dataflow_evolver.utils.config import Config, load_config
 from dataflow_evolver.utils.logging import get_logger, setup_logging
 
 logger = get_logger("main")
+
+# 失败节点（生成无产出 / 执行崩溃 / 评审不过 / 训练失败）回传的奖励。
+# 两种奖励口径的分数都非负（tier1 复合分与 dev 准确率均 ∈[0,1]），故 0 恒为最差。
+PENALTY_REWARD = 0.0
 
 
 def _resolve_pipeline_llm(cfg_llm: Config) -> dict[str, dict]:
@@ -97,23 +102,31 @@ class Orchestrator:
         project = cfg.project
         self.workspace = Path(project.workspace_dir).resolve()
         self.agent_root = Path(project.agent_root).resolve()
-        self.seed_path = str(Path(project.seed_data).resolve())
 
         serving = build_serving(cfg.llm)
 
         # 辅助 Agent（非-SDK）
         self.profiler = TaskProfilerAgent(serving)
         review_cfg = cfg.review
-        _w = review_cfg.get("weights", None)
-        review_weights = _w.to_dict() if hasattr(_w, "to_dict") else _w
+        review_weights = _plain_dict(review_cfg.get("weights", None))
+        # 去污染索引：未配 reference_files 时是个空索引，扫描恒返回干净（不改变任何行为）。
+        decon_cfg = review_cfg.get("decontamination") or Config({})
+        self.contamination = decontamination.build(
+            reference_files=list(decon_cfg.get("reference_files", []) or []),
+            n=int(decon_cfg.get("ngram", decontamination.DEFAULT_NGRAM)),
+            max_rate=float(decon_cfg.get("max_rate", decontamination.DEFAULT_MAX_RATE)),
+            fields=list(decon_cfg.get("fields", []) or []) or None,
+        )
         self.reviewer = ReviewAgent(
             serving,
+            contamination=self.contamination,
             schema_threshold=review_cfg.get("schema_threshold", 0.6),
             relevance_threshold=review_cfg.get("relevance_threshold", 0.6),
             sample_size=review_cfg.get("sample_size", 80),
             weights=review_weights,
             hard_metrics=bool(review_cfg.get("hard_metrics", True)),
             seed=review_cfg.get("sample_seed", None),
+            null_threshold=float(review_cfg.get("null_threshold", 0.5)),
         )
         # 终选安全阀阈值：4000 放大重产后若质量塌陷则跳过用次优（见 _quality_collapsed）。
         self.collapse_dup = float(review_cfg.get("collapse_dup_rate", 0.5))
@@ -147,18 +160,17 @@ class Orchestrator:
             "每个算子根据功能绑定对应用途的 serving 实例。"
         )
         llm_block = "\n".join(llm_block_lines)
-        # 从零合成设计：流水线不读输入语料，first_entry 指向一个共享的 0 字节 empty.jsonl
-        # （仅满足 DataFlow 的 first_entry 形参）；seed.jsonl 只供 TaskProfiler 建模，不进流水线。
-        self.empty_entry_path = self.agent_root / "empty.jsonl"
-        self.empty_entry_path.parent.mkdir(parents=True, exist_ok=True)
-        self.empty_entry_path.write_text("", encoding="utf-8")
-
-        # reward 来源开关（向后兼容）：
-        #   "train"（默认，数学 SFT 路径不变）：每节点跑 dev_eval_cmd（SFT+评测）取真分作 reward。
-        #   "review"（PostTrainBench 两段式）：搜索期每节点只产 probe_samples 条交 ReviewAgent 打
-        #            tier1 复合分作 reward（不训练、不占 GPU）；搜索结束再对 top-K 重产 target_samples
-        #            条做真实 SFT+评测（见 _final_selection）。
-        self.reward_source = str(cfg.search.get("reward_source", "train")).lower()
+        # 输入契约：input/ 里有语料就走 corpus-grounded 合成（入口=语料），空则走从零合成
+        # （入口=0 字节 empty.jsonl，仅满足 DataFlow 的 first_entry 形参）。见 core/input_corpus.py。
+        # 同一份 corpus 供三处使用：pipeline prompt 的入口与预览、TaskProfiler 的样例、日志。
+        empty_entry_path = self.agent_root / "empty.jsonl"
+        empty_entry_path.parent.mkdir(parents=True, exist_ok=True)
+        empty_entry_path.write_text("", encoding="utf-8")
+        self.corpus = input_corpus.discover(
+            project.get("input_dir", "") or "",
+            empty_entry_path,
+            entry_name=str(project.get("input_entry", "") or ""),
+        )
 
         # 目标产出规模（注入生成 prompt 指导算子产出量；0 或缺省=不指定）。
         # 两档：probe_samples=搜索期探针小规模；target_samples=终选重产大规模。
@@ -166,19 +178,51 @@ class Orchestrator:
         gen_cfg = cfg.get("generation")
         self.target_samples = int(gen_cfg.get("target_samples", 0)) if gen_cfg else 0
         self.probe_samples = int(gen_cfg.get("probe_samples", 0)) if gen_cfg else 0
-        # 注入生成 prompt 的「env 缺省回退值」：review 模式用探针值（脱离编排器单跑也便宜），
-        # train 模式沿用 target_samples（与旧行为一致）。
-        prompt_default_samples = (
-            self.probe_samples if (self.reward_source == "review" and self.probe_samples > 0)
-            else self.target_samples
+        # target_samples 对 pipeline 只是建议值（算子可以不读、过滤会少产、增强会多产），
+        # 而训练配方冻结意味着总步数正比于条数——不切齐就等于让节点用数据量买算力。默认强制。
+        self.enforce_target_samples = (
+            bool(gen_cfg.get("enforce_target_samples", True)) if gen_cfg else True
         )
+
+        # 奖励口径（train=搜索期真实训练取真分 / review=Tier-1 代理分 + 收尾兑现）。
+        # 口径带来的连带纪律——执行规模、是否训练、是否需要放大重产兑现、预算预留——都由策略
+        # 一处给出，见 core/evaluation.py。策略无状态，运行时从 self 读取协作者与规模配置。
+        self.strategy = evaluation.build(cfg.search.get("reward_source", "train"))
+        logger.info("奖励口径：%s", self.strategy.name)
+
+        # 外部数据搜索（默认关闭）：开启后 Agent 可去 HuggingFace 找/取真实数据集，
+        # 统一落到共享的 data_links/。是否允许引入外部数据属于实验设定，故须显式打开。
+        # 惰性导入：这条链路会拉起 claude_agent_sdk 并注册 MCP server，关闭时不该有任何代价。
+        self.data_links_dir = ""
+        if cfg.agent_sdk.get("external_data", False):
+            from dataflow_evolver.llm import mcp_datasets
+
+            from dataflow_evolver.llm import mcp_discovery
+
+            self.data_links_dir = str(
+                mcp_datasets.configure(
+                    project.get("data_links_dir", "") or self.workspace / "data_links",
+                    cfg.get("dataset_search"),
+                )
+            )
+            mcp_discovery.configure(cfg.get("discovery"))
+
         self.pipeline_agent = PipelineAgent(
             agent_cfg=cfg.agent_sdk,
             agent_root=str(self.agent_root),
-            entry_path=str(self.empty_entry_path),
+            corpus=self.corpus,
             llm_block=llm_block,
-            target_samples=prompt_default_samples,
+            target_samples=self.strategy.default_prompt_samples(self),
+            data_links_dir=self.data_links_dir,
         )
+
+        # Init node 的启动方式（三档，对应 docs/design-decisions.md §5.2 的独立性消融）：
+        #   给参考实现 → 忠实改写；只给指令 → 按指令构建；都不给 → 从零自主设计。
+        # 参考实现在这里就读盘，配错路径要在启动时报错，而不是烧掉一次 Agent SDK 调用才发现。
+        init_cfg = cfg.get("init") or Config({})
+        self.init_instruction = str(init_cfg.get("instruction", "") or "")
+        ref_path = str(init_cfg.get("reference_pipeline", "") or "")
+        self.init_reference_code = _read_reference_pipeline(ref_path) if ref_path else None
 
         # 引擎——执行流水线的子进程里把【pipeline 算子 LLM】密钥注入约定的环境变量名
         self.pipeline_extra_env: dict[str, str] = {}
@@ -196,13 +240,30 @@ class Orchestrator:
         )
         # dev 评测驱动 MCTS：trainer.dev_eval_cmd（见设计文档 §3/§6）
         dev_cmd = cfg.trainer.dev_eval_cmd
+        # dev 题集由框架物化并显式下传，不再由评测脚本各自抽样：奖励是节点之间比出来的，
+        # 「所有节点评在同一批题上」必须是事实而非约定（见 core/dev_set.py）。
+        self.dev_set = dev_set.build(cfg.trainer.get("dev_set"), self.workspace)
+        dev_set_args = ["--dev-set", self.dev_set.path] if self.dev_set else []
+        if self.dev_set:
+            # dev 是搜索直接优化的目标，把 dev 题混进合成数据是最省力的刷分路径——比混 test
+            # 更有效，因为 test 全程不参与 loop。它必须在去污染参考集里，且不能指望用户记得配。
+            self.contamination.add_file(self.dev_set.path)
+        # 下游训练脚本实际接受的字段。它决定流水线该产出什么、评审按什么打分，是**契约**而非
+        # 建议——不配则退回 TaskProfiler 让 LLM 现编字段名，而编出来的名字（problem/solution
+        # 之类都很合理）与脚本的取字段逻辑对不上时，评审照样满分放行，直到训练阶段才炸，还会
+        # 被记成「训练脚本非零退出」。
+        self.dataset_schema = _plain_dict(cfg.trainer.get("dataset_schema"))
+        if self.dataset_schema:
+            logger.info("下游 schema 契约：%s", self.dataset_schema)
+        else:
+            logger.warning(
+                "未配 trainer.dataset_schema：产出字段由 TaskProfiler 自行设计，"
+                "与训练脚本对不上要到训练阶段才会暴露。"
+            )
         train_python = cfg.trainer.get("train_python", None)
         eval_python = cfg.trainer.get("eval_python", None)
         train_timeout = cfg.trainer.train_timeout_sec
-        # 训练调度：local=本机拉起子进程（单机）；ssh=本机 rank0 + SSH 到 node1 拉起 rank1（双机）
-        dispatch = cfg.trainer.get("dispatch", "local")
-        ssh_cfg = cfg.trainer.get("ssh") if dispatch == "ssh" else None
-        logger.info("dev 评测命令：%s（超时 %ds，dispatch=%s）", dev_cmd, train_timeout, dispatch)
+        logger.info("dev 评测命令：%s（超时 %ds）", dev_cmd, train_timeout)
         if train_python:
             logger.info("train 环境 python：%s", train_python)
         if eval_python:
@@ -211,28 +272,27 @@ class Orchestrator:
         def _make_trainer(cmd: str):
             if not cmd:
                 return None
-            if dispatch == "ssh":
-                return SSHTrainerWrapper(
-                    train_eval_cmd=cmd,
-                    node1_host=ssh_cfg.node1_host,
-                    master_addr=ssh_cfg.master_addr,
-                    gpus_per_node=int(ssh_cfg.get("gpus_per_node", 8)),
-                    nnodes=int(ssh_cfg.get("nnodes", 2)),
-                    master_port=int(ssh_cfg.get("master_port", 29500)),
-                    remote_cwd=ssh_cfg.get("remote_cwd", None) or None,
-                    ssh_opts=ssh_cfg.get("ssh_opts", ""),
-                    timeout_sec=train_timeout,
-                    python_path=train_python,
-                    eval_python_path=eval_python,
-                )
+            inner = _make_bridge(cmd)
+            if not (self.enforce_target_samples and self.target_samples > 0):
+                return inner
+            return CappedTrainer(inner, cap=self.target_samples)
+
+        def _make_bridge(cmd: str):
             return DownstreamTrainerWrapper(
                 train_eval_cmd=cmd,
                 timeout_sec=train_timeout,
                 python_path=train_python,
                 eval_python_path=eval_python,
+                extra_args=dev_set_args,
             )
 
         self.trainer = _make_trainer(dev_cmd)
+        if isinstance(self.trainer, CappedTrainer):
+            logger.info("训练集切齐：至多 %d 条/节点（同算力预算）", self.target_samples)
+        elif dev_cmd:
+            logger.warning(
+                "训练集未切齐：节点间数据量不同将带来不同的总优化步数，分数不完全可比。"
+            )
         self.dev_eval_cmd = dev_cmd
         self.train_python = train_python
         self.eval_python = eval_python
@@ -242,28 +302,6 @@ class Orchestrator:
         # 缺省时由 dev_eval_cmd 把 "--mode dev" 换成 "--mode test" 派生。
         self.test_eval_cmd = cfg.trainer.get("test_eval_cmd", "") or dev_cmd.replace(
             "--mode dev", "--mode test"
-        )
-
-        # 强基线锚点（warm/cold 开关，见 docs/design-decisions.md §2）
-        baseline_cfg = cfg.get("baseline") or Config({})
-        self.baseline_enabled = bool(baseline_cfg.get("enabled", False))
-        self.baseline_margin = float(baseline_cfg.get("margin", 0.0))
-        self.baseline_seed = int(baseline_cfg.get("seed", 42))
-        self.baseline_pipeline_path = baseline_cfg.get(
-            "baseline_pipeline",
-            "workspace/_agent_root/dataflow/statics/pipelines/api_pipelines/reasoning_math_baseline_pipeline.py",
-        )
-        # 奖励策略：默认绝对分（冷启动）；暖启动跑完基线后切换为 Relative Gain。
-        self.reward_policy = RewardPolicy(reward_mode=REWARD_ABSOLUTE)
-
-        # 数据池（可选副产品，与奖励解耦；默认关闭）
-        dp_cfg = cfg.get("data_pool")
-        pool_config = PoolConfig.from_dict(dp_cfg.to_dict() if dp_cfg else None)
-        # 行数据暂存到 workspace 下的稳定 sidecar 目录（跨进程续跑可复用），
-        # 内存/checkpoint 只留元数据，避免整份数据集常驻/反复写盘（见 data_pool.StagedNode）。
-        self.pool: DataPool | None = (
-            DataPool(pool_config, staging_dir=str(self.workspace / "pool_staging"))
-            if pool_config.enabled else None
         )
 
         # 树搜索
@@ -301,33 +339,43 @@ class Orchestrator:
     def run(self, task_description: str) -> PipelineNode | None:
         self._run_start = time.time()
         self.final_result: dict | None = None
-        # 0. 若有 checkpoint → 载入续跑；否则正常起步（含暖启动基线）
+        # 0. 若有 checkpoint → 载入续跑；否则正常起步（Profiler + Init node）
         state = checkpoint.read(self.checkpoint_path) if self.checkpoint_path else None
         if state:
+            checkpoint.verify_dev_set(
+                state, self.dev_set.recipe() if self.dev_set else None
+            )
             profile = checkpoint.restore_profile(state)
+            # 续跑同样受契约约束：checkpoint 里的 schema 出自上一轮的配置，中途改了
+            # dataset_schema 而不覆盖，续跑的节点会按旧字段产数据、评分，训练时才炸。
+            if self.dataset_schema and profile.target_schema != self.dataset_schema:
+                logger.warning(
+                    "checkpoint 里的 schema 与当前 trainer.dataset_schema 不符，按配置覆盖：%s → %s",
+                    profile.target_schema, self.dataset_schema,
+                )
+                profile.target_schema = dict(self.dataset_schema)
             checkpoint.restore_tree(
                 state, self.tree,
                 agent_root=str(self.agent_root),
                 pipeline_filename=self.pipeline_filename,
             )
-            self.reward_policy = checkpoint.restore_reward_policy(state)
-            if self.pool is not None:
-                checkpoint.restore_pool(state, self.pool)
             start_it = state["completed_iterations"] + 1
             logger.info(
-                "从 checkpoint 续跑：已完成 %d 轮，从第 %d 轮继续（reward_mode=%s）",
-                state["completed_iterations"], start_it, self.reward_policy.reward_mode,
+                "从 checkpoint 续跑：已完成 %d 轮，从第 %d 轮继续。",
+                state["completed_iterations"], start_it,
             )
         else:
-            profile = self.profiler.run(task_description, seed_path=self.seed_path)
+            profile = self.profiler.run(
+                task_description,
+                self.corpus.sample_text(),
+                fixed_schema=self.dataset_schema,
+            )
             if profile is None:
                 logger.error("无法生成 TaskProfile，终止。")
                 return None
-            # 1b. 暖启动：跑一次强基线，basline 作 root + 切换到 Relative Gain 奖励
-            if self.baseline_enabled:
-                if not self._run_baseline():
-                    logger.error("基线流程失败，暖启动无法继续。终止。")
-                    return None
+            # 1b. Init node：整棵树的变异起点，跑不出分就没有可搜索的空间
+            if not self._run_init_node(profile):
+                return None
             start_it = 1
 
         it = start_it
@@ -366,18 +414,15 @@ class Orchestrator:
             self._save_checkpoint(it, profile)
             it += 1
 
-        if self.pool is not None:
-            self.pool.dump()
-
-        # review 两段式：搜索结束后对 top-K 做真实 SFT+评测选模，并对 final_model 跑一次官方全量终评。
-        if self.reward_source == "review":
+        # 代理分口径：搜索结束后对 top-K 放大重产做真实 SFT+评测选模，并对 final_model 跑一次官方全量终评。
+        if self.strategy.needs_scale_up_selection:
             self._final_selection(profile)
             # 终选把 tier2_review_result 与 train_result 回写到候选节点，而循环内最后一次落盘
             # 早于此。不在这里补写，这两份数据就只剩 run.log 里的日志行——而它们正是检验
             # 「tier1 能否预测下游真分」的唯一可比样本对，落不进结构化终态等于白留字段。
             self._save_checkpoint(it - 1, profile)
 
-        best = self.tree.best_leaf()
+        best = self.tree.best_node()
         if best is not None:
             logger.info(
                 "最优节点：%s（mean_reward=%.4f）", best.node_dir_name, best.mean_reward
@@ -386,10 +431,8 @@ class Orchestrator:
 
     # ------------------------------------------------------------------
     def _final_reserve_sec(self) -> float:
-        """为搜索后的「终选 + 终评」预留的墙钟时间（review 模式才预留）。"""
-        if self.reward_source != "review":
-            return 0.0
-        return self.tier2_top_k * self.tier2_per_run_sec + self.final_eval_reserve_sec
+        """为搜索后的「终选 + 终评」预留的墙钟时间（只有需要兑现代理分的口径才预留）。"""
+        return self.strategy.reserve_sec(self)
 
     def _search_should_stop(self) -> bool:
         """时间预算触发则停止扩展（预留终选+终评时间）。time_budget_sec<=0 时永不触发。"""
@@ -412,86 +455,48 @@ class Orchestrator:
             return
         try:
             state = checkpoint.serialize(
-                self.tree, self.reward_policy, self.pool, completed_iterations, profile
+                self.tree, completed_iterations, profile,
+                dev_set_recipe=self.dev_set.recipe() if self.dev_set else None,
             )
             checkpoint.write(self.checkpoint_path, state)
         except Exception as exc:  # 落盘失败不应拖垮主循环
             logger.warning("checkpoint 落盘失败（继续跑）：%s", exc)
 
     # ------------------------------------------------------------------
-    def _run_baseline(self) -> bool:
-        """暖启动专用：用 seed 固定的强基线流水线跑一次，得 baseline_dev_score 并作 root。
+    def _run_init_node(self, profile) -> bool:
+        """Init node（node_0 = 树根）：产出第一条可跑通的流水线与第一个分数。
 
-        基线源码硬编码了 openai.com/gpt-4o 与 empty.jsonl；这里以最小可行方式（正则替换）
-        把它适配到代理 API（复用执行子进程注入的 DF_PIPELINE_API_KEY）、本地空种子与节点缓存。
-        见 docs/design-decisions.md §2.2/§2.4。
+        它和其余节点走**完全同一条**评分路径（`_evaluate_node`），分数没有任何特殊地位——
+        整棵树都从它变异而来，所以"相对初始流水线提升了多少"直接是 `node_score − root_score`，
+        不需要奖励平移，也不需要单独的锚点模块。
+
+        三种启动方式（对应独立性消融的三档，见 docs/design-decisions.md §5.2）：
+        参考实现改写 / 只给自然语言指令 / 从零自主设计。均由 `init` 配置段决定。
         """
-        src_path = Path(self.baseline_pipeline_path).resolve()
-        if not src_path.exists():
-            logger.error("基线流水线源码不存在：%s", src_path)
+        root = self.tree.root
+        node_dir = root.node_dir_name
+        logger.info("==== Init node（%s）====", node_dir)
+        config = self.pipeline_agent.generate_initial(
+            profile=profile,
+            node_dir_name=node_dir,
+            reference_code=self.init_reference_code,
+            instruction=self.init_instruction,
+        )
+        if config is None:
+            logger.error("Init node 生成失败：Agent 跑完但未产出有效流水线。")
+            return False
+        root.config = config
+
+        outcome = self._evaluate_node(root, profile)
+        if outcome is None:
+            logger.error("Init node 未能跑出分数；整棵树没有可变异的起点，终止。")
             return False
 
-        root_dir_name = self.tree.root.node_dir_name
-        node_dir_abs = self.agent_root / root_dir_name
-        node_dir_abs.mkdir(parents=True, exist_ok=True)
-
-        # 自带一个 0 字节空种子（Condor 从零合成，输入内容被忽略，仅需文件存在）
-        empty_jsonl = node_dir_abs / "empty.jsonl"
-        empty_jsonl.write_text("", encoding="utf-8")
-
-        # 基线用 generation 用途的 LLM（或第一个可用的）
-        baseline_purpose = "generation" if "generation" in self.pipeline_llm else next(iter(self.pipeline_llm))
-        baseline_llm = self.pipeline_llm[baseline_purpose]
-        baseline_env_key = self.pipeline_env_keys[baseline_purpose]
-
-        adapted = adapt_baseline_source(
-            src_path.read_text(encoding="utf-8"),
-            api_url=baseline_llm["api_url"],
-            model_name=baseline_llm["model_name"],
-            key_env=baseline_env_key,
-            empty_jsonl_path=str(empty_jsonl),
-            cache_path=str(node_dir_abs / "cache"),
-        )
-        pipeline_path = node_dir_abs / self.pipeline_filename
-        pipeline_path.write_text(adapted, encoding="utf-8")
-
-        # 算子清单 / field_flow 从适配后的源码解析得出（而非手写），保证与实际执行一致：
-        # 基线行为完全由 code 决定，产出规模等参数以源码为准（不再谎报 num_samples 等元数据）。
-        operators, field_flow = summarize_baseline_operators(adapted)
-        baseline_config = PipelineConfig(
-            operators=operators,
-            field_flow=field_flow or "(baseline pipeline; 详见 code)",
-            code=adapted,
-            rationale=(
-                f"强基线：导入并适配自 {src_path.name}"
-                "（算子/field_flow 由源码解析得出，与实际执行一致）。"
-            ),
-        )
-
-        logger.info("跑强基线（seed=%d）：%s", self.baseline_seed, pipeline_path)
-        exec_result = self.executor.run(baseline_config, root_dir_name)
-        if not exec_result.success or exec_result.dataset_path is None:
-            logger.error("基线流水线执行失败：%s", exec_result.traceback)
-            return False
-
-        train_out = str(node_dir_abs / "train_out")
-        train = self.trainer.run(exec_result.dataset_path, train_out)
-        if train.failed:
-            logger.error("基线 dev 评测失败：%s", train.error_msg)
-            return False
-
-        baseline_dev = train.score
-        logger.info("baseline_dev_score=%.4f", baseline_dev)
-
-        # 切换奖励策略 → Relative Gain；basline 作 root；池门槛改为基线自标定（严格 > baseline+margin）
-        self.reward_policy = RewardPolicy(
-            reward_mode=REWARD_RELATIVE, baseline_dev_score=baseline_dev
-        )
-        root = self.tree.set_baseline_root(baseline_config, baseline_dev)
-        root.train_result = train
-        if self.pool is not None:
-            self.pool.set_warm_gate(baseline_dev, self.baseline_margin)
-            logger.info("数据池门槛（暖启动）：node_dev > %.4f", baseline_dev + self.baseline_margin)
+        # 根节点不经 backpropagate（它没有父链），直接落账：一次访问、一份奖励。
+        root.visits = 1
+        root.total_reward = outcome
+        self.tree.global_memory.update(root)
+        logger.info("Init node 完成：%s score=%.4f", node_dir, outcome)
         return True
 
     # ------------------------------------------------------------------
@@ -556,17 +561,12 @@ class Orchestrator:
             pass
 
     def _run_step(self, child: PipelineNode, parent: PipelineNode, profile) -> None:
-        """一轮扩展的主体：生成→执行(自修正)→评审(自修正)→训练→诊断→回传。
+        """一轮扩展的主体：生成 → 评估 → 回传。
 
         SDK 基础设施失败会以 AgentInfraError 向上抛出（由 _step 统一处理）；其余失败
-        （生成无产出/执行崩溃/评审不过/训练失败）按既有逻辑置 dead 并回传 penalty。
+        （生成无产出/执行崩溃/评审不过/训练失败）置 dead 并回传 PENALTY_REWARD。
         """
         node_dir = child.node_dir_name
-        penalty = self.reward_policy.penalty
-        # 搜索期执行环境：review 模式注入探针规模，让生成的 pipeline 只产 probe_samples 条（便宜）。
-        search_env = self._gen_env(self.probe_samples) if self.reward_source == "review" else None
-        # train 模式不注入任何 env（保持对旧执行器/测试桩的调用签名完全不变）。
-        exec_kwargs = {} if search_env is None else {"env_overrides": search_env}
 
         # 3. 生成。父节点信息分三路注入：已验证代码作变异起点、设计意图避免误改取舍、Tier-1 归因
         #    指明该攻哪一维；再加同父兄弟的负面清单促使分散探索。
@@ -576,25 +576,55 @@ class Orchestrator:
         memory_summary = self.tree.global_memory.render(
             exclude_node_ids={parent.id, *(sid for sid, _ in siblings)}
         )
-        parent_review = parent.review_result
-        parent_code = parent.config.code if parent.config else None
-        parent_rationale = parent.config.rationale if parent.config else None
         config = self.pipeline_agent.generate(
             profile=profile,
             node_dir_name=node_dir,
             diagnostic=parent.diagnostic_report,
             memory_summary=memory_summary,
-            parent_code=parent_code,
-            parent_rationale=parent_rationale,
-            parent_review=parent_review,
+            parent_code=parent.config.code if parent.config else None,
+            parent_rationale=parent.config.rationale if parent.config else None,
+            parent_review=parent.review_result,
             siblings=[line for _, line in siblings],
         )
         if config is None:
             logger.warning("PipelineAgent 生成失败（agent 跑完但未产出有效流水线），惩罚该扩展并跳过。")
             child.dead = True
-            self.tree.backpropagate(child, penalty)
+            self.tree.backpropagate(child, PENALTY_REWARD)
             return
         child.config = config
+
+        reward = self._evaluate_node(child, profile)
+        self.tree.backpropagate(child, PENALTY_REWARD if reward is None else reward)
+
+    def _evaluate_node(self, node: PipelineNode, profile) -> float | None:
+        """对**已写好 config** 的节点求分：执行(自修正) → 评审(自修正) → 按模式取分。
+
+        返回该节点的奖励；任一环节最终失败则置 `node.dead` 并返回 None（由调用方决定
+        如何记账——子节点回传惩罚，Init node 则直接终止运行）。
+
+        Init node 与变异节点共用本方法，是"初始流水线不享受特殊评分口径"这条设计的落点。
+
+        无论成败都在收尾扫一遍外部数据溯源：失败节点用了什么数据同样是审计对象——"拉了不该拉
+        的数据集导致污染扣分"恰恰只在失败节点上发生，而那正是最需要查清来源的时候。
+        """
+        try:
+            return self._score_node(node, profile)
+        finally:
+            try:
+                provenance.scan_node(
+                    self.agent_root / node.node_dir_name, data_links_dir=self.data_links_dir
+                )
+            except Exception as exc:  # 旁路记录绝不能盖掉真实的返回值或异常
+                logger.warning("外部数据溯源扫描失败（%s）：%s", node.node_dir_name, exc)
+
+    def _score_node(self, node: PipelineNode, profile) -> float | None:
+        """`_evaluate_node` 的主体，见其文档。"""
+        node_dir = node.node_dir_name
+        config = node.config
+        assert config is not None, "_evaluate_node 要求节点已持有 config"
+        search_env = self.strategy.search_env(self)
+        # 无 env 要注入时不传该参数：保持对旧执行器/测试桩的调用签名完全不变。
+        exec_kwargs = {} if search_env is None else {"env_overrides": search_env}
 
         # 4. 执行（含自修正）
         exec_result = self.executor.run(config, node_dir, **exec_kwargs)
@@ -605,21 +635,20 @@ class Orchestrator:
             fixed = self.pipeline_agent.self_correct(node_dir, exec_result.traceback or "")
             if fixed is None:
                 break
-            child.config = fixed
+            node.config = fixed
             exec_result = self.executor.run(fixed, node_dir, **exec_kwargs)
 
         if not exec_result.success or exec_result.dataset_path is None:
-            logger.warning("执行最终失败，惩罚节点。")
-            child.dead = True
-            self.tree.backpropagate(child, penalty)
-            return
+            logger.warning("执行最终失败，判定节点失败。")
+            node.dead = True
+            return None
 
         # 5. Phase-1 快反馈（含立即自修正：失败则看中间 step 产物定位、修复、重审，限次）
         evidence_path = self._review_evidence_path(node_dir)
         review = self.reviewer.review(
             exec_result.dataset_path, profile, evidence_path=evidence_path, phase="search"
         )
-        child.review_result = review
+        node.review_result = review
         r_retries = 0
         # 各轮修复的目标与成效。只把最新一轮 issues 喂回去，LLM 不知道某段逻辑是上一轮为修 X
         # 才加的，容易改掉它导致 X 复现，在节点内部震荡空转掉有限的自修正次数。
@@ -638,7 +667,7 @@ class Orchestrator:
             )
             if fixed is None:
                 break
-            child.config = fixed
+            node.config = fixed
             exec_result = self.executor.run(fixed, node_dir, **exec_kwargs)
             # 评审自修正后执行崩溃：内嵌执行修复循环（复用 self_correction_retries 次数）
             exec_fix_retries = 0
@@ -651,7 +680,7 @@ class Orchestrator:
                 exec_fixed = self.pipeline_agent.self_correct(node_dir, exec_result.traceback or "")
                 if exec_fixed is None:
                     break
-                child.config = exec_fixed
+                node.config = exec_fixed
                 exec_result = self.executor.run(exec_fixed, node_dir, **exec_kwargs)
             if not exec_result.success or exec_result.dataset_path is None:
                 logger.warning("评审自修正后执行最终失败，停止重审。")
@@ -666,61 +695,17 @@ class Orchestrator:
             fix_history.append(summary)
             self._append_fix_history(node_dir, r_retries, review.issues, summary)
             review = new_review
-            child.review_result = review
+            node.review_result = review
         if not review.passed:
-            logger.info("数据评审最终未通过，不训练，惩罚节点。issues=%s", review.issues)
-            child.dead = True
-            self.tree.backpropagate(child, penalty)
-            return
+            logger.info("数据评审最终未通过，不训练，判定节点失败。issues=%s", review.issues)
+            node.dead = True
+            return None
 
-        # ---- reward_source=review：Tier-1 复合分即 reward，搜索期不训练/不诊断/不占 GPU ----
-        if self.reward_source == "review":
-            reward = review.tier1_score
-            self.tree.backpropagate(child, reward)
-            logger.info(
-                "节点 %s 完成（Tier-1）：tier1=%.4f reward=%.4f（composite=%.3f, "
-                "dup=%.2f null=%.2f parse=%.2f）",
-                child.node_dir_name, review.tier1_score, reward, review.llm_composite,
-                review.dup_rate, review.null_rate, review.parse_valid_rate,
-            )
-            return
-
-        # 6. Phase-2 真实训练（dev 评测）+ 诊断
-        train_out = str(self.agent_root / node_dir / "train_out")
-        train = self.trainer.run(exec_result.dataset_path, train_out)
-        child.train_result = train
-        if train.failed:
-            logger.warning("训练系统级失败：%s，惩罚节点。", train.error_msg)
-            child.dead = True
-            self.tree.backpropagate(child, penalty)
-            return
-
-        report = self.diagnostician.analyze(train.bad_cases, profile.downstream_task)
-        child.diagnostic_report = report
-
-        # 7. 回传奖励（RewardPolicy：绝对分 / Relative Gain 随模式切换）
-        reward = self.reward_policy.reward(train.score)
-        self.tree.backpropagate(child, reward)
-        logger.info(
-            "节点 %s 完成：dev=%.4f reward=%.4f（mode=%s）",
-            child.node_dir_name, train.score, reward, self.reward_policy.reward_mode,
-        )
-
-        # 8. 数据池收割（可选）：运行期只暂存，门槛/去重/占比裁剪留到 run() 末尾 dump 统一处理
-        if self.pool is not None:
-            rows = _read_jsonl_rows(exec_result.dataset_path)
-            self.pool.stage(
-                node_id=child.id,
-                rows=rows,
-                dev_score=train.score,
-                review_passed=review.passed,
-            )
-
-
-    # ------------------------------------------------------------------
-    def _gen_env(self, n: int) -> dict[str, str] | None:
-        """构造注入 pipeline 执行子进程的产出规模环境变量（n<=0 时不注入）。"""
-        return {"DF_TARGET_SAMPLES": str(int(n))} if n and n > 0 else None
+        # 6. 按奖励口径取分：train 口径在此跑真实训练+诊断，review 口径直接用 Tier-1 复合分。
+        score = self.strategy.score(self, node, profile, exec_result.dataset_path)
+        if score is None:
+            node.dead = True
+        return score
 
     def _quality_collapsed(self, orig: "ReviewResult", new: "ReviewResult") -> bool:
         """大规模重产后的质量塌陷判定（安全阀）：命中任一即视为塌陷，跳过该候选。"""
@@ -740,7 +725,7 @@ class Orchestrator:
         return False
 
     def _final_selection(self, profile) -> None:
-        """搜索结束后的 Tier-2 选模 + 终评（仅 reward_source=review）。
+        """搜索结束后的 Tier-2 选模 + 终评（仅需要兑现代理分的口径会走到，见 EvaluationStrategy）。
 
         1) 按 tier1 取 top-K 候选；
         2) 各自用 target_samples（4000）重跑**同一** pipeline.py（env 注入，不重新生成代码）；
@@ -792,7 +777,8 @@ class Orchestrator:
             )
             # 1) 大规模重产同一 pipeline.py
             exec_result = self.executor.run(
-                node.config, node_dir, env_overrides=self._gen_env(self.target_samples)
+                node.config, node_dir,
+                env_overrides=evaluation.samples_env(self.target_samples),
             )
             if not exec_result.success or exec_result.dataset_path is None:
                 logger.warning("候选 %s 放大重产失败，改用次优。", node_dir)
@@ -979,24 +965,34 @@ def _sibling_summaries(
     return out
 
 
-def _read_jsonl_rows(path: str) -> list[dict]:
-    """读取 jsonl 文件为 dict 列表（跳过空行/坏行），供数据池收割。"""
-    rows: list[dict] = []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(obj, dict):
-                    rows.append(obj)
-    except OSError as exc:
-        logger.warning("读取数据集失败（池收割跳过）：%s", exc)
-    return rows
+def _read_reference_pipeline(path: str) -> str:
+    """读取 Init node 的参考实现源码。
+
+    读不到直接抛：这是启动配置错误，静默降级成"从零自主设计"会让一次消融实验跑成
+    另一档模式，而日志里只有一行 warning——事后无从分辨结果属于哪一档。
+    """
+    p = Path(path).expanduser()
+    if not p.is_file():
+        raise FileNotFoundError(f"init.reference_pipeline 指向的文件不存在：{p}")
+    return p.read_text(encoding="utf-8")
+
+
+def _override(cfg: Config, section: str, **values) -> None:
+    """把非 None 的命令行值写回配置的某一段（None = 该项未指定，沿用 YAML）。"""
+    provided = {k: v for k, v in values.items() if v is not None}
+    if provided:
+        cfg.to_dict().setdefault(section, {}).update(provided)
+
+
+def _plain_dict(value) -> dict:
+    """把配置里的嵌套段取成普通 dict；缺省/空值统一成 `{}`。
+
+    `Config` 不能直接 `dict()`——它没有 `keys()`，`dict()` 会退化成整数索引并抛 `KeyError: 0`。
+    而同一个键在测试里常常直接塞普通 dict，两种形态都得吃下。
+    """
+    if value is None:
+        return {}
+    return dict(value.to_dict() if hasattr(value, "to_dict") else value)
 
 
 def main() -> None:
@@ -1004,9 +1000,28 @@ def main() -> None:
     parser.add_argument("--config", default="configs/default.yaml", help="YAML 配置路径")
     parser.add_argument("--task", required=True, help="高层任务描述")
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--init-code",
+        default=None,
+        help="Init node 的参考实现路径（覆盖 init.reference_pipeline）：给了就走忠实改写模式",
+    )
+    parser.add_argument(
+        "--init-instruction",
+        default=None,
+        help="Init node 的构建指令（覆盖 init.instruction）",
+    )
+    parser.add_argument(
+        "--input-dir",
+        default=None,
+        help="输入语料目录（覆盖 project.input_dir）；有语料=grounded 合成，空=从零合成",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    # 命令行覆盖：消融实验要在同一份 YAML 上换档（换启动模式、切输入范式），
+    # 每次改配置文件既容易漏改，也让"这次跑的到底是哪档"不可追溯。
+    _override(cfg, "init", reference_pipeline=args.init_code, instruction=args.init_instruction)
+    _override(cfg, "project", input_dir=args.input_dir)
     log_file = Path(cfg.project.workspace_dir) / "run.log"
     setup_logging(level=args.log_level, log_file=log_file)
 
@@ -1030,6 +1045,12 @@ def main() -> None:
             print(f"终评分（官方 evaluate.py --limit -1 全量）：{test_score:.4f}")
         else:
             print("终评分：未获得（终评失败，见日志）")
+        # 口径提示：PTB 的 dev 与终评取自同一题池，--limit N 是确定性前缀，故 dev 题**包含在**
+        # 终评题里。选模在终评集的子集上进行，终评分因此偏乐观——对外比较时必须一并说明。
+        print(
+            "注：dev 题集是终评题集的前缀子集（官方 evaluate.py 的 --limit 取确定性前 N 条），"
+            "选模与终评并非独立样本，终评分偏乐观；见 docs/posttrainbench_adaptation.md。"
+        )
 
 
 if __name__ == "__main__":

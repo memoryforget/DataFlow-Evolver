@@ -52,10 +52,11 @@ class ReviewResult:
     dup_rate: float = 0.0                  # 重复占比 = max(整记录哈希重复, 训练字段级重复)
     null_rate: float = 0.0                 # schema 关键字段空缺率
     parse_valid_rate: float = 1.0          # 可解析（合法 JSON + 字段齐全）占比
+    contamination_rate: float = 0.0        # 与 benchmark 测试集的 n-gram 重合率（未配参考集时恒 0）
 
     # --- 复合分：作为 Tier-1 reward 回传 MCTS ---
     llm_composite: float = 0.0             # 五维加权（固定权重）
-    tier1_score: float = 0.0               # llm_composite * (1-dup) * (1-null) * parse_valid
+    tier1_score: float = 0.0               # llm_composite × (1-dup)(1-null)(1-contam) × parse_valid
 
     # --- 失败信号（借鉴 ANDES F1-F7 坏味道分类；仅观测/可解释，不参与打分）---
     failure_signals: list[str] = field(default_factory=list)  # 命中的信号编号，如 ["F3", "F5"]

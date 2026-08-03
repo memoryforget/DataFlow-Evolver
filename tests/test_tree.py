@@ -68,13 +68,13 @@ def test_select_prefers_higher_reward_when_visits_equal():
     assert selected is a
 
 
-def test_best_leaf_picks_highest_mean_reward():
+def test_best_node_picks_highest_mean_reward():
     tm = TreeManager(max_children_per_node=3)
     a = tm.expand(tm.root, _cfg("a"))
     b = tm.expand(tm.root, _cfg("b"))
     tm.backpropagate(a, 0.3)
     tm.backpropagate(b, 0.7)
-    assert tm.best_leaf() is b
+    assert tm.best_node() is b
 
 
 def test_dead_child_not_counted_in_expandable():
@@ -89,7 +89,7 @@ def test_dead_child_not_counted_in_expandable():
     assert tm.select() is tm.root
 
 
-def test_dead_child_skipped_in_selection_and_best_leaf():
+def test_dead_child_skipped_in_selection_and_best_node():
     tm = TreeManager(max_children_per_node=2, exploration_constant=0.1)
     a = tm.expand(tm.root, _cfg("a"))
     b = tm.expand(tm.root, _cfg("b"))
@@ -97,23 +97,38 @@ def test_dead_child_skipped_in_selection_and_best_leaf():
     tm.backpropagate(b, 0.1)
     a.dead = True
     assert tm.root.best_child(0.1) is b      # 跳过 dead 的 a
-    assert tm.best_leaf() is b               # best_leaf 也跳过 dead
+    assert tm.best_node() is b               # best_node 也跳过 dead
 
 
-def test_best_leaf_warm_start_falls_back_to_baseline():
-    """暖启动：没有子节点打败基线（relative 奖励 ≤ 0）时，best_leaf 回退到基线 root（review H2）。"""
+def _init_root(tm: TreeManager, score: float) -> None:
+    """按 Orchestrator._run_init_node 的记账方式把 root 填成 Init node。"""
+    tm.root.config = _cfg("init")
+    tm.root.visits = 1
+    tm.root.total_reward = score
+
+
+def test_best_node_includes_init_root():
+    """没有变异超过初始流水线时，交付的应是初始流水线本身而非"最不差的变异"。"""
     tm = TreeManager(max_children_per_node=3)
-    tm.set_baseline_root(_cfg("baseline"), baseline_dev_score=0.8)
-    child = tm.reserve_child(tm.root)
-    child.config = _cfg("worse")
-    tm.backpropagate(child, -0.2)            # 逊于基线 → 负的 Relative Gain
-    assert tm.best_leaf() is tm.root         # 回退基线
+    _init_root(tm, 0.8)
+    worse = tm.reserve_child(tm.root)
+    worse.config = _cfg("worse")
+    tm.backpropagate(worse, 0.6)
+    assert tm.best_node() is tm.root
 
-    # 一旦有节点打败基线（正增益），就返回那个节点
-    winner = tm.reserve_child(tm.root)
-    winner.config = _cfg("better")
-    tm.backpropagate(winner, 0.15)
-    assert tm.best_leaf() is winner
+    better = tm.reserve_child(tm.root)
+    better.config = _cfg("better")
+    tm.backpropagate(better, 0.95)
+    assert tm.best_node() is better
+
+
+def test_all_nodes_excludes_virtual_root_but_keeps_init_root():
+    tm = TreeManager()
+    a = tm.expand(tm.root, _cfg("a"))
+    assert tm.all_nodes() == [a]             # 虚拟根（config=None）不是一次实验
+
+    _init_root(tm, 0.5)
+    assert set(tm.all_nodes()) == {tm.root, a}
 
 
 def test_global_memory_updates_on_backprop():

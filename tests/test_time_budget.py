@@ -7,6 +7,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from _ptb_stubs import bare_orchestrator
 
+from dataflow_evolver.core import evaluation
+
 
 def test_reserve_only_in_review_mode(tmp_path):
     o = bare_orchestrator(tmp_path, reward_source="review", tier2_top_k=3,
@@ -33,8 +35,7 @@ def test_should_never_stop_when_budget_disabled(tmp_path):
     assert o._search_should_stop() is False
 
 
-def test_gen_env_helper(tmp_path):
-    o = bare_orchestrator(tmp_path)
-    assert o._gen_env(200) == {"DF_TARGET_SAMPLES": "200"}
-    assert o._gen_env(0) is None
-    assert o._gen_env(-5) is None
+def test_samples_env_helper():
+    assert evaluation.samples_env(200) == {"DF_TARGET_SAMPLES": "200"}
+    assert evaluation.samples_env(0) is None
+    assert evaluation.samples_env(-5) is None

@@ -178,7 +178,7 @@ def test_review_evidence_path_lands_in_node_dir(tmp_path):
 
 
 class _StubProfiler:
-    def run(self, task_description, seed_path=None):
+    def run(self, task_description, sample_text=None, fixed_schema=None):
         return PROFILE
 
 
@@ -191,9 +191,7 @@ def test_checkpoint_written_after_final_selection(tmp_path):
     ck = tmp_path / "ck.json"
     o = bare_orchestrator(tmp_path, tier2_top_k=1, time_budget_sec=0.0)
     o.max_iterations = 0                    # 跳过搜索循环，只验证终选后的落盘
-    o.baseline_enabled = False
     o.profiler = _StubProfiler()
-    o.seed_path = ""
     o.checkpoint_path = str(ck)
     node = _add_candidate(o, tier1=0.9)
 

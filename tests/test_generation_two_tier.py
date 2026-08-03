@@ -4,19 +4,22 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from dataflow_evolver.core.input_corpus import InputCorpus
 from dataflow_evolver.core.schemas import PipelineConfig, TaskProfile
 from dataflow_evolver.engine.execution_wrapper import SubprocessExecutionWrapper
 from dataflow_evolver.llm.prompts import build_pipeline_prompt
 
+SCRATCH = InputCorpus(entry_path="empty.jsonl")   # 无输入语料 = 从零合成
+
 
 def test_pipeline_prompt_instructs_env_target_samples():
     profile = TaskProfile("QA", {"instruction": "str", "output": "str"}, [], "sft")
-    sized = build_pipeline_prompt(profile, "empty.jsonl", "node_1", target_samples=200)
+    sized = build_pipeline_prompt(profile, SCRATCH, "node_1", target_samples=200)
     assert "DF_TARGET_SAMPLES" in sized                 # 指示从环境变量读取
     assert "os.environ" in sized
     assert "200" in sized                                # 缺省回退值
     # 默认不注入
-    base = build_pipeline_prompt(profile, "empty.jsonl", "node_1")
+    base = build_pipeline_prompt(profile, SCRATCH, "node_1")
     assert "DF_TARGET_SAMPLES" not in base
 
 

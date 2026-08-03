@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dataflow_evolver.core.baseline import REWARD_ABSOLUTE, RewardPolicy
+from dataflow_evolver.core import evaluation, input_corpus
 from dataflow_evolver.core.schemas import (
     DiagnosticReport,
     PipelineConfig,
@@ -22,6 +22,10 @@ class StubPipelineAgent:
         self.generate_calls = 0
 
     def generate(self, **kwargs):
+        self.generate_calls += 1
+        return PipelineConfig(operators=[], field_flow="f", code=self.code, rationale="r")
+
+    def generate_initial(self, **kwargs):
         self.generate_calls += 1
         return PipelineConfig(operators=[], field_flow="f", code=self.code, rationale="r")
 
@@ -67,15 +71,17 @@ class StubReviewer:
 
 
 class StubTrainer:
-    """按调用顺序返回预置 TrainResult；记录调用次数（用于断言搜索期是否训练）。"""
+    """按调用顺序返回预置 TrainResult；记录调用次数与收到的数据集路径。"""
 
     def __init__(self, results=None):
         self._results = list(results or [])
         self._i = 0
         self.calls = 0
+        self.datasets = []  # 训练脚本实际拿到的数据集（断言切齐是否生效）
 
     def run(self, dataset_path, output_dir):
         self.calls += 1
+        self.datasets.append(dataset_path)
         r = self._results[min(self._i, len(self._results) - 1)]
         self._i += 1
         return r
@@ -103,20 +109,28 @@ def make_review_result(tier1=0.5, passed=True, dup=0.0, null=0.0, parse=1.0, com
     return r
 
 
-def bare_orchestrator(tmp_path, **overrides):
-    """构造一个只填必要属性的 Orchestrator（不触发真实 serving / SDK / 子进程）。"""
+def bare_orchestrator(tmp_path, reward_source="review", **overrides):
+    """构造一个只填必要属性的 Orchestrator（不触发真实 serving / SDK / 子进程）。
+
+    `reward_source` 单独作参数而非 setattr 覆盖项：它要建出评分策略，而策略在运行时才从
+    编排器读 trainer 等协作者，所以测试仍可在返回后自由替换 o.trainer / o.reviewer。
+    """
     o = Orchestrator.__new__(Orchestrator)
-    o.reward_source = "review"
+    o.strategy = evaluation.build(reward_source)
     o.probe_samples = 200
     o.target_samples = 4000
     o.tree = TreeManager(max_children_per_node=4)
-    o.reward_policy = RewardPolicy(reward_mode=REWARD_ABSOLUTE)
     o.self_correction_retries = 2
     o.review_self_correction_retries = 2
-    o.pool = None
     o.agent_root = Path(tmp_path)
     o.workspace = Path(tmp_path)
     o.pipeline_agent = StubPipelineAgent()
+    o.corpus = input_corpus.discover("", Path(tmp_path) / "empty.jsonl")
+    o.init_reference_code = None
+    o.init_instruction = ""
+    o.dev_set = None                        # 未物化 dev 集：评测脚本沿用自身默认
+    o.dataset_schema = {}                   # 未配下游契约：沿用 TaskProfiler 的推断
+    o.data_links_dir = ""                   # 外部数据工具未挂载（溯源扫描仍会跑）
     o.executor = StubExecutor(Path(tmp_path) / "ds")
     o.reviewer = StubReviewer([make_review_result()])
     o.trainer = StubTrainer([TrainResult(score=0.5, metric_name="gsm8k")])

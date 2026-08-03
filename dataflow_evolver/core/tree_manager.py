@@ -1,7 +1,11 @@
 """TreeManager：MCTS 主循环的树操作——select(UCB1) / expand / backpropagate，并维护全局记忆。
 
-借鉴 DataMaster 的 MCTS：从虚拟根沿最大 UCT 下行到"可扩展"节点；扩展时挂上
+借鉴 DataMaster 的 MCTS：从根沿最大 UCT 下行到"可扩展"节点；扩展时挂上
 PipelineAgent 产出的新配置；回传时沿祖先链累加奖励与访问数。
+
+根节点（node_0）由编排器填成 Init node（持有真实流水线与首个分数），整棵树都是它的变异后代。
+TreeManager 本身不负责建立 Init node，因此新建时根仍是空壳（config=None）——查询类方法
+按"有没有 config"判断它是不是一次实验，不依赖任何外部标记。
 """
 from __future__ import annotations
 
@@ -14,7 +18,7 @@ logger = get_logger("core.tree_manager")
 
 
 class TreeManager:
-    """持有虚拟根与超参，提供选点 / 扩展 / 回传。"""
+    """持有根节点与搜索超参，提供选点 / 扩展 / 回传。"""
 
     def __init__(
         self,
@@ -26,7 +30,11 @@ class TreeManager:
         memory_max_issues: int = 3,
         memory_issue_maxlen: int = 120,
     ) -> None:
-        self.root = PipelineNode()  # 虚拟根，config=None
+        self.root = PipelineNode()  # 空壳，待编排器填成 Init node
+        # 钉死根的编号：文档、prompt 与日志都把起点称作 node_0，而计数器是全局的——只要有人
+        # 在建树前多造一个节点，根就会漂成 node_3 之类，且只体现在目录名上，很难发现。
+        # 子节点仍从计数器取号，不会与 0 相撞。
+        self.root.id = 0
         self.exploration_constant = exploration_constant
         self.max_children_per_node = max_children_per_node
         # 探索常数 c 衰减（借鉴 DataMaster）：早期多探索、后期多利用。
@@ -44,26 +52,6 @@ class TreeManager:
         """当前有效探索常数 c（随已评估节点数指数衰减，下限 exploration_min）。"""
         c = self.exploration_constant * (self.exploration_decay ** self._step_count)
         return max(self.exploration_min, c)
-
-    def set_baseline_root(
-        self, config: PipelineConfig, baseline_dev_score: float
-    ) -> PipelineNode:
-        """暖启动：把虚拟空根替换为持有基线配置的真实根（见 docs/design-decisions.md §2.4）。
-
-        - root 持有基线 `config`（其 `code` 即适配后的基线源码，供首层子节点作变异起点）；
-        - `visits=1`，`total_reward=0.0`——基线相对自身的 Relative Gain 恒为 0，是 UCB 的零点；
-        - `baseline_dev_score` 记到 root，便于复现与日志（奖励换算的真值由 RewardPolicy 持有）。
-        """
-        self.root.config = config
-        self.root.visits = 1
-        self.root.total_reward = 0.0
-        self.root.baseline_dev_score = baseline_dev_score
-        self.global_memory.update(self.root)
-        logger.info(
-            "基线作 root：%s（baseline_dev_score=%.4f, visits=1, reward=0）",
-            self.root.node_dir_name, baseline_dev_score,
-        )
-        return self.root
 
     def is_expandable(self, node: PipelineNode) -> bool:
         """存活（非 dead）子节点未满配额即可扩展。
@@ -96,7 +84,7 @@ class TreeManager:
             parent.children.remove(child)
 
     def select(self) -> PipelineNode:
-        """自虚拟根沿最大 UCT 下行，返回第一个可扩展节点。
+        """自根沿最大 UCT 下行，返回第一个可扩展节点。
 
         根节点总是可扩展（直到铺满首层）；否则沿 best_child 下探，遇到可扩展节点即停。
         探索常数随已评估节点数衰减（见 current_exploration）。
@@ -118,7 +106,7 @@ class TreeManager:
         return child
 
     def backpropagate(self, node: PipelineNode, reward: float) -> None:
-        """从 node 沿父链累加 reward 与 visits（含虚拟根）。"""
+        """从 node 沿父链累加 reward 与 visits（一路到根）。"""
         cur: PipelineNode | None = node
         while cur is not None:
             cur.visits += 1
@@ -128,35 +116,32 @@ class TreeManager:
         self._step_count += 1   # 驱动探索常数衰减
 
     # ---- 便捷查询 ----
-    def best_leaf(self) -> PipelineNode | None:
-        """返回平均奖励最高的已访问、非 dead、非根节点（最终产物挑选用）。
+    def best_node(self) -> PipelineNode | None:
+        """返回平均奖励最高的已评估、非 dead 节点（最终产物挑选用）。
 
-        暖启动兜底（review H2）：若 root 是基线节点（有 config + baseline_dev_score），
-        且没有任何子节点打败基线（最佳子节点平均奖励 ≤ 0，Relative Gain 下即未超基线），
-        则回退返回基线 root——避免把"比已有强基线还差"的流水线当成最优交付。
+        root（Init node）本身也是候选：若没有任何变异超过初始流水线，就该交付初始流水线
+        本身，而不是"最不差的那个变异"。
         """
         best: PipelineNode | None = None
-        stack = list(self.root.children)
-        while stack:
-            n = stack.pop()
-            stack.extend(n.children)
+        for n in self.all_nodes():
             if n.visits == 0 or n.dead:
                 continue
             if best is None or n.mean_reward > best.mean_reward:
                 best = n
-        # 暖启动：基线作 root 时，没人超过基线就交付基线本身
-        if self.root.config is not None and self.root.baseline_dev_score is not None:
-            if best is None or best.mean_reward <= 0.0:
-                logger.info("无节点打败基线，best_leaf 回退到基线 root：%s", self.root.node_dir_name)
-                return self.root
         return best
 
     def all_nodes(self) -> list[PipelineNode]:
-        """前序遍历返回除虚拟根外的所有节点。"""
+        """前序遍历返回所有节点，含作为 Init node 的 root。
+
+        仅当根还是空壳（config=None，即 Init node 尚未建立）时排除它——它不是一次实验，
+        排除后调用方拿到的恒是"可比较、可重跑"的节点集合，无需各自再判断根的性质。
+        """
         out: list[PipelineNode] = []
-        stack = list(self.root.children)
+        stack = [self.root]
         while stack:
             n = stack.pop()
-            out.append(n)
             stack.extend(n.children)
+            if n is self.root and n.config is None:
+                continue
+            out.append(n)
         return out

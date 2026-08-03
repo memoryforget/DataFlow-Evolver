@@ -1,46 +1,42 @@
-"""MATH train 题库加载与判分（dev 评测用）。
+"""MATH 风格题集的加载与 prompt 构造（dev 评测用）。
 
-数据源：MATH competition train split (7500 条，含 7 子学科 × 5 难度等级)。
-这些是公开训练语料（非 benchmark test set），用作 MCTS dev 奖励信号不会污染终评。
-答案格式：LaTeX \\boxed{} 内为最终答案。
-评测 prompt 复用 Qwen2.5-Math 的模板格式。
+典型数据源：MATH competition train split（7500 条，7 子学科 × 5 难度等级）。这些是公开训练
+语料（非 benchmark test set），用作 MCTS dev 奖励信号不会污染终评。
+答案格式：LaTeX \\boxed{} 内为最终答案；评测 prompt 复用 Qwen2.5-Math 的模板格式。
 
-默认只加载固定的 500 条子集（seed=42 随机采样），加速 MCTS 迭代。
-设置环境变量 MATH_TRAIN_SAMPLE_SIZE=0 可加载全量 7500 条。
+**本模块不做抽样，也没有默认题库路径。** 评哪些题是框架的决策：`core/dev_set.py` 在启动时
+按 (source_sha, seed, size) 物化成一份文件并写进 manifest，经 `--dev-set` 下传。脚本这边
+再留一套平行的抽样档位，只会让两个口径各说各话（曾经真的发生过，见 design-decisions.md）。
 """
 from __future__ import annotations
 
-import os
-import random
 from pathlib import Path
 
-from .answer_extract import extract_answer, extract_boxed, is_equiv
-
-# 默认路径：项目内 data/math_train.jsonl
-_DEFAULT_MATH_TRAIN_PATH = str(
-    Path(__file__).resolve().parents[2] / "data" / "math_train.jsonl"
-)
-
-_SAMPLE_SIZE = int(os.environ.get("MATH_TRAIN_SAMPLE_SIZE", "500"))
-_SAMPLE_SEED = 42
+from .answer_extract import extract_boxed
 
 
-def load_math_train(
-    data_path: str | None = None, cache_dir: str | None = None
-) -> list[dict]:
-    """加载 MATH train set（本地文件）。返回 [{"question", "gold_answer", "level", "subject"}, ...]
+def load_math_train(data_path: str, cache_dir: str | None = None) -> list[dict]:
+    """读取题集文件，返回 [{"question", "gold_answer", "level", "subject"}, ...]。
 
-    默认返回固定的 500 条子集（seed=42），保证每次评测结果可复现。
-    设置环境变量 MATH_TRAIN_SAMPLE_SIZE=0 返回全量。
+    `data_path` 是必填的：调用方（框架）已经决定好评哪些题，本函数原样读完返回，
+    不抽样、不截断、不回退到任何默认路径。
     """
     import json
 
-    path = Path(data_path) if data_path else Path(_DEFAULT_MATH_TRAIN_PATH)
+    if not data_path:
+        raise ValueError(
+            "load_math_train 需要显式的题集路径：评哪些题由框架的 trainer.dev_set 决定，"
+            "本模块不再提供默认题库或内置抽样。"
+        )
+
+    path = Path(data_path)
     if not path.exists():
         raise FileNotFoundError(
-            f"MATH train 文件不存在：{path}\n"
-            f"请将 Qwen2.5-Math/evaluation/data/math/train.jsonl 复制到 data/math_train.jsonl，"
-            f"或通过 MATH_TRAIN_PATH 环境变量指定路径。"
+            f"dev 题集不存在：{path}\n"
+            f"它由框架按 trainer.dev_set 物化（见 core/dev_set.py）。源文件不入库，"
+            f"需自行准备：从 Qwen2.5-Math 仓库取 evaluation/data/math/train.jsonl 放到 "
+            f"data/math_train.jsonl，或改 configs/*.yaml 的 trainer.dev_set.source "
+            f"指向别处。详见 data/README.md。"
         )
 
     examples = []
@@ -64,10 +60,6 @@ def load_math_train(
                 "subject": row.get("subject", ""),
             })
 
-    if _SAMPLE_SIZE > 0 and len(examples) > _SAMPLE_SIZE:
-        rng = random.Random(_SAMPLE_SEED)
-        examples = rng.sample(examples, _SAMPLE_SIZE)
-
     return examples
 
 
@@ -79,31 +71,3 @@ def build_prompt(question: str) -> str:
     "Please reason step by step, and put your final answer within \\boxed{}"
     """
     return question
-
-
-# Qwen2.5-Math 评测用的 system prompt
-SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}."
-
-
-def score_predictions(
-    predictions: list[str], examples: list[dict]
-) -> tuple[float, list[dict]]:
-    """判分。返回 (accuracy, bad_cases)。"""
-    correct = 0
-    bad_cases: list[dict] = []
-    for pred_text, ex in zip(predictions, examples):
-        pred_answer = extract_answer(pred_text, mode="boxed")
-        if pred_answer is None:
-            pred_answer = extract_answer(pred_text, mode="number")
-        gold = ex["gold_answer"]
-        if is_equiv(pred_answer or "", gold):
-            correct += 1
-        else:
-            bad_cases.append({
-                "input": ex["question"],
-                "prediction": pred_answer or "(extraction failed)",
-                "ground_truth": gold,
-                "error_type": "wrong_answer",
-            })
-    accuracy = correct / len(examples) if examples else 0.0
-    return accuracy, bad_cases

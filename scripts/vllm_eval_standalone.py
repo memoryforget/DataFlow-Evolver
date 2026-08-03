@@ -24,6 +24,7 @@ import signal
 import subprocess
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -46,27 +47,40 @@ def _sampling_plan(bench_name: str) -> tuple[int, float]:
     return 1, 0.0
 
 
+def _grade(pred_text: str, ex: dict) -> tuple[bool, str | None]:
+    """判定单条预测是否正确，并返回用于留痕的抽取结果。
+
+    多选题（example 带 gold_letter）必须比字母：那里的 gold_answer 存的是选项原文
+    （见 additional_benchmarks._normalize_row），拿抽出的字母去比它永远不相等。
+    抽不出字母时退回按原文做数学等价比较。
+    """
+    from math_benchmarks.grader import check_is_correct
+    from math_benchmarks.answer_extract import extract_answer, extract_choice_letter
+
+    gold_letter = ex.get("gold_letter")
+    if gold_letter:
+        letter = extract_choice_letter(pred_text)
+        if letter is not None:
+            return letter == gold_letter, letter
+    extracted = extract_answer(pred_text)
+    return check_is_correct(extracted, ex["gold_answer"]), extracted
+
+
 def _score_benchmark(bench_name: str, examples: list, preds_per_example: list,
                      all_bad_cases: list, max_bad_cases: int) -> float:
     """按 unbiased pass@1 打分。preds_per_example[i] 为第 i 题的 N 个预测文本列表。"""
-    from math_benchmarks.grader import check_is_correct
-    from math_benchmarks.answer_extract import extract_answer
-
     total = 0.0
     for i, ex in enumerate(examples):
         preds = preds_per_example[i] or [""]
-        correct = sum(
-            1 for p in preds
-            if check_is_correct(extract_answer(p, bench_name), ex["gold_answer"])
-        )
+        correct = sum(1 for p in preds if _grade(p, ex)[0])
         total += correct / len(preds)
         if correct == 0 and len(all_bad_cases) < max_bad_cases:
             first = preds[0]
             all_bad_cases.append({
                 "input": ex["question"],
                 "prediction": first,
-                "extracted_answer": extract_answer(first, bench_name),
-                "ground_truth": ex["gold_answer"],
+                "extracted_answer": _grade(first, ex)[1],
+                "ground_truth": ex.get("gold_letter") or ex["gold_answer"],
                 "error_type": f"{bench_name}:wrong_answer",
             })
     return total / max(len(examples), 1)
@@ -77,6 +91,11 @@ def parse_args():
     parser.add_argument("--model-dir", type=str, required=True)
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--mode", type=str, default="dev", choices=["dev", "test"])
+    parser.add_argument(
+        "--dev-set", type=str, default="",
+        help="框架物化好的 dev 集 jsonl（见 core/dev_set.py）。--mode dev 必需：本脚本"
+             "只在给定题集上评测，不抽样也没有内置默认题库。--mode test 忽略此项。",
+    )
     parser.add_argument("--tp-size", type=int, default=4)
     parser.add_argument("--dp-size", type=int, default=1)
     parser.add_argument("--max-model-len", type=int, default=32768)
@@ -104,7 +123,7 @@ def _cap_new_tokens(prompt_len: int, max_model_len: int, max_new_tokens: int,
                     floor: int = 512, margin: int = 16) -> int:
     """把生成上限收敛到上下文剩余空间：min(max_new_tokens, max_model_len − prompt − margin)。
 
-    Qwen2.5-32B 上下文 = max_model_len；serve 模式下 vLLM 严格校验 prompt+max_tokens≤上下文，
+    基座上下文 = max_model_len；serve 模式下 vLLM 严格校验 prompt+max_tokens≤上下文，
     故不能直接请求 = max_model_len 的 max_tokens（会 400）。floor 兜底极端长 prompt。
     """
     room = max_model_len - prompt_len - margin
@@ -155,7 +174,7 @@ def _generate_via_api(base_url: str, model: str, messages_list: list[list[dict]]
     return results
 
 
-def _load_benchmarks(mode: str):
+def _load_benchmarks(mode: str, dev_set: str = ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from math_benchmarks import (
         load_gsm8k, gsm8k_prompt,
@@ -185,7 +204,17 @@ def _load_benchmarks(mode: str):
             ("minervamath", load_minervamath, minervamath_prompt),
             ("gpqa", load_gpqa, gpqa_prompt),
         ]
-    return [("math_train", load_math_train, math_train_prompt)]
+    if not dev_set:
+        # 不猜。本脚本只负责"在给定题集上评测"，不决定评哪些题：退回默认题库要么得内置一套
+        # 抽样（与框架的 dev 口径各说各话），要么闷头评全量 7500 题（一轮 MCTS 多烧几小时 GPU）。
+        # 两者都比直接报错糟。
+        raise ValueError(
+            "--mode dev 需要 --dev-set：dev 题集由框架按 trainer.dev_set 物化后下传"
+            "（见 core/dev_set.py）。若 trainer.dev_set.source 留空则不会物化——"
+            "请配上它；手动跑评测时自行传一份题集文件。"
+        )
+    # 框架已把题集固定成一份文件，这里只负责在它上面评测，所有节点因此评在同一批题上。
+    return [("dev", partial(load_math_train, data_path=dev_set), math_train_prompt)]
 
 
 def _build_messages(examples: list, prompt_fn) -> list[list[dict]]:
@@ -215,7 +244,8 @@ def _build_prompts(examples: list, prompt_fn, tokenizer) -> list[str]:
 
 
 def run_eval_offline(model_dir: Path, mode: str, tp_size: int,
-                     max_model_len: int, max_new_tokens: int) -> dict:
+                     max_model_len: int, max_new_tokens: int,
+                     dev_set: str = "") -> dict:
     """DP=1: 直接用 vLLM LLM 类推理。"""
     from vllm import LLM, SamplingParams
 
@@ -227,7 +257,7 @@ def run_eval_offline(model_dir: Path, mode: str, tp_size: int,
         enforce_eager=True,
     )
     tokenizer = llm.get_tokenizer()
-    benchmarks = _load_benchmarks(mode)
+    benchmarks = _load_benchmarks(mode, dev_set)
 
     bench_scores = {}
     all_bad_cases = []
@@ -286,7 +316,8 @@ def _cleanup_vllm_workers():
 
 
 def run_eval_serve(model_dir: Path, mode: str, tp_size: int, dp_size: int,
-                   max_model_len: int, max_new_tokens: int) -> dict:
+                   max_model_len: int, max_new_tokens: int,
+                   dev_set: str = "") -> dict:
     """DP>1: 启动 vllm serve 子进程，通过 OpenAI Chat API 推理。"""
     base_url = f"http://{SERVE_HOST}:{SERVE_PORT}"
     model_str = str(model_dir)
@@ -322,7 +353,7 @@ def run_eval_serve(model_dir: Path, mode: str, tp_size: int, dp_size: int,
 
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_str, trust_remote_code=True)
-        benchmarks = _load_benchmarks(mode)
+        benchmarks = _load_benchmarks(mode, dev_set)
 
         bench_scores = {}
         all_bad_cases = []
@@ -392,6 +423,7 @@ def main():
                 tp_size=args.tp_size, dp_size=args.dp_size,
                 max_model_len=args.max_model_len,
                 max_new_tokens=args.max_new_tokens,
+                dev_set=args.dev_set,
             )
         else:
             results = run_eval_offline(
@@ -399,6 +431,7 @@ def main():
                 tp_size=args.tp_size,
                 max_model_len=args.max_model_len,
                 max_new_tokens=args.max_new_tokens,
+                dev_set=args.dev_set,
             )
 
         results_path = output_dir / "results.json"

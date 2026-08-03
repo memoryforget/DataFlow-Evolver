@@ -4,7 +4,6 @@
 #   - search.reward_source: review（每节点 reward=ReviewAgent tier1，搜索期不训练/不占 GPU）
 #   - generation: probe_samples(搜索) / target_samples(终选) 两档，pipeline 从 env DF_TARGET_SAMPLES 读条数
 #   - trainer.dev_eval_cmd 换成 scripts/posttrainbench_sft_eval.py（单卡全量 SFT + 官方 evaluate.py）
-#   - dispatch: local；data_pool/baseline 关闭
 #
 # 本配置**环境变量参数化**，可被 scripts/run_posttrainbench_local.sh 复用到任意 benchmark：
 #   PTB_BASE_MODEL   本地 base model 路径（由 runner export，桥接脚本从 env 读取）
@@ -16,7 +15,7 @@
 project:
   workspace_dir: ./workspace
   agent_root: ./workspace/_agent_root
-  seed_data: ./data/seed.jsonl
+  input_dir: ${PTB_INPUT_DIR:./input}      # 放了语料=grounded 合成；空=从零合成（GSM8K 默认从零）
 
 llm:
   backend: api
@@ -38,22 +37,42 @@ agent_sdk:
   effort: max
   permission_mode: bypassPermissions
   setting_sources: [project]
-  skills: [dataflow-dev]
   max_turns: 50
   pipeline_filename: pipeline.py
   max_retries: 4
   retry_base_delay: 10
   run_timeout_sec: 1800
   resume_on_retry: true
+  # 外部数据：Agent 可去 HuggingFace / ModelScope 找并取真实数据集（落到共享 data_links/）。
+  # ★ 与 review.decontamination 是一套的，不能只开这个：gsm8k 本体就在 HF 上、test split
+  #   触手可及，而 PostTrainBench 明令禁止拿 test 训练（src/eval/general/prompt.txt）。
+  #   不设参考集就开取数，等于给搜索留了一条比改进数据省力得多的刷分路径。
+  external_data: true
+  discovery: true                          # 连带挂 data-discovery（网页/GitHub/arXiv，只找线索不取数）
+
+# 取数 MCP 的连接信息。这些是 in-process MCP，跑在编排器进程里，读不到 agent_sdk.env。
+dataset_search:
+  endpoint: ${HF_ENDPOINT:}                # 直连不通时填镜像，如 https://hf-mirror.com
+  token: ${HF_TOKEN:}                      # gated 数据集需要；留空=沿用环境变量/本地登录态
+  cache_dir: ${HF_HOME:}
+  max_download_mb: 2048                    # 单份数据集落盘上限；触顶截断（保留 split 头部）并在 meta 标明
+  modelscope_endpoint: ""
+  modelscope_token: ${MODELSCOPE_API_TOKEN:}
+
+discovery:
+  serper_api_key: ${SERPER_API_KEY:}       # search_web 用；留空=该工具返回说明，改用内置 WebSearch
+  github_token: ${GITHUB_TOKEN:}           # 留空=匿名搜索，GitHub 限流 10 次/分钟
+  # search_papers 走 arXiv 公开 API，不需要凭据。
 
 # 两档产出规模：搜索期探针 200；终选重产 4000（同一 pipeline.py 经 env DF_TARGET_SAMPLES 复用）
 generation:
   target_samples: 4000
   probe_samples: 200
 
-# 冷启动（无强基线锚点）
-baseline:
-  enabled: false
+# Init node 自主设计（不给参考实现、不给指令）
+init:
+  reference_pipeline: ""
+  instruction: ""
 
 search:
   # ★ reward 来源：review = Tier-1 复合分驱动 MCTS（本适配核心开关）
@@ -109,22 +128,47 @@ review:
   collapse_null_rate: 0.3
   collapse_parse_valid_rate: 0.7
   collapse_tier1_frac: 0.6
+  # 去污染：agent_sdk.external_data 打开后这一段是**必需**的，不是可选加固。
+  # ★ 参考集必须与 PTB_BENCHMARK 对应。默认这份是 GSM8K 官方 test split（1319 题，本仓库已带）；
+  #   换 benchmark 时必须同时换 PTB_DECONTAM_REF，否则拿 gsm8k 的题去查 humaneval 的污染，
+  #   检不出任何东西却给出"已开去污染"的虚假安全感。
+  #   其余 PTB benchmark（aime2025 / gpqamain / humaneval / bfcl / healthbench / arenahardwriting）
+  #   本仓库没有本地副本，需自行落一份**仅供比对**的 test 文件（不进训练路径）后指过来。
+  decontamination:
+    reference_files:
+      - ${PTB_DECONTAM_REF:data/benchmarks/limo_eval/gsm8k/test.jsonl}
+    ngram: 13
+    fields: []
+    max_rate: 0.02
 
 # Phase-2 / Tier-2：单卡全量 SFT + 官方 evaluate.py（只取聚合 accuracy）
 trainer:
+  # posttrainbench_sft_eval.py 的 _INSTRUCTION_KEYS / _OUTPUT_KEYS 首选键。
+  # 注意它与 llamafactory_math_sft_eval.py 的别名表并不相同（例如 solution 只有前者认），
+  # 所以契约按脚本逐份声明，不做全局默认。
+  dataset_schema:
+    instruction: str
+    output: str
   train_python: ${PTB_TRAIN_PYTHON:/workspace/xiaqifeng/miniconda3/envs/df-train/bin/python}
   eval_python: ${PTB_EVAL_PYTHON:/workspace/xiaqifeng/miniconda3/envs/df-eval/bin/python}
   # base-model / ptb-task-dir 由桥接脚本从 env（PTB_BASE_MODEL / PTB_TASK_DIR）读取，
   # 故这里不放进命令（避免 env 未设时展开成空串顶掉后一个 flag）。框架会自动追加 --dataset/--output。
+  #
+  # ★ dev ⊂ test（已知重叠，刻意维持现状）：官方 evaluate.py 没有独立的 dev 池，dev 与终评
+  #   都评在同一份 benchmark 题池上（gsm8k = HF openai/gsm8k 的 test split），而 inspect_ai
+  #   的 --limit N 走 slice(0, N)，是确定性前 N 条。于是 --limit 150 是 --limit -1 的前缀子集。
+  #   影响面：搜索期用 tier1 打分、完全不接触 benchmark，所以 MCTS 不会直接优化终评集；重叠只
+  #   作用在「从 top-3 候选里挑 1 个」这一步。后果是终评分偏乐观（150/1319≈11% 的题参与过选模），
+  #   且 3 选 1 的排序不是独立样本。自己看趋势够用，对外报数须一并说明。
+  #   要彻底不相交需改评测路径（详见 docs/posttrainbench_adaptation.md）。
+  #
+  # 本配置**不继承** default.yaml（load_config 只读单份文件），两边的差异都得手工对齐。
+  #   - trainer.dev_set：对 PTB 不适用。物化 dev 需要评测脚本能接 --dev-set，而官方 evaluate.py
+  #     写死读 benchmark 自己的题池，指不到外部文件。
   dev_eval_cmd: python scripts/posttrainbench_sft_eval.py --mode dev --dev-limit ${PTB_DEV_LIMIT:150} --benchmark ${PTB_BENCHMARK:gsm8k}
   test_eval_cmd: python scripts/posttrainbench_sft_eval.py --mode test --benchmark ${PTB_BENCHMARK:gsm8k}
   timeout_sec: 1200            # 流水线执行（纯数据合成，探针 200 条）超时
   train_timeout_sec: 5400      # 单次 Tier-2（4000 重产的全量 SFT + dev 评测）超时
-  dispatch: local
 
 diagnostic:
   max_bad_cases: 30            # 本适配下 Phase-2 诊断关闭（无 bad_cases），此项无效
-
-# 数据池关闭（本适配不产副产品池）
-data_pool:
-  enabled: false

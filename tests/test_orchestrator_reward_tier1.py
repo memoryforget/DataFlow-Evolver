@@ -6,7 +6,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
 
-from dataflow_evolver.core.baseline import REWARD_ABSOLUTE, RewardPolicy
 from dataflow_evolver.core.schemas import TaskProfile, TrainResult
 from dataflow_evolver.core.tree_manager import TreeManager
 
@@ -57,7 +56,6 @@ def test_review_mode_failed_gate_penalizes_and_no_training(tmp_path):
 
 def test_train_mode_reward_is_train_score_and_trains(tmp_path):
     o = bare_orchestrator(tmp_path, reward_source="train")
-    o.reward_policy = RewardPolicy(reward_mode=REWARD_ABSOLUTE)
     o.reviewer = StubReviewer([make_review_result(passed=True, tier1=0.1)])
     o.trainer = StubTrainer([TrainResult(score=0.77, metric_name="math")])
     child = _run_one_step(o)

@@ -1,7 +1,7 @@
 """断点续跑：把 MCTS 运行状态序列化到磁盘，崩溃/中断后从上次进度继续。
 
 动机：真实跑每个节点都耗真实 API/SDK 预算；进程在第 k/N 轮挂掉若从头再来 = 重复烧钱。
-这里把【树状态 + 奖励策略 + 数据池暂存 + 进度 + TaskProfile】落盘成一个 JSON checkpoint，
+这里把【树状态 + 进度 + TaskProfile】落盘成一个 JSON checkpoint，
 每完成一轮覆盖写一次；启动时若存在则载入、从下一轮续跑。
 
 节点产物（pipeline.py / 数据集 / cache）本就落在各 node 目录，无需在此重复；这里只存
@@ -15,8 +15,6 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from dataflow_evolver.core.baseline import RewardPolicy
-from dataflow_evolver.core.data_pool import DataPool, StagedNode
 from dataflow_evolver.core.schemas import (
     BadCase,
     DiagnosticReport,
@@ -32,7 +30,8 @@ from dataflow_evolver.utils.logging import get_logger
 logger = get_logger("core.checkpoint")
 
 # v2：TaskProfile 移除 domain 字段（旧 v1 checkpoint 含 domain，恢复会失败）→ 提版本使其被安全丢弃重跑
-SCHEMA_VERSION = 2
+# v3：移除 baseline / data_pool 模块，reward_policy 与 pool 两段不再存在，root 改为 Init node
+SCHEMA_VERSION = 3
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +56,6 @@ def _node_to_dict(node: PipelineNode) -> dict[str, Any]:
         "visits": node.visits,
         "total_reward": node.total_reward,
         "dead": node.dead,
-        "baseline_dev_score": node.baseline_dev_score,
         "review_result": asdict(node.review_result) if node.review_result else None,
         "tier2_review_result": (
             asdict(node.tier2_review_result) if node.tier2_review_result else None
@@ -80,34 +78,41 @@ def _all_nodes(tree: TreeManager) -> list[PipelineNode]:
 
 def serialize(
     tree: TreeManager,
-    reward_policy: RewardPolicy,
-    pool: DataPool | None,
     completed_iterations: int,
     profile: TaskProfile,
+    dev_set_recipe: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    state: dict[str, Any] = {
+    return {
         "schema_version": SCHEMA_VERSION,
         "completed_iterations": completed_iterations,
         "step_count": tree._step_count,
         "profile": asdict(profile),
-        "reward_policy": {
-            "reward_mode": reward_policy.reward_mode,
-            "baseline_dev_score": reward_policy.baseline_dev_score,
-        },
+        # 已存节点的分数都出自这份 dev 集；续跑时换了口径就不可比（见 verify_dev_set）。
+        "dev_set": dev_set_recipe,
         "nodes": [_node_to_dict(n) for n in _all_nodes(tree)],
     }
-    if pool is not None:
-        state["pool"] = {
-            "gate_mode": pool.gate_mode,
-            "baseline_dev": pool.baseline_dev,
-            "margin": pool.margin,
-            "staged": [
-                {"node_id": s.node_id, "dev_score": s.dev_score,
-                 "path": s.path, "row_count": s.row_count}
-                for s in pool._staged
-            ],
-        }
-    return state
+
+
+def verify_dev_set(state: dict[str, Any], current_recipe: dict[str, Any] | None) -> None:
+    """续跑前核对 dev 集口径；不一致则抛异常。
+
+    `dev_set.materialize` 只能发现 workspace 里遗留的 manifest 与本次配置不符；若 workspace
+    的 eval 目录被清掉，它会心安理得地重建一份新题集，而 checkpoint 里的旧节点分数是在老题集
+    上得到的——两批分数混在一棵树里比较，MCTS 的排序就是错的，且没有任何迹象。
+    """
+    recorded = state.get("dev_set")
+    if recorded is None and current_recipe is None:
+        return
+    if recorded is None:
+        logger.warning("checkpoint 未记录 dev 集口径（旧版本落盘），跳过核对。")
+        return
+    if recorded != current_recipe:
+        raise ValueError(
+            "checkpoint 里的 dev 集口径与本次配置不一致，续跑会把两批不可比的分数混进同一棵树。\n"
+            f"  checkpoint：{recorded}\n"
+            f"  本次配置：  {current_recipe}\n"
+            "要么改回原配置续跑，要么换一个 checkpoint 路径从头跑。"
+        )
 
 
 def write(path: str, state: dict[str, Any]) -> None:
@@ -140,11 +145,6 @@ def read(path: str) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 def restore_profile(state: dict[str, Any]) -> TaskProfile:
     return TaskProfile(**state["profile"])
-
-
-def restore_reward_policy(state: dict[str, Any]) -> RewardPolicy:
-    rp = state["reward_policy"]
-    return RewardPolicy(reward_mode=rp["reward_mode"], baseline_dev_score=rp["baseline_dev_score"])
 
 
 def _load_node_code(agent_root: str | None, node_id: int, pipeline_filename: str) -> str:
@@ -208,7 +208,6 @@ def restore_tree(
         node.visits = nd["visits"]
         node.total_reward = nd["total_reward"]
         node.dead = nd.get("dead", False)
-        node.baseline_dev_score = nd["baseline_dev_score"]
         node.review_result = _review_from_dict(nd["review_result"])
         # .get()：旧 checkpoint 没有这个键，续跑不应因此报错
         node.tier2_review_result = _review_from_dict(nd.get("tier2_review_result"))
@@ -237,18 +236,4 @@ def restore_tree(
     for nid in sorted(built):
         if built[nid].config is not None:
             tree.global_memory.update(built[nid])
-    reseed_id_counter(max(built) + 1 if built else 1)
-
-
-def restore_pool(state: dict[str, Any], pool: DataPool) -> None:
-    pd = state.get("pool")
-    if not pd:
-        return
-    pool.gate_mode = pd["gate_mode"]
-    pool.baseline_dev = pd["baseline_dev"]
-    pool.margin = pd["margin"]
-    pool._staged = [
-        StagedNode(node_id=s["node_id"], dev_score=s["dev_score"],
-                   path=s["path"], row_count=s.get("row_count", 0))
-        for s in pd["staged"]
-    ]
+    reseed_id_counter(max(built) + 1 if built else 0)

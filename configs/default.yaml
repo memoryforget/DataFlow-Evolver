@@ -4,7 +4,11 @@
 project:
   workspace_dir: ./workspace
   agent_root: ./workspace/_agent_root      # Agent SDK 的 cwd；内含 .claude/skills + dataflow 源码副本
-  seed_data: ./data/seed.jsonl             # 种子样例数据（jsonl）
+  # 输入语料目录：**放了数据就是 corpus-grounded 合成**（流水线入口指向语料，在其之上加工），
+  # 目录空/不存在就是 from-scratch 合成（凭模型知识从零合成）。范式由目录内容决定，无需另设开关。
+  input_dir: ./input
+  input_entry: ""                          # 目录内多个数据文件时显式指定入口（相对 input_dir）；留空=自动选
+  data_links_dir: ""                       # 外部数据集下载目录（跨节点共享）；留空=<workspace>/data_links
 
 # 非-SDK 模型后端
 llm:
@@ -31,8 +35,7 @@ agent_sdk:
   model: claude-opus-4-8
   effort: max                              # Claude 努力/思考档位 low|medium|high(默认)|xhigh(仅Opus4.7)|max；
   permission_mode: bypassPermissions       # 无头自动化
-  setting_sources: [project]               # 从 cwd/.claude 加载技能
-  skills: [dataflow-dev]                    # 经 setting_sources(project)+.claude/skills 自动发现；generating-dataflow-pipeline 不再强制使用
+  setting_sources: [project]               # 从 cwd/.claude 加载技能；技能由 SDK 自动发现，无需在此枚举
   max_turns: 50                            # 单次 SDK 运行最大轮数（MCP发现+读源码+写pipeline+自测修复，需要更多轮次）
   pipeline_filename: pipeline.py           # 约定：Agent 把流水线写到 <node_id>/pipeline.py
   # 瞬时错误（429/5xx/连接/超时）鲁棒性：指数退避重试 + 单次运行超时
@@ -40,26 +43,54 @@ agent_sdk:
   retry_base_delay: 10                     # 首次重试等待秒数，之后指数递增（10/20/40s...）
   run_timeout_sec: 1800                    # 单次 SDK 运行超时(秒)；超时按可重试错误处理，避免挂起时无限阻塞主循环
   resume_on_retry: true                    # 重试时若上次已建立会话则 resume 续跑(不重跑已完成的 turn)；上次没建起会话则全新重跑
+  # 外部数据搜索（默认关闭）：开启后挂载 dataset-search MCP，Agent 可在 HuggingFace 上
+  # 搜索/预览/下载真实数据集到 project.data_links_dir，并在流水线里读取。
+  # 是否允许引入外部数据属于实验设定的一部分，故须显式打开；开启时务必同时配好
+  # review.decontamination.reference_files，否则很容易把 benchmark 的镜像数据集拉进来。
+  external_data: false
+  discovery: true                          # external_data 打开时是否连带挂 data-discovery（找线索）
   # 工具：用 claude_code 预设放开全部内置工具（见 llm/agent_sdk.py），不再设白名单
   # 系统提示：保留 claude_code 预设，仅 append DataFlow 指令；可用 system_prompt_append 覆盖该 append 文本
+
+# dataset-search MCP：取数（HuggingFace + ModelScope）。仅在 agent_sdk.external_data: true 时生效。
+# 注意：这些工具是 in-process MCP，跑在编排器自己的进程里，**读不到 agent_sdk.env**
+# （那一段是发给 Agent SDK 子进程的）。连接信息只能配在这里或直接 export。
+dataset_search:
+  endpoint: ""                    # HF_ENDPOINT；国内直连不通时填镜像，如 https://hf-mirror.com
+  token: ""                       # HF_TOKEN；gated 数据集需要。留空=沿用环境变量/本地登录态
+  cache_dir: ""                   # HF_HOME；留空=沿用环境（注意 datasets 的缓存也会占盘）
+  max_download_mb: 2048           # 单份数据集落盘上限；触顶截断（保留 split 头部）并在 meta 标明
+  modelscope_endpoint: ""         # MODELSCOPE_ENDPOINT；留空=https://modelscope.cn
+  modelscope_token: ""            # MODELSCOPE_API_TOKEN；仅私有/受限数据集需要，公开数据集免登录
+  # 下载默认取**整个 split**：取多少、怎么采样、按什么过滤本就是流水线该做的决策，也正是被
+  # 搜索的对象；固化在工具里等于替搜索先做了一个它无从推翻的选择。只取单个 split 而非整仓库，
+  # 是为了不把 test split 一起拖进来。
+  # ModelScope 侧需装 external-data 依赖组；没装时那三个工具返回说明，不影响 HF 侧。
+
+# data-discovery MCP：只找线索、不取数（网页 / GitHub / arXiv）。随 external_data 一起挂载，
+# 可用 agent_sdk.discovery: false 单独关掉。凭据缺失只让对应那一个工具不可用，另外两个照常。
+discovery:
+  serper_api_key: ""              # search_web 用（付费）；留空=该工具返回说明，改用内置 WebSearch
+  github_token: ""                # 留空=匿名搜索，GitHub 限流 10 次/分钟
+  # search_papers 走 arXiv 公开 API，不需要任何凭据。
 
 # 数据生成规模：注入生成 prompt，指导算子产出量（合成式据此设 num_samples，转换式控采样/过滤）
 generation:
   target_samples: 800                      # 目标产出条数（0=不指定）；按下游 SFT 需求调，Condor 建议 <5000
+  # 训练前把数据切齐到 target_samples 条（默认 true）。训练配方在框架外冻结，总优化步数
+  # 正比于条数，不切齐则多产数据的节点白拿更多梯度步数，分数不再只反映数据质量。
+  # 关掉它等于把"数据量"也放进搜索空间——想做"更多数据是否更好"的消融时才关。
+  enforce_target_samples: true
   # probe_samples:（PostTrainBench 两段式新增，可选）搜索期每节点探针产出条数（如 200）。
   #   设置后 search.reward_source=review 时，搜索执行注入 DF_TARGET_SAMPLES=probe_samples，
   #   终选重产注入 DF_TARGET_SAMPLES=target_samples（同一 pipeline.py 复用两档规模）。默认未设=沿用 target_samples。
 
-# 强基线锚点（相对增益奖励 / 池阈值；见 docs/design-decisions.md §2）
-# ✅ 已接入 main.py。锁定决策：Δ=0（node>baseline 即正向）、seed=42、只跑一次基线。
-# enabled=true 时启动会先跑一次基线（消耗真实 API 预算），故默认关闭。
-baseline:
-  enabled: false                  # true=warm start（baseline 作 root + Relative Gain 奖励 + τ≥基线）；false=冷启动（虚拟空根，供独立性消融）
-  reward_mode: absolute           # 说明：实际模式由 enabled 决定（暖=relative_to_baseline / 冷=absolute）；此项仅文档化意图
-  margin: 0.0                     # Δ：node_dev − baseline_dev > margin 视为正向（已定 0）
-  seed: 42                        # 固定随机种子，基线只跑一次得稳定 baseline_dev_score
-  # 基线产物的评测复用 trainer.dev_eval_cmd；换领域时须让基线在同一目标领域产数据
-  baseline_pipeline: workspace/_agent_root/dataflow/statics/pipelines/api_pipelines/reasoning_math_baseline_pipeline.py
+# Init node（node_0 = 树根）的启动方式，三档对应 docs/design-decisions.md §5.2 的独立性消融。
+# 与其余节点同口径评分、无特殊地位；「相对初始流水线提升多少」在报告层用 score − node_0_score 算。
+# 两项都可被命令行 --init-code / --init-instruction 覆盖。
+init:
+  reference_pipeline: ""          # 参考实现路径：给了就走「忠实改写」（不改数据处理逻辑，只搬到本框架契约下）
+  instruction: ""                 # 自然语言构建指令；两项都留空 = 让 Agent 自主设计一条最小可行流水线
 
 # MCTS 树搜索
 search:
@@ -90,22 +121,66 @@ search:
 
 # Phase-1 快反馈：数据评审
 review:
-  schema_threshold: 0.6
-  relevance_threshold: 0.6
-  sample_size: 40
-  # 以下为 PostTrainBench Tier-1 升级新增（可选；不设=仅用 schema/relevance 两维，行为不变）：
-  # hard_metrics: true            # 是否启用硬指标惩罚（dup_rate/null_rate/parse_valid_rate 扫全份文件）
-  # sample_seed:                  # 蓄水池采样随机种子（复现用；不设=非确定）
-  # weights:                      # 五维复合分固定权重（缺项回退默认；下为默认值）
-  #   correctness: 0.35
-  #   relevance: 0.20
-  #   difficulty: 0.15
-  #   diversity: 0.15
-  #   schema: 0.15
-  # collapse_dup_rate: 0.5        # 终选安全阀：放大重产后 dup_rate 超过此值判质量塌陷（跳过用次优）
-  # collapse_null_rate: 0.3       # 同上，null_rate 上限
-  # collapse_parse_valid_rate: 0.7  # 同上，parse_valid_rate 下限
-  # collapse_tier1_frac: 0.6      # 同上，tier1 相对探针回退到此比例以下判塌陷
+  # 评审只有**五个维度**（correctness / relevance / difficulty / diversity / schema），
+  # 它们有两种互不相同的用法，别把下面的 *_threshold 当成额外维度：
+  #   ① 连续分：五维按 weights 加权成 llm_composite，再乘硬指标惩罚 = tier1_score。
+  #      review 模式下 tier1_score 就是 MCTS 的 reward。
+  #   ② 通过门槛：passed 是布尔量，决定要不要触发自修正重来、要不要往下走训练。
+  #      只有 schema 和 relevance 两维设门槛——字段对不上或跑题的数据，另外三维再高也没法用；
+  #      而正确性/难度/多样性是质量梯度，低了该按比例扣分，不该一票否决。
+  #
+  # 与 configs/posttrainbench_gsm8k.yaml 同口径。注意：五维打分与硬指标**一直是开着的**
+  # （ReviewAgent 的代码默认 hard_metrics=True、weights=下面这五个值、sample_size=80），
+  # 此处写全只是让口径显式可见、便于两份配置对照，不改变行为。
+
+  # ---- ① 连续分 ----
+  weights:                        # 五维复合分固定权重
+    correctness: 0.35
+    relevance: 0.20
+    difficulty: 0.15
+    diversity: 0.15
+    schema: 0.15
+  hard_metrics: true              # 硬指标惩罚（dup_rate/null_rate/parse_valid_rate 扫全份文件）
+
+  # ---- ② 通过门槛（另有两条硬否决：null_threshold 与下面的去污染 max_rate）----
+  schema_threshold: 0.6           # schema 维低于此值判不通过
+  relevance_threshold: 0.6        # relevance 维低于此值判不通过
+  # trainer.dataset_schema 的关键字段空缺率一票否决线。字段名整体对不上时空缺率≈1，
+  # 在这里拦下比等训练脚本报「数据集为空或字段不匹配」便宜一整轮 GPU。
+  null_threshold: 0.5
+
+  # ---- 抽样 ----
+  sample_size: 80
+  # 固定蓄水池采样种子。不设时（旧行为）连"同一份未改动文件的两次重评"抽样都不同，
+  # 于是 passed 门槛带纯 RNG 噪声：边界节点可能靠换抽样而非靠修好数据通过。
+  # 代价是固定切片有系统性偏差，抽 80 条可接受。硬指标扫全份文件，不受采样影响。
+  sample_seed: 42
+  # 终选安全阀：仅 search.reward_source=review 的 Tier-2 阶段生效（train 模式下 reward 已是
+  # 真分，不走放大重产那条路）。留在这里是为了切换 reward_source 时不必再补一遍。
+  collapse_dup_rate: 0.5          # 放大重产后 dup_rate 超过此值判质量塌陷（跳过用次优）
+  collapse_null_rate: 0.3
+  collapse_parse_valid_rate: 0.7
+  collapse_tier1_frac: 0.6        # tier1 相对探针回退到此比例以下判塌陷
+  # 去污染（见 core/decontamination.py）：合成数据与评测基准测试集的 n-gram 重合检测。
+  # 搜索的目标函数就是下游分数，把测试题混进训练集是提分最省力的路径——不量化扣分，MCTS 迟早
+  # 会走过去。开了外部数据搜索后尤其要配（Hub 上大量数据集本身就是 benchmark 的镜像）。
+  # 下面列的就是 test_eval_cmd 终评用的那 11 份题集；dev 题集由框架物化后自动并入，不必重复写。
+  decontamination:
+    reference_files:              # benchmark 测试集文件（jsonl/json/txt）；留空=不检测
+      - data/benchmarks/limo_eval/gsm8k/test.jsonl
+      - data/benchmarks/limo_eval/math/test.jsonl
+      - data/benchmarks/limo_eval/aime/test.jsonl
+      - data/benchmarks/limo_eval/amc/test.jsonl
+      - data/benchmarks/limo_eval/olympiadbench/test.jsonl
+      - data/benchmarks/limo_eval/cn_math_2024/test.jsonl
+      - data/benchmarks/limo_eval/gaokao/test.jsonl
+      - data/benchmarks/limo_eval/kaoyan/test.jsonl
+      - data/benchmarks/limo_eval/grade_school_math/test.jsonl
+      - data/benchmarks/limo_eval/minerva/test.jsonl
+      - data/benchmarks/limo_eval/gpqa/test.jsonl
+    ngram: 13                     # 归一化后的 n-gram 长度；短文本退回整串精确匹配
+    fields: []                    # 参与比对的字段；留空=该行所有字符串字段
+    max_rate: 0.02                # 污染率上限，超过即判 passed=False（低于上限只按比例扣分）
 
 # Phase-2 真实训练：外部脚本桥接
 trainer:
@@ -115,39 +190,36 @@ trainer:
   # eval 环境的 python 路径（df-eval；负责 vLLM benchmark 评测）
   # 留空则在 train 进程内直接评测（仅适合同环境开发/调试）
   eval_python: /vepfs-mlp2/c20250602/500050/lh/xqf/miniconda3/envs/df-eval/bin/python
+  # 下游训练脚本实际接受的字段名——流水线产出的**权威契约**，会覆盖 TaskProfiler 的推断，
+  # 并作为评审硬门槛（字段对不上在训练前就判不通过，见 review.null_threshold）。
+  # 留空 = 让 LLM 自行设计字段名，对不上要到训练阶段才炸，且报错看不出根因是字段名。
+  # 取值须与训练脚本的取字段逻辑一致：llamafactory_math_sft_eval.py 与
+  # posttrainbench_sft_eval.py 都以 instruction/output 为首选键。
+  dataset_schema:
+    instruction: str                # 题面 / 指令
+    output: str                     # 参考解答（含推理过程）
+
+  # dev 题集由框架物化，评测脚本不参与决策（见 core/dev_set.py）。启动时按
+  # (source_sha, seed, size) 固定成 workspace/eval/dev.jsonl 并以 --dev-set 下传：
+  #   - 所有节点保证评在同一批题上（奖励是节点之间比出来的，口径漂移会静默毁掉排序）；
+  #   - 落盘后 dev 才能进去污染参考集——dev 是搜索直接优化的目标，把 dev 题混进合成数据
+  #     比混 test 更能刷分，这一条会自动接线，不需要在下面的 reference_files 里重复配；
+  #   - 口径进 checkpoint，续跑时对不上直接报错。
+  # ★ source 留空 = 不物化 = 不下传 --dev-set，而 llamafactory_math_sft_eval.py --mode dev
+  #   会**直接报错**（在 SFT 之前，不烧 GPU）。这是有意的：脚本一旦有「自己挑题」的退路，
+  #   框架这套口径就形同虚设。要跑 dev 就得把题集来源明确写在这里。
+  dev_set:
+    # 源文件不入库，需自行准备（见 data/README.md）。
+    source: data/math_train.jsonl   # MATH competition train（7500 条公开训练语料，非 benchmark test）
+    size: 500                       # 从 source 里抽多少条；0 = 全量
+    seed: 42
   # 防数据泄露纪律（见 docs/design-decisions.md §3）：
   #   dev：仅给 MCTS 当奖励信号，允许被「刷」；test：全程对 loop 不可见，仅终评一次。
-  dev_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode dev     # Full SFT + MATH train 评测（默认抽样 500 题，MATH_TRAIN_SAMPLE_SIZE=0 跑全量 7500）
+  dev_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode dev     # Full SFT + 上面物化的 dev 题集
   test_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode test   # 终评：完整 benchmark suite（GSM8K/AIME/MATH500/AMC23/OlympiadBench/CHMath/Gaokao/Kaoyan/GradeSchool/MinervaMath/GPQA）
   timeout_sec: 7200                                             # 流水线执行（纯数据合成）超时=2h；4算子约30min，5算子(交叉验证+精修)会超1h，留足余量
-  train_timeout_sec: 28800                                      # dev/test 评测（含内层 Full SFT 训练 6h + benchmark suite 评测）超时=8h
-  # 训练调度方式：
-  #   local（默认）：编排器在本机拉起训练子进程，阻塞等待（单机）。
-  #   ssh：编排器只在 node0 拉起一次训练脚本；脚本内部完成 convert_dataset、
-  #        经免密 SSH 拉起 node1 worker、双机 torchrun 训练，以及 rank0 单机评测。
-  dispatch: ssh
-  # dispatch=ssh 时的双机参数：
-  ssh:
-    node1_host: "30300"          # node1 的 SSH 目标（如 user@10.0.0.2 或 ~/.ssh/config 里的别名）
-    master_addr: 198.19.158.245       # node0 对 node1 可路由的 IP（torchrun rendezvous 主地址）
-    master_port: 29500
-    nnodes: 2
-    gpus_per_node: 8                    # 每机 GPU 数（脚本内 NPROC_PER_NODE=gpus_per_node*nnodes//nnodes）
-    remote_cwd: /vepfs-mlp2/c20250602/500050/lh/xqf/DataFlow-Evolver         # node1 上项目根目录（共享 FS 通常与本机同路径）；留空=编排器 cwd
-    ssh_opts: ""                        # 额外 ssh 选项，如 "-i ~/.ssh/id_rsa -p 22"
+  train_timeout_sec: 28800                                      # dev/test 评测（含内层 Full SFT 训练 + benchmark suite 评测）超时=8h
 
 # Phase-2 慢反馈：诊断
 diagnostic:
   max_bad_cases: 30
-
-# 全局数据池（可选副产品；与 MCTS 奖励解耦，见 docs/design-decisions.md §4）
-# ✅ 已接入 main.py：运行期暂存 → dump 前统一[门槛筛→去重→占比裁剪]。
-# 门槛：暖启动 node_dev > baseline_dev+margin（严格）；冷启动 node_dev ≥ max(本轮分位数, score_threshold)。
-data_pool:
-  enabled: true                  # 已接入 main.py：true=启动即建 DataPool 累积高质量数据；置 false 关闭（做独立性消融/省算力时）。开启前建议先做受控实验（等量对比+多样性量化）
-  score_threshold: 0.0            # 冷启动绝对地板（与分位数取 max；0=不设地板，纯靠分位数+review.passed）
-  quantile: 0.5                   # 冷启动分位数门槛（0.5=中位数；尺度无关，跨 benchmark 不重调）
-  max_pool_fraction_per_pipeline: 0.3   # 单 pipeline 占池上限 30%；来源数 <⌈1/f⌉(=4) 时不生效
-  max_rows_per_pipeline: 0        # 可选叠加绝对行数上限，0=不限
-  dedup: content_hash             # 已定：精确去重起步。embedding 语义去重推后（与 bad-case 上采样冲突，未实现）
-  output_path: ./workspace/data_pool.jsonl

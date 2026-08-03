@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+from dataflow_evolver.core.input_corpus import InputCorpus
 from dataflow_evolver.core.schemas import DiagnosticReport, ReviewResult, TaskProfile
 
 # ---------------------------------------------------------------------------
@@ -16,8 +17,7 @@ PROFILER_PROMPT = """你是一名数据工程任务分析师。根据下面的�
 任务描述：
 {task_description}
 
-{sample_block}
-
+{sample_block}{schema_block}
 请只输出一个 JSON 对象，字段如下：
 {{
   "task_description": "对任务的精炼复述",
@@ -28,12 +28,29 @@ PROFILER_PROMPT = """你是一名数据工程任务分析师。根据下面的�
 不要输出 JSON 以外的任何内容。"""
 
 
-def build_profiler_prompt(task_description: str, sample_text: str | None = None) -> str:
+def build_profiler_prompt(
+    task_description: str,
+    sample_text: str | None = None,
+    fixed_schema: dict | None = None,
+) -> str:
+    """`fixed_schema` 非空时，schema 由下游训练脚本决定，不再让模型自行设计字段名。
+
+    其余字段（quality_criteria / downstream_task）仍由模型产出，但会围绕这份 schema 展开——
+    所以是写进 prompt 而不是只在解析后覆盖：让模型看见真正的字段名，它给的质量要点才对得上。
+    """
     sample_block = ""
     if sample_text:
         sample_block = f"样例数据（节选）：\n{sample_text}\n"
+    schema_block = ""
+    if fixed_schema:
+        schema_block = (
+            f"\n【schema 已固定】下游训练脚本只接受这组字段，`target_schema` 必须原样输出它，"
+            f"不要改名、增删或换同义词：\n{fixed_schema}\n"
+        )
     return PROFILER_PROMPT.format(
-        task_description=task_description, sample_block=sample_block
+        task_description=task_description,
+        sample_block=sample_block,
+        schema_block=schema_block,
     )
 
 
@@ -44,22 +61,21 @@ PIPELINE_AGENT_PROMPT = """为下述目标编写一条完整、可直接运行�
 
 Target: {target}
 Expected outputs: {expected_outputs}
-Entry file（空输入）: {entry_path}
-
+Entry file: {entry_path}
+{input_block}
 要求：
 1. 先输出算子决策摘要，再生成完整流水线代码。摘要将原样写入 `{node_dir}/decision.json`，\
 **键名必须严格按下面这份 schema**（框架按键名读取，改名/换同义词会导致信息丢失）：
 {{"ops": [{{"name": "算子类名", "purpose": "这一步做什么（一句话）", "params": {{}}}}, ...],
- "field_flow": "Empty → 字段A → 字段A + 字段B → ...",
+ "field_flow": "入口字段（纯生成、无入口语料时写 Empty；以外部数据集为入口时写它的真实字段） \
+→ 字段A → 字段A + 字段B → ...",
  "reason": "整体设计理由"}}
 其中 `ops` 必须是**对象数组**且按流水线执行顺序列全每一个算子（含自定义算子），\
 每个都要给 `purpose`；不要写成 `operators`、`description`、`design_rationale` 等其它键名。
 2. 在 `{node_dir}/operators/` 目录下为每个处理步骤编写独立的自定义算子文件（每个算子一个 .py）。\
 算子必须继承 OperatorABC（`from dataflow.core import OperatorABC`），实现 run() 方法。\
 然后把流水线主文件写入 `{node_dir}/pipeline.py`，决策 JSON 写入 `{node_dir}/decision.json`。
-3. 这是【从零合成（from-scratch synthesis）】任务：流水线不依赖任何输入语料。\
-`first_entry_file_name` 必须指向上面的 Entry file（一个空 jsonl，仅为满足 DataFlow 的 first_entry 形参）；\
-请用自定义的**生成类算子**凭模型知识合成数据。
+3. {paradigm_rule}
 4. 目标 schema（下游期望字段及类型）：{target_schema}
 5. 流水线里的 LLM serving 必须用 `APILLMServing_request`，并严格使用下列参数：
 {llm_block}
@@ -69,7 +85,7 @@ Entry file（空输入）: {entry_path}
 `pipeline.compile()` → `if os.environ.get('DF_COMPILE_ONLY'): sys.exit(0)` → `pipeline.forward()`。\
 然后运行 `DF_COMPILE_ONLY=1 python {node_dir}/pipeline.py`。如果 compile() 报 KeyError/ImportError/TypeError，\
 修复后重跑，直到 compile 通过。
-{recommendation_block}{size_block}{parent_block}{diagnostic_block}{review_block}{sibling_block}{memory_block}
+{recommendation_block}{size_block}{external_data_block}{init_block}{parent_block}{diagnostic_block}{review_block}{sibling_block}{memory_block}
 约束：这是无头自动化运行，禁止触发任何交互式询问（AskUserQuestion）或 git/gh 子流程。\
 写自定义算子时，可用 MCP get_operator_detail 查看 reasoning 类别的已有算子源码作为编码风格参考。"""
 
@@ -105,9 +121,140 @@ PIPELINE_SELFCORRECT_PROMPT = """上一次生成的流水线 `{node_dir}/pipelin
 约束：无头运行，禁止交互式询问与 git/gh 子流程。只修复问题、保持流水线目标不变。"""
 
 
+# 输入范式共四种组合：input/ 有没有语料 × 外部取数工具开没开。后者必须参与判定——
+# 只按 input/ 判定的话，「没有语料」会被写成「不依赖任何输入、凭模型知识合成」，
+# 而这句编号硬要求会直接盖掉靠后那段自称"可选"的外部数据说明，Agent 于是从不去取数。
+SCRATCH_PARADIGM_RULE = (
+    "这是【从零合成（from-scratch synthesis）】任务：input/ 里没有语料，外部取数也未开放，"
+    "流水线不依赖任何输入。`first_entry_file_name` 必须指向上面的 Entry file（一个空 jsonl，"
+    "仅为满足 DataFlow 的 first_entry 形参）；请用自定义的**生成类算子**凭模型知识合成数据。"
+)
+
+SCRATCH_WITH_EXTERNAL_PARADIGM_RULE = (
+    "这是【无输入语料（from-scratch synthesis）】任务：input/ 里没有语料。但下面的"
+    "【外部数据搜索】工具是**开着的**，所以「凭模型知识生成」不是唯一选项——数据从哪来"
+    "是你要做的设计决策。下面几条都合法：\n"
+    "   (a) **取真实数据打底**：用 dataset-search / data-discovery 找到合适的公开数据集，"
+    "`download_dataset` 落盘后把 `first_entry_file_name` 指向它返回的**绝对路径**，"
+    "再用算子把它规整成目标 schema（字段映射、改写、蒸馏、过滤、配对皆可）。"
+    "真实语料的多样性通常好过纯生成，也不容易塌缩成模型自己的口癖。\n"
+    "   (b) **凭模型知识合成**：`first_entry_file_name` 指向上面的 Entry file"
+    "（一个空 jsonl，仅为满足 DataFlow 的 first_entry 形参），用生成类算子从零产出。\n"
+    "   (c) **混合**：以真实语料为种子，再用生成类算子增广。\n"
+    "   请在 decision.json 的 reason 里写明选了哪条以及为什么。"
+)
+
+GROUNDED_PARADIGM_RULE = (
+    "这是【语料 grounded 合成（corpus-grounded synthesis）】任务："
+    "`first_entry_file_name` 必须指向上面的 Entry file——那是用户提供的真实语料。"
+    "流水线要**在这份语料之上**加工：抽取、改写、增强、蒸馏、过滤、配对皆可，"
+    "但产出必须能追溯到输入，不要绕开它另起一套凭空生成。"
+    "语料字段与目标 schema 不一致时，用算子做字段映射/转换，而不是丢掉输入。"
+)
+
+GROUNDED_WITH_EXTERNAL_PARADIGM_RULE = (
+    GROUNDED_PARADIGM_RULE
+    + "\n   下面的【外部数据搜索】工具也是开着的：可以再引入公开数据集作为**补充**"
+    "（补覆盖面、加多样性），在自定义算子里按下载返回的绝对路径读入即可。"
+    "但 input/ 的语料是本次任务的主语料，补充不等于替换——不要用外部数据把它顶掉。"
+)
+
+
+def _external_data_block(data_links_dir: str) -> str:
+    """外部数据搜索工具的用法与纪律（仅在 agent_sdk.external_data 打开时注入）。
+
+    纪律里最关键的是「下载即落 data_links/、pipeline 里写绝对路径」：Agent 下载的文件若只
+    存在于它当时的工作目录假设里，流水线在子进程里重跑就会找不到——而那次失败看起来会像
+    是流水线代码的问题，很难追到真正原因。
+    """
+    return (
+        "\n【外部数据搜索（可选）】除了凭模型知识合成，你还可以引入真实的公开数据集。\n"
+        "  **dataset-search MCP（取数）**，HuggingFace 侧按此顺序用：\n"
+        "  1. `search_datasets(query)` 按关键词找候选（Hub 搜索**不支持语义匹配**，关键词要具体）；\n"
+        "  2. `inspect_dataset(dataset_id)` 看 license / configs / splits，**先确认 license 允许使用**；\n"
+        "  3. `preview_dataset(dataset_id, config, split)` 取几行真实数据，确认字段与风格对得上目标 schema；\n"
+        "  4. `download_dataset(dataset_id, config, split)` 把**整个 split** 落成 jsonl，返回**绝对路径**。\n"
+        "  ModelScope 侧有对应的 `search_ms_datasets` / `preview_ms_dataset` / `download_ms_dataset`，"
+        "契约完全一致。**HuggingFace 连不上时改用它**，找中文语料时也优先考虑。\n"
+        "  **data-discovery MCP（只找线索、不取数）**：`search_web`（网页）、`search_github`"
+        "（数据集仓库）、`search_papers`（arXiv）。Hub 的关键词搜索找不到你想要的东西时用它们——"
+        "很多语料是先在论文或博客里被提到，你才知道它叫什么。拿到名字后仍要回上面的 download 工具取数。\n"
+        f"  下载的文件统一落在共享目录 {data_links_dir}（跨节点复用）。在流水线里**必须用返回的"
+        "绝对路径**读取它（作为 FileStorage 的 first_entry，或在自定义算子里显式读入），"
+        "不要假设相对路径——流水线是在独立子进程里跑的。\n"
+        "  **不要传 `max_rows` 去限制下载量**：默认全量下载是刻意的——取多少条、怎么采样、按什么"
+        "过滤，是你的流水线该做的决策（也是会被评估的部分），在算子里做才可控、可复现、可被后续"
+        "节点改进。`max_rows` 只保留 split 的**前 N 行**，不是随机采样：数据集若按难度/来源/时间"
+        "排过序，你拿到的就是一段有偏样本。同理，若返回的 meta 里 `complete` 为 false（体积触顶被"
+        "截断），说明这份文件也只是头部，据此判断数据源风格时要留意。\n"
+        "  **所有外部数据必须经这些工具获取**：不要在流水线或算子里直接 `load_dataset(...)`、"
+        "`hf_hub_download(...)`、`requests.get(...)` 或 curl 拉取。特别注意：FileStorage 的 "
+        "`first_entry_file_name` 虽然支持 `hf:owner/name:config:split` / `ms:owner/name:split` "
+        "这种远程写法（dataflow-dev 技能里有），**这里同样不要用**——请先 download 落盘，再填返回"
+        "的本地绝对路径。工具落盘时会写 .meta.json 溯源边车（来源/许可/行数/是否完整/时间），"
+        "绕开工具取来的数据没有出处记录，无法通过数据审计。\n"
+        "  取舍提醒：引入外部数据是为了拿到模型知识之外的多样性，不是为了凑数。与目标任务分布"
+        "不一致的数据会拉低下游表现；宁可少而对，也不要多而杂。\n"
+        "  **严禁引入评测基准的测试集**（及其任何镜像/衍生版本）——那是数据泄露，会让分数失真"
+        "并使整轮实验作废。\n"
+    )
+
+
+# 外部数据工具未挂载时的对应纪律。少了这段，"不许联网取数据"这条设定就只存在于配置里，
+# prompt 对 Agent 只字未提，而它的内置工具（Bash/WebFetch）和 datasets 库一直都在手边。
+NO_EXTERNAL_DATA_RULE = (
+    "\n【外部数据：本轮不启用】流水线只能用上面的输入语料与模型自身知识，"
+    "**不要联网拉取任何外部数据**（`load_dataset(...)` 远程数据集、`hf_hub_download`、"
+    "`requests`/curl 下载，以及 FileStorage 的 `hf:` / `ms:` 远程 first_entry 写法，一律禁止）。"
+    "这是实验设定的一部分：本轮要衡量的是流水线设计本身，混入外部语料会让结果不可比。"
+    "对 LLM serving API 的调用不受此限。\n"
+)
+
+
+def _paradigm_rule(grounded: bool, external: bool) -> str:
+    """输入范式（第 3 条要求）：由 input/ 有没有语料（见 core/input_corpus.py）
+    与外部取数工具开没开共同决定。
+
+    两个维度都要看：「input/ 为空」只说明用户没提供语料，不代表这条流水线就该凭空生成——
+    开了外部取数时，去 Hub 上取一份真实语料再规整成目标 schema 同样合法，往往还更好。
+    """
+    if grounded:
+        return GROUNDED_WITH_EXTERNAL_PARADIGM_RULE if external else GROUNDED_PARADIGM_RULE
+    return SCRATCH_WITH_EXTERNAL_PARADIGM_RULE if external else SCRATCH_PARADIGM_RULE
+
+
+def _init_block(reference_code: str | None, instruction: str | None) -> str:
+    """Init node（node_0）专属指引，三档启动方式各渲染一段。
+
+    共同的硬约束是"简单可靠优先"：整棵搜索树都从这一个节点变异出去，起点跑不稳
+    等于整轮搜索报废，而复杂度本就该由后续变异节点按反馈逐步加上去。
+    """
+    common = (
+        "\n【初始节点（node_0）】这是整棵搜索树的起点，没有父节点可继承。后续所有变异都基于"
+        "它演化，所以**稳定跑通优先于精巧**：结构尽量简单、算子数量克制、不要预先堆叠"
+        "各种过滤与增强——那些留给后续节点按评审反馈有依据地加。\n"
+    )
+    if reference_code:
+        return common + (
+            "\n【参考实现（忠实改写）】下面是一份已有的参考实现。请把它改写成符合本框架契约的"
+            "DataFlow 流水线（算子拆分、FileStorage 路径、LLM serving 参数、decision.json 等按上述要求），"
+            "**保持其数据处理逻辑与算法取舍不变**——不要顺手做优化、不要增删处理步骤、不要改变"
+            "生成或过滤策略。这一档的用途是把参考实现原样搬到同一评测口径下，改动了就失去对照意义：\n"
+            f"```python\n{reference_code}\n```\n"
+        )
+    if instruction:
+        return common + (
+            f"\n【构建指令】请按下述指令设计这条初始流水线：{instruction}\n"
+        )
+    return common + (
+        "\n【自主设计】没有给定参考实现或指令，请你根据上面的 Target 与目标 schema 自行设计"
+        "一条最小可行的流水线：能稳定产出符合 schema 的数据即可。\n"
+    )
+
+
 def build_pipeline_prompt(
     profile: TaskProfile,
-    entry_path: str,
+    corpus: InputCorpus,
     node_dir: str,
     diagnostic: DiagnosticReport | None = None,
     memory_summary: str | None = None,
@@ -118,6 +265,10 @@ def build_pipeline_prompt(
     parent_rationale: str | None = None,
     parent_review: ReviewResult | None = None,
     siblings: list[str] | None = None,
+    is_init: bool = False,
+    init_reference_code: str | None = None,
+    init_instruction: str | None = None,
+    data_links_dir: str = "",
 ) -> str:
     # 目标产出规模：注入后让 Agent 据此设置算子参数（合成式调 num_samples / 转换式控采样过滤）。
     # 关键：产出条数必须【从环境变量 DF_TARGET_SAMPLES 运行时读取】，不要写死——这样同一份
@@ -137,12 +288,12 @@ def build_pipeline_prompt(
             f"   - 过滤/验证类算子：确保不会过度过滤导致最终产出远低于 num_samples；\n"
             f"   - 环境变量缺省时回退 {target_samples}，保证脱离编排器单独运行也能出数据。\n"
         )
-    # 父节点（暖启动时首层父为基线）pipeline.py 代码作为变异起点：
-    # 让 Agent「在父节点基础上做有的放矢的变异」，而非每次从零冷启动（见 docs/design-decisions.md §2.4）。
+    # 父节点 pipeline.py 代码作为变异起点：让 Agent「在父节点基础上做有的放矢的变异」，
+    # 而非每次从零重写。首层节点的父是 Init node，故除 Init node 自身外这段恒存在。
     parent_block = ""
     if parent_code:
         parent_block = (
-            f"\n【变异起点】下面是父节点（或强基线）已验证可运行的流水线代码。请在它的基础上做"
+            f"\n【变异起点】下面是父节点已验证可运行的流水线代码。请在它的基础上做"
             f"**针对性变异**（改进算子逻辑、调整 prompt、增删处理步骤、改参数等），目标是产出比它更优的数据；"
             f"不要原样照抄，也不要无依据地大改：\n```python\n{parent_code}\n```\n"
         )
@@ -171,7 +322,7 @@ def build_pipeline_prompt(
             f"   失败概述：{diagnostic.summary}\n"
             f"   可执行建议：\n{suggestions}\n"
         )
-    # parent_review 为 None 的情形是正常的：首层节点的父是基线/虚拟根，本就没被评审过。
+    # parent_review 恒有值（父节点必然已通过评审才可被选中扩展），None 仅作防御性兜底。
     review_block = _parent_quality_block(parent_review) if parent_review is not None else ""
     # 兄弟节点已试方向：同一父节点下要长出多个子节点，若每次 prompt 完全相同，就只能指望
     # 采样随机性撞出不同方向，等于把多次昂贵扩展浪费成一次的信息量。
@@ -211,13 +362,19 @@ def build_pipeline_prompt(
         )
     return PIPELINE_AGENT_PROMPT.format(
         target=profile.task_description,
-        entry_path=entry_path,
+        entry_path=corpus.entry_path,
+        input_block=corpus.prompt_block(),
+        paradigm_rule=_paradigm_rule(corpus.grounded, bool(data_links_dir)),
         expected_outputs=list(profile.target_schema.keys()),
         node_dir=node_dir,
         target_schema=profile.target_schema,
         llm_block=llm_block or "   （未提供具体 API 参数，沿用技能默认。）",
         recommendation_block=recommendation_block,
         size_block=size_block,
+        external_data_block=(
+            _external_data_block(data_links_dir) if data_links_dir else NO_EXTERNAL_DATA_RULE
+        ),
+        init_block=_init_block(init_reference_code, init_instruction) if is_init else "",
         parent_block=parent_block,
         diagnostic_block=diagnostic_block,
         review_block=review_block,

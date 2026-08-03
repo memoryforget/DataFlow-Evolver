@@ -6,6 +6,7 @@ I/O 契约（TODO.md §5.6）：
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -16,6 +17,7 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+from dataflow_evolver.core import train_set
 from dataflow_evolver.core.schemas import BadCase, TrainResult
 from dataflow_evolver.utils.logging import get_logger
 
@@ -31,6 +33,26 @@ class TrainerWrapperABC(ABC):
         raise NotImplementedError
 
 
+class CappedTrainer(TrainerWrapperABC):
+    """在数据进训练脚本前切齐到固定条数，再交给内层 trainer。
+
+    做成一层包装而不是在调用点各切一次：搜索期打分与终选 Tier-2 是两条独立的调用路径，
+    任何一条漏掉切齐，那批节点就在不同算力预算下打分，而这种偏差不会报错。包在
+    `self.trainer` 外面，则"凡是训练都受约束"由构造处一次保证。
+
+    切齐的理由与它管不到的那一半（产出不足），见 `core/train_set`。
+    """
+
+    def __init__(self, inner: TrainerWrapperABC, cap: int, seed: int = train_set.DEFAULT_SEED):
+        self.inner = inner
+        self.cap = int(cap)
+        self.seed = int(seed)
+
+    def run(self, dataset_path: str, output_dir: str) -> TrainResult:
+        ts = train_set.materialize(dataset_path, output_dir, self.cap, self.seed)
+        return self.inner.run(ts.path, output_dir)
+
+
 class DownstreamTrainerWrapper(TrainerWrapperABC):
     """子进程调用用户提供的"训练+评估"脚本。
 
@@ -44,12 +66,16 @@ class DownstreamTrainerWrapper(TrainerWrapperABC):
         timeout_sec: int = 1800,
         python_path: str | None = None,
         eval_python_path: str | None = None,
+        extra_args: list[str] | None = None,
     ) -> None:
         self.cmd_parts = _split_cmd(train_eval_cmd)
         # 允许配置独立的 train 环境 python（解决 agent/train 依赖冲突）
         if python_path and self.cmd_parts and self.cmd_parts[0] in ("python", "python3"):
             self.cmd_parts[0] = python_path
         self.timeout_sec = timeout_sec
+        # 编排器决定、需逐次传给脚本的参数（如 --dev-set）。放在 --dataset/--output 之后，
+        # 使脚本侧的位置约定不受影响。
+        self.extra_args = list(extra_args or [])
         self.launch_env: dict[str, str] = {}
         if eval_python_path:
             self.launch_env["SFT_EVAL_PYTHON"] = eval_python_path
@@ -65,12 +91,14 @@ class DownstreamTrainerWrapper(TrainerWrapperABC):
             *self.cmd_parts,
             "--dataset", str(Path(dataset_path).resolve()),
             "--output", str(out_dir),
+            *self.extra_args,
         ]
         logger.info("启动下游训练：%s", " ".join(cmd))
 
         # 使用 Popen 以便在超时时杀死整个进程树（包括孙进程）
         try:
             env = {**os.environ, **self.launch_env, "DF_TRAIN_RUN_ID": run_id}
+            _write_run_manifest(out_dir, cmd, str(Path(dataset_path).resolve()), env)
             if sys.platform == "win32":
                 # Windows: 创建新进程组
                 proc = subprocess.Popen(
@@ -130,130 +158,6 @@ class DownstreamTrainerWrapper(TrainerWrapperABC):
         return _parse_results(results_path, log_path)
 
 
-class SSHTrainerWrapper(TrainerWrapperABC):
-    """双机训练：框架只在 node0 启动一次脚本，脚本内部负责拉起 node1 worker。
-
-    前提：两机共享文件系统（dataset/output 路径两机一致）+ 免密 SSH。框架只做：
-      1. 在 node0 本机启动一次训练脚本；
-      2. 注入分布式与远端信息（NODE1_HOST / MASTER_ADDR / NNODES / GPU 数等）；
-      3. 阻塞等待脚本完成并解析 results.json。
-
-    具体的 convert_dataset / node1 SSH 拉起 / rank0 训练 / rank0 评测全部在脚本内部完成，
-    框架本身只产出 pipeline 和数据集路径。
-    """
-
-    def __init__(
-        self,
-        train_eval_cmd: str,
-        *,
-        node1_host: str,
-        master_addr: str,
-        gpus_per_node: int,
-        nnodes: int = 2,
-        master_port: int = 29500,
-        remote_cwd: str | None = None,
-        ssh_opts: str = "",
-        timeout_sec: int = 25200,
-        python_path: str | None = None,
-        eval_python_path: str | None = None,
-    ) -> None:
-        self.cmd_parts = _split_cmd(train_eval_cmd)
-        # rank1 远端解释器与 rank0 一致（默认沿用 python_path 或本机 python）
-        self.python_exe = python_path or sys.executable
-        if self.cmd_parts and _looks_like_python(self.cmd_parts[0]):
-            self.cmd_parts[0] = self.python_exe
-        self.node1_host = node1_host
-        self.master_addr = master_addr
-        self.gpus_per_node = gpus_per_node
-        self.nnodes = nnodes
-        self.master_port = master_port
-        self.remote_cwd = remote_cwd or os.getcwd()
-        self.ssh_opts = ssh_opts
-        self.timeout_sec = timeout_sec
-        self.eval_python = eval_python_path or ""
-
-    def _launcher_env(self, run_id: str) -> dict[str, str]:
-        """构造 node0 launcher 环境。真正的 node1 拉起由脚本内部完成。"""
-        env = {
-            "NNODES": str(self.nnodes),
-            "NODE_RANK": "0",
-            "MASTER_ADDR": self.master_addr,
-            "MASTER_PORT": str(self.master_port),
-            "SFT_NUM_GPUS": str(self.gpus_per_node * self.nnodes),
-            "FORCE_TORCHRUN": "1",
-            "DF_TRAIN_RUN_ID": run_id,
-            "NODE1_HOST": self.node1_host,
-            "SSH_OPTS": self.ssh_opts,
-            "SFT_REMOTE_PYTHON": self.python_exe,
-        }
-        # REMOTE_CWD 可能为 None，需要转换为字符串或省略
-        if self.remote_cwd is not None:
-            env["REMOTE_CWD"] = str(self.remote_cwd)
-        if self.eval_python:
-            env["SFT_EVAL_PYTHON"] = self.eval_python
-        return env
-
-    def run(self, dataset_path: str, output_dir: str) -> TrainResult:
-        out_dir = Path(output_dir).resolve()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        results_path = out_dir / "results.json"
-        log_path = out_dir / "train.log"
-        ds_abs = str(Path(dataset_path).resolve())
-        tail = ["--dataset", ds_abs, "--output", str(out_dir)]
-        run_id = _make_run_id(out_dir)
-
-        # 只在 node0 启动一次脚本；脚本内部负责 convert + SSH 拉 node1 + rank0/rank1 训练 + rank0 评测。
-        try:
-            rc, stdout, stderr, timed_out = self._run_local(tail, timeout=self.timeout_sec, run_id=run_id)
-        except FileNotFoundError as exc:
-            msg = f"训练脚本不可执行：{exc}"
-            logger.error(msg)
-            return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
-
-        log_path.write_text(
-            (stdout or "") + "\n--- STDERR ---\n" + (stderr or ""), encoding="utf-8"
-        )
-
-        if timed_out:
-            msg = f"训练超时（>{self.timeout_sec}s）"
-            logger.error(msg)
-            return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
-        if rc != 0:
-            msg = f"rank0 训练非零退出（{rc}）"
-            logger.error("%s；详见 %s", msg, log_path)
-            return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
-        if not results_path.exists():
-            msg = f"训练脚本未回写 results.json：{results_path}"
-            logger.error(msg)
-            return TrainResult(0.0, "unknown", [], str(log_path), True, msg)
-        return _parse_results(results_path, log_path)
-
-    def _run_local(self, tail: list[str], timeout: int, run_id: str) -> tuple[int, str, str, bool]:
-        """本机拉起 node0 launcher，阻塞等待。返回 (returncode, stdout, stderr, timed_out)。"""
-        env = {**os.environ, **self._launcher_env(run_id=run_id)}
-        cmd = [*self.cmd_parts, *tail]
-        logger.info("本机拉起训练脚本（node0 launcher）：%s", " ".join(cmd))
-        if sys.platform == "win32":
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, env=env,
-                                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
-        else:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, env=env, preexec_fn=os.setsid)
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout)
-            return proc.returncode, stdout, stderr, False
-        except subprocess.TimeoutExpired:
-            logger.warning("node0 launcher 超时（>%ds），终止进程树...", timeout)
-            _kill_process_tree(proc.pid)
-            try:
-                stdout, stderr = proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                stdout, stderr = proc.communicate()
-            return proc.returncode, stdout, stderr, True
-
-
 def _looks_like_python(token: str) -> bool:
     """判断命令首 token 是否为 python 解释器（"python"/"python3" 或解释器路径）。"""
     base = Path(token).name.lower()
@@ -277,6 +181,52 @@ def _split_cmd(cmd: str) -> list[str]:
 
 def _make_run_id(output_dir: Path) -> str:
     return f"{int(time.time() * 1000)}-{os.getpid()}-{output_dir.name}"
+
+
+# 训练配置以命令行 + 环境变量的形式散在框架外，节点分数却全靠它可比。跑到一半改了 YAML
+# 或动了脚本，前后节点就在不同训练配方下打分，而树里看不出任何差别。这些前缀覆盖训练规模、
+# 基座、评测并行度等会改变分数的量。
+_ENV_PREFIXES = ("SFT_", "EVAL_", "MATH_", "PTB_", "DF_")
+
+
+def _write_run_manifest(
+    out_dir: Path, cmd: list[str], dataset_path: str, env: dict[str, str]
+) -> None:
+    """把这次训练的配方落一份 `run_manifest.json`，供事后核验跨节点可比性。
+
+    尽力而为：留痕失败不该影响训练本身，只告警。
+    """
+    try:
+        manifest = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "cmd": cmd,
+            "dataset": dataset_path,
+            "env": {
+                k: v for k, v in sorted(env.items()) if k.startswith(_ENV_PREFIXES)
+            },
+            "scripts": _fingerprint_scripts(cmd),
+        }
+        (out_dir / "run_manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:
+        logger.warning("run_manifest 落盘失败（不影响训练）：%s", exc)
+
+
+def _fingerprint_scripts(cmd: list[str]) -> dict[str, str]:
+    """对命令里出现的 .py 文件取内容摘要——脚本被改动后同一条命令不再等价。"""
+    out: dict[str, str] = {}
+    for token in cmd:
+        if not token.endswith(".py"):
+            continue
+        p = Path(token)
+        if not p.is_file():
+            continue
+        try:
+            out[str(p)] = hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+        except OSError:
+            continue
+    return out
 
 
 def _parse_results(results_path: Path, log_path: Path) -> TrainResult:

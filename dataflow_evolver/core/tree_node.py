@@ -15,7 +15,8 @@ from dataflow_evolver.core.schemas import (
     TrainResult,
 )
 
-_id_counter = count(1)
+# 从 0 起：树根即 Init node，目录名 node_0，与文档/prompt 里的称呼一致。
+_id_counter = count(0)
 
 
 def reseed_id_counter(start: int) -> None:
@@ -25,7 +26,11 @@ def reseed_id_counter(start: int) -> None:
 
 
 class PipelineNode:
-    """一棵 MCTS 树中的节点；根节点为虚拟节点（config 为 None）。"""
+    """一棵 MCTS 树中的节点。
+
+    根节点（id=0）由编排器填成 Init node，持有真实流水线；新建时 config 为 None，
+    因此"是不是一次实验"一律按 config 是否为空判断，不依赖额外标记。
+    """
 
     def __init__(
         self,
@@ -45,9 +50,6 @@ class PipelineNode:
         # 之后不再作为扩展点、不被选点下探、不参与最优产物挑选（见 review M1）。
         self.dead: bool = False
 
-        # 暖启动时 root 记录基线 dev 分（仅 baseline root 使用；其余节点保持 None）
-        self.baseline_dev_score: float | None = None
-
         # 双反馈结果（回写）
         self.review_result: ReviewResult | None = None
         # Tier-2 放大重产后的重评结果。与 review_result（搜索期探针小样本）分开保存：
@@ -58,10 +60,6 @@ class PipelineNode:
         self.diagnostic_report: DiagnosticReport | None = None
 
     # ---- 树形结构 ----
-    @property
-    def is_root(self) -> bool:
-        return self.parent is None
-
     @property
     def node_dir_name(self) -> str:
         """workspace 下的节点子目录名。"""

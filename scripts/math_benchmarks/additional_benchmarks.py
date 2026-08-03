@@ -1,7 +1,10 @@
-"""Additional benchmark loaders and scorers.
+"""Additional benchmark loaders.
 
 All benchmarks are loaded from fixed paths under:
 `data/benchmarks/limo_eval/`
+
+判分统一在 `scripts/vllm_eval_standalone.py` 的 `_grade` 里做，这里只负责把各家
+原始字段规整成 `{question, gold_answer, choices?, gold_letter?}`。
 """
 
 from __future__ import annotations
@@ -11,13 +14,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .answer_extract import (
-    extract_answer,
-    extract_boxed,
-    extract_choice_letter,
-    is_equiv,
-    normalize_number,
-)
+from .answer_extract import extract_boxed, is_equiv
 
 _OPTION_LABELS = "ABCDE"
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -256,80 +253,6 @@ def load_benchmark_examples(
     return _normalize_examples(rows, bench_name)
 
 
-def _latex_score(predictions: list[str], examples: list[dict]) -> tuple[float, list[dict]]:
-    correct = 0
-    bad_cases: list[dict] = []
-    for pred_text, ex in zip(predictions, examples):
-        pred_answer = extract_answer(pred_text, mode="boxed")
-        if pred_answer is None:
-            pred_answer = extract_answer(pred_text, mode="auto")
-        gold = ex["gold_answer"]
-        match = pred_answer is not None and is_equiv(pred_answer, gold)
-        if match:
-            correct += 1
-        else:
-            bad_cases.append({
-                "input": ex["question"],
-                "prediction": pred_answer or "(extraction failed)",
-                "ground_truth": gold,
-                "error_type": "wrong_answer",
-            })
-    return correct / len(examples) if examples else 0.0, bad_cases
-
-
-def _numeric_score(predictions: list[str], examples: list[dict]) -> tuple[float, list[dict]]:
-    correct = 0
-    bad_cases: list[dict] = []
-    for pred_text, ex in zip(predictions, examples):
-        pred_answer = extract_answer(pred_text, mode="auto")
-        gold = ex["gold_answer"]
-        match = False
-        if pred_answer is not None:
-            pred_num = normalize_number(pred_answer)
-            gold_num = normalize_number(gold)
-            if pred_num is not None and gold_num is not None:
-                match = abs(pred_num - gold_num) < 1e-3
-            else:
-                match = is_equiv(pred_answer, gold)
-        if match:
-            correct += 1
-        else:
-            bad_cases.append({
-                "input": ex["question"],
-                "prediction": pred_answer or "(extraction failed)",
-                "ground_truth": gold,
-                "error_type": "wrong_answer",
-            })
-    return correct / len(examples) if examples else 0.0, bad_cases
-
-
-def _mcq_score(predictions: list[str], examples: list[dict]) -> tuple[float, list[dict]]:
-    correct = 0
-    bad_cases: list[dict] = []
-    for pred_text, ex in zip(predictions, examples):
-        pred_letter = extract_choice_letter(pred_text)
-        pred_answer = extract_answer(pred_text, mode="auto")
-        gold_answer = ex["gold_answer"]
-        gold_letter = ex.get("gold_letter")
-
-        match = False
-        if pred_letter is not None and gold_letter is not None:
-            match = pred_letter == gold_letter
-        elif pred_answer is not None:
-            match = is_equiv(pred_answer, gold_answer)
-
-        if match:
-            correct += 1
-        else:
-            bad_cases.append({
-                "input": ex["question"],
-                "prediction": pred_letter or pred_answer or "(extraction failed)",
-                "ground_truth": gold_letter or gold_answer,
-                "error_type": "wrong_answer",
-            })
-    return correct / len(examples) if examples else 0.0, bad_cases
-
-
 def load_chmath(cache_dir: str | None = None) -> list[dict]:
     return load_benchmark_examples(
         bench_name="CHMath",
@@ -339,10 +262,6 @@ def load_chmath(cache_dir: str | None = None) -> list[dict]:
 
 def chmath_prompt(question: str) -> str:
     return question
-
-
-def chmath_score(predictions: list[str], examples: list[dict]) -> tuple[float, list[dict]]:
-    return _latex_score(predictions, examples)
 
 
 def load_olympiadbench(cache_dir: str | None = None) -> list[dict]:
@@ -356,10 +275,6 @@ def olympiadbench_prompt(question: str) -> str:
     return question
 
 
-def olympiadbench_score(predictions: list[str], examples: list[dict]) -> tuple[float, list[dict]]:
-    return _latex_score(predictions, examples)
-
-
 def load_gaokao(cache_dir: str | None = None) -> list[dict]:
     return load_benchmark_examples(
         bench_name="Gaokao",
@@ -369,10 +284,6 @@ def load_gaokao(cache_dir: str | None = None) -> list[dict]:
 
 def gaokao_prompt(question: str) -> str:
     return question
-
-
-def gaokao_score(predictions: list[str], examples: list[dict]) -> tuple[float, list[dict]]:
-    return _latex_score(predictions, examples)
 
 
 def load_kaoyan(cache_dir: str | None = None) -> list[dict]:
@@ -386,10 +297,6 @@ def kaoyan_prompt(question: str) -> str:
     return question
 
 
-def kaoyan_score(predictions: list[str], examples: list[dict]) -> tuple[float, list[dict]]:
-    return _latex_score(predictions, examples)
-
-
 def load_gradeschool(cache_dir: str | None = None) -> list[dict]:
     return load_benchmark_examples(
         bench_name="GradeSchool",
@@ -399,10 +306,6 @@ def load_gradeschool(cache_dir: str | None = None) -> list[dict]:
 
 def gradeschool_prompt(question: str) -> str:
     return question
-
-
-def gradeschool_score(predictions: list[str], examples: list[dict]) -> tuple[float, list[dict]]:
-    return _numeric_score(predictions, examples)
 
 
 def load_minervamath(cache_dir: str | None = None) -> list[dict]:
@@ -416,10 +319,6 @@ def minervamath_prompt(question: str) -> str:
     return question
 
 
-def minervamath_score(predictions: list[str], examples: list[dict]) -> tuple[float, list[dict]]:
-    return _latex_score(predictions, examples)
-
-
 def load_gpqa(cache_dir: str | None = None) -> list[dict]:
     return load_benchmark_examples(
         bench_name="GPQA",
@@ -430,6 +329,3 @@ def load_gpqa(cache_dir: str | None = None) -> list[dict]:
 def gpqa_prompt(question: str) -> str:
     return question
 
-
-def gpqa_score(predictions: list[str], examples: list[dict]) -> tuple[float, list[dict]]:
-    return _mcq_score(predictions, examples)

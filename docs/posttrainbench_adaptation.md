@@ -173,6 +173,60 @@ export PTB_BENCHMARK=gsm8k PTB_DEV_LIMIT=150 PTB_TIME_BUDGET_SEC=1200
   per-sample 的 test 题面或答案；`results.json.bad_cases` 恒为 `[]`。
 - Phase-2 DiagnosticAgent 在 review 模式下不触发（无 bad_cases）。
 
+### 6.1 已知重叠：dev ⊂ test（刻意维持现状）
+
+PostTrainBench 的任务目录只提供评测口径，**不提供 train split**，也没有独立的 dev 池。dev 与终评
+因此评在同一份题池上：gsm8k 两者都取 HF `openai/gsm8k` 的 **test** split。而 `--limit` 在
+`inspect_ai` 里是 `slice(0, N)`（`_eval/task/util.py`），即确定性取前 N 条，server 家族
+（healthbench / arenahardwriting）则是 `random.Random(42).shuffle` 后取前 N。两种都可复现，
+但也都意味着 **`--limit 150` 是 `--limit -1` 的前缀子集**。
+
+影响面比字面看起来窄：
+
+- **搜索期不受影响**。`reward_source: review` 下 MCTS 的 reward 是 Tier-1 复合分，全程不接触
+  benchmark，不存在「MCTS 直接优化终评集」。
+- **重叠只作用在终选**，即「从 top-3 候选里挑 1 个」这一步。
+- **后果**：参与过选模的 150 题也计入终评（gsm8k 下约占 1319 题的 11%），终评分偏乐观；且 3 选 1
+  的排序建立在终评集的子集上，不是独立样本。
+
+自己迭代看趋势够用；**对外报数或与他人结果比较时必须一并说明**。编排器在终选/终评摘要里会打印
+这条提示（`main.py`）。
+
+想彻底不相交，两条路各有代价：
+
+1. **切开题池**：dev 用前 150，终评只评剩下 1169 条。改动小，但终评不再是官方全量口径，
+   分数无法与榜单直接比。
+2. **另建 dev 源**：GSM8K 官方有 train split（7473 条，`inspect_evals` 目前只拿它做 few-shot），
+   从那里物化一份 dev 与 test 天然不相交。但官方 `evaluate.py` 写死读 benchmark 自己的题池，
+   指不到外部文件，需要自定义一个 inspect task 或改走本仓库的 vLLM 评测路径。
+
+### 6.2 外部数据（web search / Hub 取数）：PTB 链路默认不启用
+
+`configs/posttrainbench_gsm8k.yaml` 里没有 `agent_sdk.external_data`，而 `load_config` **不做
+跨文件继承**（`utils/config.py` 只读单份 YAML），所以取值是代码里的 `False`——`dataset-search`
+与 `data-discovery` 两个 MCP 都不会挂载，PTB 的 Agent 只能从零合成。
+
+这不是不兼容，打开只是加一行；但 PTB 场景下**开之前必须先配去污染**：gsm8k / gpqa / aime 这些
+benchmark 本体就在 HuggingFace 上，test split 触手可及，而 PostTrainBench 明令禁止拿 test 训练
+（`src/eval/general/prompt.txt`）。缺了 `review.decontamination.reference_files`，等于给搜索开了
+一条比改进数据省力得多的刷分路径——而 MCTS 一定会找到它。要启用的话，这三项要一起加：
+
+```yaml
+agent_sdk:
+  external_data: true
+  discovery: true          # 只找线索不取数的那三个工具（网页/GitHub/arXiv）
+dataset_search:
+  endpoint: ""             # 直连不通时填镜像
+  max_download_mb: 2048
+review:
+  decontamination:
+    reference_files: [<benchmark test set 落地文件>]
+    max_rate: 0.02
+```
+
+`reference_files` 需要一份可读的 test 集文件；PTB 的题池是评测时从 HF 拉的、本地没有静态副本，
+所以这一步要先把对应 split 落盘一份**仅供比对**（不进训练路径）。
+
 ---
 
 ## 7. 风险 / TODO

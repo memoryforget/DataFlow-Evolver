@@ -6,8 +6,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dataflow_evolver.agents.diagnostic_agent import DiagnosticAgent
 from dataflow_evolver.agents.review_agent import ReviewAgent
 from dataflow_evolver.agents.task_profiler import TaskProfilerAgent
+from dataflow_evolver.core.input_corpus import InputCorpus
 from dataflow_evolver.core.schemas import BadCase
 from dataflow_evolver.llm.serving import LLMServingABC
+
+SCRATCH = InputCorpus(entry_path="empty.jsonl")   # 无输入语料 = 从零合成
 
 
 class StubServing(LLMServingABC):
@@ -108,7 +111,7 @@ def test_diagnostic_parses_report():
 
 
 def test_pipeline_prompt_injects_review_issues():
-    """评审 issues 经 parent_review 注入；父未被评审过（如基线/虚拟根）则不出现该段。
+    """评审 issues 经 parent_review 注入；parent_review 缺失则不出现该段。
 
     曾另有一条只收 issues 列表的 elif 分支，与 parent_review 表达同一语义、格式却不同。
     生产代码从不走它，测试却在测它——绿灯不代表真实路径可用，故删掉分支、用例改走这里。
@@ -117,7 +120,7 @@ def test_pipeline_prompt_injects_review_issues():
     from dataflow_evolver.llm.prompts import build_pipeline_prompt
 
     profile = TaskProfile("QA", {"q": "str", "a": "str"}, [], "sft")
-    base = build_pipeline_prompt(profile, "empty.jsonl", "node_1")
+    base = build_pipeline_prompt(profile, SCRATCH, "node_1")
     assert "父节点数据质量" not in base
 
     review = ReviewResult(
@@ -125,7 +128,7 @@ def test_pipeline_prompt_injects_review_issues():
         issues=["qa 字段为空", "与任务不相关"],
     )
     with_issues = build_pipeline_prompt(
-        profile, "empty.jsonl", "node_1", parent_review=review
+        profile, SCRATCH, "node_1", parent_review=review
     )
     assert "父节点数据质量归因" in with_issues
     assert "qa 字段为空" in with_issues and "与任务不相关" in with_issues
@@ -137,10 +140,10 @@ def test_pipeline_prompt_injects_target_samples():
     from dataflow_evolver.llm.prompts import build_pipeline_prompt
 
     profile = TaskProfile("QA", {"instruction": "str", "output": "str"}, [], "sft")
-    base = build_pipeline_prompt(profile, "empty.jsonl", "node_1")
+    base = build_pipeline_prompt(profile, SCRATCH, "node_1")
     assert "目标产出规模" not in base                      # 默认 0 → 不注入
 
-    sized = build_pipeline_prompt(profile, "empty.jsonl", "node_1", target_samples=1500)
+    sized = build_pipeline_prompt(profile, SCRATCH, "node_1", target_samples=1500)
     assert "目标产出规模" in sized and "1500" in sized
     assert "num_samples" in sized                          # 指导从零合成类算子
 

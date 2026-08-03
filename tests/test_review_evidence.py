@@ -11,7 +11,6 @@ from pathlib import Path
 
 from dataflow_evolver.agents.review_agent import ReviewAgent
 from dataflow_evolver.core import checkpoint
-from dataflow_evolver.core.baseline import RewardPolicy
 from dataflow_evolver.core.schemas import PipelineConfig, ReviewResult, TaskProfile
 from dataflow_evolver.core.tree_manager import TreeManager
 
@@ -152,9 +151,7 @@ def _cfg() -> PipelineConfig:
 
 
 def _serialize(tree: TreeManager) -> dict:
-    return checkpoint.serialize(
-        tree, RewardPolicy(), None, completed_iterations=1, profile=PROFILE
-    )
+    return checkpoint.serialize(tree, completed_iterations=1, profile=PROFILE)
 
 
 def test_tier2_review_defaults_to_none_and_is_separate_field():

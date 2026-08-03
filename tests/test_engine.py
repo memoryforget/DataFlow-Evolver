@@ -1,4 +1,6 @@
+import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -10,21 +12,87 @@ ROOT = Path(__file__).resolve().parents[1]
 REF_SCRIPT = ROOT / "scripts" / "reference_train_eval.py"
 
 
+def _dev_set(tmp_path: Path, rows: list[str]) -> Path:
+    dev = tmp_path / "dev.jsonl"
+    dev.write_text("".join(r + "\n" for r in rows), encoding="utf-8")
+    return dev
+
+
 def test_trainer_parses_reference_results(tmp_path):
     ds = tmp_path / "ds.jsonl"
     ds.write_text(
         '{"instruction":"q1","answer":"a1"}\n'
-        '{"instruction":"q2","answer":""}\n',
+        '{"instruction":"q2","answer":"a2"}\n',
         encoding="utf-8",
     )
+    # dev 题集里 q1 被训练数据覆盖，q9 没有 → 1/2
+    dev = _dev_set(tmp_path, [
+        '{"instruction":"q1","answer":"a1"}',
+        '{"instruction":"q9","answer":"a9"}',
+    ])
+
     cmd = f'{sys.executable} "{REF_SCRIPT}"'
-    wrapper = DownstreamTrainerWrapper(cmd, timeout_sec=60)
+    wrapper = DownstreamTrainerWrapper(
+        cmd, timeout_sec=60, extra_args=["--dev-set", str(dev)]
+    )
     result = wrapper.run(str(ds), str(tmp_path / "out"))
+
     assert result.failed is False
-    assert result.metric_name == "non_empty_ratio"
+    assert result.metric_name == "exact_match"
     assert abs(result.score - 0.5) < 1e-9
     assert len(result.bad_cases) == 1
-    assert result.bad_cases[0].error_type == "empty_answer"
+    assert result.bad_cases[0].error_type == "no_answer"
+
+
+def test_reference_script_refuses_to_run_without_a_question_set(tmp_path):
+    """拿不到题集必须非零退出，而不是回退到某份"默认题库"。
+
+    参考实现同时是契约文档：这里若允许兜底，读它的人就会照抄一份能静默评错题集的脚本，
+    而框架的 dev 口径（core/dev_set.py 物化 + manifest）也就只剩君子协定。
+    """
+    ds = tmp_path / "ds.jsonl"
+    ds.write_text('{"instruction":"q1","answer":"a1"}\n', encoding="utf-8")
+
+    wrapper = DownstreamTrainerWrapper(f'{sys.executable} "{REF_SCRIPT}"', timeout_sec=60)
+    result = wrapper.run(str(ds), str(tmp_path / "out"))
+
+    assert result.failed is True
+    assert not (tmp_path / "out" / "results.json").exists()
+
+
+def test_trainer_forwards_extra_args(tmp_path, monkeypatch):
+    """--dev-set 之类由编排器决定的参数必须原样传到脚本，且排在 --dataset/--output 之后。"""
+    ds = tmp_path / "ds.jsonl"
+    ds.write_text('{"answer":"x"}\n', encoding="utf-8")
+    wrapper = DownstreamTrainerWrapper(
+        "nonexistent_cmd_xyz", timeout_sec=10, extra_args=["--dev-set", "/tmp/dev.jsonl"]
+    )
+    wrapper.run(str(ds), str(tmp_path / "out"))
+
+    manifest = json.loads((tmp_path / "out" / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["cmd"][-2:] == ["--dev-set", "/tmp/dev.jsonl"]
+    assert manifest["cmd"].index("--dataset") < manifest["cmd"].index("--dev-set")
+
+
+def test_trainer_writes_run_manifest(tmp_path, monkeypatch):
+    """训练配方散在命令行+环境变量里，跑到一半被改动会让节点分数不可比——必须留痕。"""
+    ds = tmp_path / "ds.jsonl"
+    ds.write_text('{"instruction":"q1","answer":"a1"}\n', encoding="utf-8")
+    monkeypatch.setenv("SFT_NUM_EPOCHS", "15")
+    monkeypatch.setenv("UNRELATED_VAR", "noise")
+    dev = _dev_set(tmp_path, ['{"instruction":"q1","answer":"a1"}'])
+
+    cmd = f'{sys.executable} "{REF_SCRIPT}"'
+    DownstreamTrainerWrapper(
+        cmd, timeout_sec=60, extra_args=["--dev-set", str(dev)]
+    ).run(str(ds), str(tmp_path / "out"))
+
+    manifest = json.loads((tmp_path / "out" / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["env"]["SFT_NUM_EPOCHS"] == "15"
+    assert "UNRELATED_VAR" not in manifest["env"]        # 只留会改变分数的量
+    assert manifest["dataset"] == str(ds.resolve())
+    # 同一条命令下脚本被改动也不再等价，故记内容摘要而非只记路径
+    assert str(REF_SCRIPT) in manifest["scripts"]
 
 
 def test_trainer_missing_script_degrades(tmp_path):
@@ -34,6 +102,27 @@ def test_trainer_missing_script_degrades(tmp_path):
     result = wrapper.run(str(ds), str(tmp_path / "out"))
     assert result.failed is True
     assert result.error_msg is not None
+
+
+def test_trainer_times_out_and_degrades(tmp_path):
+    """训练超时 → 及时杀掉进程树并降级 failed，不抛出、不干等满。
+
+    卡住的训练不能拖垮主循环：MCTS 还有别的节点要跑，而 TrainResult(failed=True)
+    足以让这个节点按系统级失败处理。
+    """
+    ds = tmp_path / "ds.jsonl"
+    ds.write_text('{"instruction":"q","answer":"a"}\n', encoding="utf-8")
+    slow = tmp_path / "slow.py"
+    slow.write_text("import time; time.sleep(30)\n", encoding="utf-8")
+
+    wrapper = DownstreamTrainerWrapper(f'{sys.executable} "{slow}"', timeout_sec=2)
+    t0 = time.time()
+    result = wrapper.run(str(ds), str(tmp_path / "out"))
+    elapsed = time.time() - t0
+
+    assert result.failed is True
+    assert result.error_msg is not None
+    assert elapsed < 20  # 超时即返回，而不是等满 30s
 
 
 def test_execution_missing_pipeline_file(tmp_path):
@@ -124,104 +213,3 @@ def test_execution_picks_max_step_over_mtime(tmp_path):
     assert result.success is True
     assert result.dataset_path.endswith("s_step2.jsonl")
 
-
-# ---------------------------------------------------------------------------
-# SSHTrainerWrapper：双机训练（本机 rank0 + SSH 拉起 rank1）。stub 训练命令，无需 GPU。
-# ---------------------------------------------------------------------------
-import subprocess  # noqa: E402
-import time  # noqa: E402
-
-from dataflow_evolver.engine.trainer_wrapper import SSHTrainerWrapper  # noqa: E402
-
-
-def _ssh_wrapper(cmd: str, *, nnodes: int, timeout_sec: int, node1_host: str = "node1") -> SSHTrainerWrapper:
-    return SSHTrainerWrapper(
-        cmd,
-        node1_host=node1_host,
-        master_addr="127.0.0.1",
-        gpus_per_node=0,
-        nnodes=nnodes,
-        timeout_sec=timeout_sec,
-        python_path=sys.executable,
-    )
-
-
-def test_ssh_trainer_single_node_end_to_end(tmp_path):
-    """nnodes=1：跳过 SSH，仅本机 rank0 拉起 reference_train_eval.py → 解析 TrainResult。"""
-    ds = tmp_path / "ds.jsonl"
-    ds.write_text(
-        '{"instruction":"q1","answer":"a1"}\n'
-        '{"instruction":"q2","answer":""}\n',
-        encoding="utf-8",
-    )
-    cmd = f'{sys.executable} "{REF_SCRIPT}"'
-    wrapper = _ssh_wrapper(cmd, nnodes=1, timeout_sec=60)
-    result = wrapper.run(str(ds), str(tmp_path / "out"))
-    assert result.failed is False
-    assert result.metric_name == "non_empty_ratio"
-    assert abs(result.score - 0.5) < 1e-9
-    assert len(result.bad_cases) == 1
-    assert result.bad_cases[0].error_type == "empty_answer"
-
-
-def test_ssh_trainer_missing_script_degrades(tmp_path):
-    """rank0 命令不可执行 → 降级 failed（不抛出）。"""
-    ds = tmp_path / "ds.jsonl"
-    ds.write_text('{"answer":"x"}\n', encoding="utf-8")
-    wrapper = SSHTrainerWrapper(
-        "nonexistent_cmd_xyz --flag", node1_host="node1", master_addr="127.0.0.1",
-        gpus_per_node=0, nnodes=1, timeout_sec=10, python_path=None,
-    )
-    result = wrapper.run(str(ds), str(tmp_path / "out"))
-    assert result.failed is True
-    assert result.error_msg is not None
-
-
-def test_ssh_trainer_passes_cluster_env_to_launcher(tmp_path, monkeypatch):
-    """nnodes=2：框架只本地拉一次 node0 脚本，并把集群信息注入环境变量。"""
-    ds = tmp_path / "ds.jsonl"
-    ds.write_text('{"instruction":"q","answer":"a"}\n', encoding="utf-8")
-    out = tmp_path / "out"
-    captured = {}
-
-    real_popen = subprocess.Popen
-
-    def fake_popen(cmd, *args, **kwargs):
-        captured["cmd"] = cmd
-        captured["env"] = kwargs.get("env")
-        assert not (isinstance(cmd, list) and cmd and cmd[0] == "ssh")
-        return real_popen(cmd, *args, **kwargs)
-
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
-
-    cmd = f'{sys.executable} "{REF_SCRIPT}"'
-    wrapper = _ssh_wrapper(cmd, nnodes=2, timeout_sec=60, node1_host="user@10.0.0.2")
-    result = wrapper.run(str(ds), str(out))
-
-    assert result.failed is False
-    launcher_cmd = captured.get("cmd")
-    env = captured.get("env")
-    assert launcher_cmd is not None and env is not None
-    assert str(REF_SCRIPT) in " ".join(str(x) for x in launcher_cmd)
-    assert env["NODE_RANK"] == "0"
-    assert env["MASTER_ADDR"] == "127.0.0.1"
-    assert env["NNODES"] == "2"
-    assert env["NODE1_HOST"] == "user@10.0.0.2"
-    assert env["SFT_REMOTE_PYTHON"] == sys.executable
-
-
-def test_ssh_trainer_times_out(tmp_path):
-    """rank0 训练超时 → 短超时后降级 failed（不抛出）。"""
-    ds = tmp_path / "ds.jsonl"
-    ds.write_text('{"instruction":"q","answer":"a"}\n', encoding="utf-8")
-    # 用一个会睡很久的命令模拟长训练
-    slow = tmp_path / "slow.py"
-    slow.write_text("import time; time.sleep(30)\n", encoding="utf-8")
-    cmd = f'{sys.executable} "{slow}"'
-    wrapper = _ssh_wrapper(cmd, nnodes=1, timeout_sec=2)
-    t0 = time.time()
-    result = wrapper.run(str(ds), str(tmp_path / "out"))
-    elapsed = time.time() - t0
-    assert result.failed is True
-    assert result.error_msg is not None
-    assert elapsed < 20  # 超时后应及时返回，而非等满 30s

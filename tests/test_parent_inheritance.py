@@ -6,10 +6,13 @@
 """
 from __future__ import annotations
 
+from dataflow_evolver.core.input_corpus import InputCorpus
 from dataflow_evolver.core.schemas import PipelineConfig, ReviewResult, TaskProfile, TrainResult
 from dataflow_evolver.core.tree_node import PipelineNode
 from dataflow_evolver.llm.prompts import build_pipeline_prompt
 from dataflow_evolver.main import _sibling_summaries
+
+SCRATCH = InputCorpus(entry_path="empty.jsonl")   # 无输入语料 = 从零合成
 
 PROFILE = TaskProfile("QA", {"q": "str", "a": "str"}, [], "sft")
 
@@ -36,7 +39,7 @@ def _review(**kw) -> ReviewResult:
 # ---- 1. rationale ----------------------------------------------------------
 def test_parent_rationale_injected_with_parent_code():
     prompt = build_pipeline_prompt(
-        PROFILE, "empty.jsonl", "node_2",
+        PROFILE, SCRATCH, "node_2",
         parent_code="print('parent')",
         parent_rationale="故意压低温度以保证答案正确性",
     )
@@ -46,7 +49,7 @@ def test_parent_rationale_injected_with_parent_code():
 
 def test_no_rationale_block_when_absent():
     prompt = build_pipeline_prompt(
-        PROFILE, "empty.jsonl", "node_2", parent_code="print('parent')"
+        PROFILE, SCRATCH, "node_2", parent_code="print('parent')"
     )
     assert "父节点设计意图" not in prompt
 
@@ -54,7 +57,7 @@ def test_no_rationale_block_when_absent():
 def test_rationale_injected_even_without_parent_code():
     """code 为空（续跑时 node 目录已清理）时子节点信息最匮乏，意图反而是仅存的方向信息。"""
     prompt = build_pipeline_prompt(
-        PROFILE, "empty.jsonl", "node_2", parent_code="", parent_rationale="压低温度保正确性"
+        PROFILE, SCRATCH, "node_2", parent_code="", parent_rationale="压低温度保正确性"
     )
     assert "父节点设计意图" in prompt
     assert "压低温度保正确性" in prompt
@@ -66,7 +69,7 @@ def test_rationale_injected_even_without_parent_code():
 
 def test_rationale_wording_switches_with_code_presence():
     with_code = build_pipeline_prompt(
-        PROFILE, "empty.jsonl", "node_2", parent_code="print(1)", parent_rationale="理由"
+        PROFILE, SCRATCH, "node_2", parent_code="print(1)", parent_rationale="理由"
     )
     assert "在此基础上改进" in with_code
     assert "可作为方向参考" not in with_code
@@ -76,7 +79,7 @@ def test_rationale_wording_switches_with_code_presence():
 def test_parent_review_block_injected_even_when_passed():
     """关键回归：父节点评审**通过**时也必须注入归因（这正是旧实现漏掉的唯一现实分支）。"""
     prompt = build_pipeline_prompt(
-        PROFILE, "empty.jsonl", "node_2", parent_review=_review(passed=True)
+        PROFILE, SCRATCH, "node_2", parent_review=_review(passed=True)
     )
     assert "父节点数据质量归因" in prompt
     assert "评审通过" in prompt
@@ -84,7 +87,7 @@ def test_parent_review_block_injected_even_when_passed():
 
 def test_parent_review_block_exposes_dims_and_weakest():
     prompt = build_pipeline_prompt(
-        PROFILE, "empty.jsonl", "node_2", parent_review=_review()
+        PROFILE, SCRATCH, "node_2", parent_review=_review()
     )
     assert "多样性 0.20" in prompt and "正确性 0.90" in prompt
     # 最弱两维应被点名：diversity(0.20) 与 difficulty(0.70)
@@ -95,7 +98,7 @@ def test_parent_review_block_exposes_dims_and_weakest():
 
 def test_parent_review_block_renders_failure_signals_with_description():
     prompt = build_pipeline_prompt(
-        PROFILE, "empty.jsonl", "node_2",
+        PROFILE, SCRATCH, "node_2",
         parent_review=_review(failure_signals=["F3"]),
     )
     assert "命中的失败信号" in prompt
@@ -105,7 +108,7 @@ def test_parent_review_block_renders_failure_signals_with_description():
 def test_parent_review_block_renders_signals_and_issues_separately():
     """信号段按编号查表拼出，issues 段照实渲染——两者在 ReviewResult 里本就是两个字段。"""
     prompt = build_pipeline_prompt(
-        PROFILE, "empty.jsonl", "node_2",
+        PROFILE, SCRATCH, "node_2",
         parent_review=_review(
             failure_signals=["F3"],
             issues=["80 条里约 60 条是同一个购物找零模板"],
@@ -120,14 +123,14 @@ def test_parent_review_issues_not_truncated():
     """父节点是最相关节点，其 issues 原文完整注入（不做长度截断）。"""
     long_issue = "非常具体的证据" * 40
     prompt = build_pipeline_prompt(
-        PROFILE, "empty.jsonl", "node_2", parent_review=_review(issues=[long_issue])
+        PROFILE, SCRATCH, "node_2", parent_review=_review(issues=[long_issue])
     )
     assert long_issue in prompt
 
 
 def test_parent_review_marks_rejected():
     prompt = build_pipeline_prompt(
-        PROFILE, "empty.jsonl", "node_2", parent_review=_review(passed=False)
+        PROFILE, SCRATCH, "node_2", parent_review=_review(passed=False)
     )
     assert "评审未通过" in prompt
 
@@ -135,7 +138,7 @@ def test_parent_review_marks_rejected():
 # ---- 3. 兄弟负面清单 -------------------------------------------------------
 def test_sibling_block_injected():
     prompt = build_pipeline_prompt(
-        PROFILE, "empty.jsonl", "node_4",
+        PROFILE, SCRATCH, "node_4",
         siblings=["node_2: ops=[A] | tier1=0.310", "node_3: ops=[B] | tier1=0.440"],
     )
     assert "兄弟节点已试过的方向" in prompt
@@ -144,7 +147,7 @@ def test_sibling_block_injected():
 
 
 def test_no_sibling_block_when_empty():
-    prompt = build_pipeline_prompt(PROFILE, "empty.jsonl", "node_2", siblings=[])
+    prompt = build_pipeline_prompt(PROFILE, SCRATCH, "node_2", siblings=[])
     assert "兄弟节点已试过的方向" not in prompt
 
 
@@ -259,7 +262,7 @@ def test_diagnostic_block_has_no_duplicate_numbering():
     from dataflow_evolver.core.schemas import DiagnosticReport
 
     diag = DiagnosticReport(summary="答案格式错误率高", actionable_suggestions=["加格式校验算子"])
-    prompt = build_pipeline_prompt(PROFILE, "empty.jsonl", "node_2", diagnostic=diag)
+    prompt = build_pipeline_prompt(PROFILE, SCRATCH, "node_2", diagnostic=diag)
 
     assert "【父节点诊断反馈】" in prompt
     assert "加格式校验算子" in prompt

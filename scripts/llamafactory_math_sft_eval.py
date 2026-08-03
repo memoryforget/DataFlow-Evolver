@@ -1,50 +1,26 @@
-"""LlamaFactory Full SFT + Math Benchmark 评测脚本（LIMO 配置：Qwen2.5-32B 双机16卡）。
+"""LlamaFactory Full SFT + Math Benchmark 评测脚本（单机多卡）。
 
 契约：
-    python scripts/llamafactory_math_sft_eval.py --dataset <ds.jsonl> --output <out_dir> [--mode dev|test]
+    python scripts/llamafactory_math_sft_eval.py --dataset <ds.jsonl> --output <out_dir> \\
+        [--mode dev|test] [--dev-set <dev.jsonl>]
 
 模式：
-    dev（默认）：MATH train 随机抽样 500 条评测（MATH_TRAIN_SAMPLE_SIZE 控制，=0 跑全量 7500），驱动 MCTS 奖励信号。
+    dev（默认）：在框架经 --dev-set 下传的题集上评测，驱动 MCTS 奖励信号。题集内容与条数由
+          框架的 trainer.dev_set 决定（core/dev_set.py 物化 + manifest），本脚本不抽样、
+          不回退默认题库；缺 --dev-set 直接报错，不会闷头评全量。
     test：GSM8K + AIME2024 + MATH500 + AMC23 + OlympiadBench + CHMath +
           Gaokao + Kaoyan + GradeSchool + MinervaMath + GPQA，仅终评用。
 
 流程：
     1. 数据格式转换（DataFlow JSONL → LlamaFactory sharegpt 格式）
-    2. LlamaFactory Full SFT（Qwen2.5-32B, DeepSpeed ZeRO-3, 双机16卡 A100 80G）
+    2. LlamaFactory Full SFT（DeepSpeed ZeRO-3 + FlashAttention-2，单机 SFT_NUM_GPUS 卡）
     3. vLLM 推理（直接加载 fine-tuned 模型）对选定 bench 评测
     4. bench 取平均 accuracy → results.json
 
-LIMO 论文核心配置（2502.03387）：
-    - 基础模型: Qwen2.5-32B-Instruct
-    - 序列长度: 16384 (所有样本均低于此长度)
-    - 学习率: 5e-6 (极低，论文无 warmup)
-    - 训练轮数: 15 epochs
-    - 全局批次大小: 64 (16卡 × batch_size=1 × grad_accum=4)
-    - DeepSpeed ZeRO-3 + FlashAttention-2
-    - 数据: 800 条高质量推理样本
-
-双机启动（16卡 A100 80G）：
-    硬件要求：双机必须有 100G+ 网络互连（RoCE/InfiniBand），否则通信成为严重瓶颈。
-
-    推荐：只在主节点 (Node 0) 启动，由脚本内部 SSH 拉起 Node 1 worker:
-        export NNODES=2
-        export NODE_RANK=0
-        export NODE1_HOST=<node1 ssh目标>
-        export MASTER_ADDR=<主节点IP>
-        export MASTER_PORT=29500
-        python scripts/llamafactory_math_sft_eval.py --dataset data.jsonl --output output/
-
-    兼容手动模式：也可以在从节点 (Node 1) 单独启动 worker:
-        export NNODES=2
-        export NODE_RANK=1
-        export MASTER_ADDR=<主节点IP>
-        export MASTER_PORT=29500
-        python scripts/llamafactory_math_sft_eval.py --dataset data.jsonl --output output/
-
-    注意：
-    1. 两个节点必须使用相同的 --dataset 和 --output 路径（共享文件系统）
-    2. 显存占用估算：ZeRO-3 将 32B 模型状态均摊至 ~32GB/卡，激活值约 20-25GB，总占用 55-65GB
-    3. 全局批次大小 = NNODES × (NUM_GPUS/NNODES) × BATCH_SIZE × GRAD_ACCUM = 2 × 8 × 1 × 4 = 64
+训练超参沿用 LIMO 论文配置（2502.03387）：序列长度 16384、学习率 5e-6、15 epochs、
+无 warmup（保留 5 步防初期震荡）、ZeRO-3。全局批次 = SFT_NUM_GPUS × BATCH_SIZE × GRAD_ACCUM。
+基座与卡数经 SFT_BASE_MODEL / SFT_NUM_GPUS 覆盖；换基座时记得同步 CUTOFF_LEN 与 EVAL_* 的
+上下文长度，以及 EVAL_TP_SIZE × EVAL_DP_SIZE（须整除可用卡数）。
 
 评测环境依赖：
     - vLLM: 0.19.1 (DP>1 通过 vllm serve + OpenAI API 模式)
@@ -86,15 +62,14 @@ NUM_EPOCHS = float(os.environ.get("SFT_NUM_EPOCHS", "15"))
 LEARNING_RATE = float(os.environ.get("SFT_LEARNING_RATE", "5.0e-6"))
 BATCH_SIZE = int(os.environ.get("SFT_BATCH_SIZE", "1"))
 GRAD_ACCUM = int(os.environ.get("SFT_GRAD_ACCUM", "4"))
-NUM_GPUS = int(os.environ.get("SFT_NUM_GPUS", "16"))  # 训练：双机总卡数（torchrun 分布式）
+NUM_GPUS = int(os.environ.get("SFT_NUM_GPUS", "8"))  # 训练：本机参与训练的卡数（torchrun）
 CUTOFF_LEN = int(os.environ.get("SFT_CUTOFF_LEN", "16384"))  # LIMO 序列长度
 WARMUP_STEPS = int(os.environ.get("SFT_WARMUP_STEPS", "5"))  # 论文无 warmup，保留5步防初期震荡
 # 评测：使用独立 vLLM 脚本，支持 TP（tensor parallel）+ DP（data parallel）。
-# 32B 权重 bf16≈64GB，使用 TP=4（每卡 16GB）在 4×A100 80G 上运行。
-# vLLM 0.19.1 DP>1 时自动启动 vllm serve + OpenAI API 模式推理（8 GPU）。
+# TP × DP 必须整除本机可用卡数；换基座后按权重大小调 TP（单卡放得下就 TP=1、把卡都给 DP 更快）。
 TP_SIZE = int(os.environ.get("EVAL_TP_SIZE", "4"))
-DP_SIZE = int(os.environ.get("EVAL_DP_SIZE", "2"))  # 默认 DP=2，配合 TP=4 使用全部 8 张 GPU
-MAX_MODEL_LEN = int(os.environ.get("EVAL_MAX_MODEL_LEN", "32768"))  # Qwen2.5-32B 上下文窗口,与LIMO一致
+DP_SIZE = int(os.environ.get("EVAL_DP_SIZE", "2"))  # 默认 4×2，占满 8 卡
+MAX_MODEL_LEN = int(os.environ.get("EVAL_MAX_MODEL_LEN", "32768"))  # 需 ≤ 基座上下文窗口
 MAX_NEW_TOKENS = int(os.environ.get("EVAL_MAX_NEW_TOKENS", "32768"))  # 评测生成长度上限，与 LIMO 一致(实际受 MAX_MODEL_LEN-prompt 挤占)
 HF_CACHE_DIR = os.environ.get("HF_CACHE_DIR", "./hf_cache")  # HuggingFace 缓存目录（vLLM tokenizer）
 MAX_BAD_CASES_PER_BENCH = 30
@@ -102,123 +77,8 @@ SFT_TRAIN_TIMEOUT_SEC = int(os.environ.get("SFT_TRAIN_TIMEOUT_SEC", "21600"))
 TRAIN_RUN_ID = os.environ.get("DF_TRAIN_RUN_ID", "manual")
 
 
-def _node_rank() -> int:
-    """本进程的节点 rank（NODE_RANK；单机/未设时为 0）。用于双机下只让 rank0 做评测。"""
-    try:
-        return int(os.environ.get("NODE_RANK", "0"))
-    except ValueError:
-        return 0
-
-
-def _nnodes() -> int:
-    try:
-        return int(os.environ.get("NNODES", "1"))
-    except ValueError:
-        return 1
-
-
-def _node1_host() -> str:
-    return os.environ.get("NODE1_HOST", "").strip()
-
-
-def _ssh_opts() -> str:
-    return os.environ.get("SSH_OPTS", "").strip()
-
-
-def _remote_cwd() -> str:
-    return os.environ.get("REMOTE_CWD", "").strip() or os.getcwd()
-
-
-def _remote_python() -> str:
-    return os.environ.get("SFT_REMOTE_PYTHON", sys.executable)
-
-
 def _eval_python() -> str:
     return os.environ.get("SFT_EVAL_PYTHON", "").strip()
-
-
-def _should_launch_remote_worker() -> bool:
-    return _node_rank() == 0 and _nnodes() > 1
-
-
-def _read_sysfs_text(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
-
-
-def _detect_nccl_ib_hca_and_gid_index(socket_ifname: str) -> tuple[str | None, str | None]:
-    base = Path("/sys/class/infiniband")
-    if not socket_ifname or not base.exists():
-        return None, None
-
-    candidates: list[tuple[int, str, str]] = []
-    for ndev_path in base.glob("*/ports/*/gid_attrs/ndevs/*"):
-        if _read_sysfs_text(ndev_path) != socket_ifname:
-            continue
-
-        gid_index = ndev_path.name
-        port_dir = ndev_path.parents[2]
-        gid_value = _read_sysfs_text(port_dir / "gids" / gid_index)
-        gid_type = _read_sysfs_text(ndev_path.parents[1] / "types" / gid_index)
-        if not gid_value or gid_value == "0000:0000:0000:0000:0000:0000:0000:0000":
-            continue
-
-        is_link_local = gid_value.lower().startswith("fe80:")
-        if gid_type == "RoCE v2" and not is_link_local:
-            score = 0
-        elif gid_type == "IB/RoCE v1" and not is_link_local:
-            score = 1
-        elif gid_type == "RoCE v2":
-            score = 2
-        elif gid_type == "IB/RoCE v1":
-            score = 3
-        else:
-            score = 9
-
-        hca = ndev_path.parents[4].name
-        port = port_dir.name
-        candidates.append((score, f"{hca}:{port}", gid_index))
-
-    if not candidates:
-        return None, None
-
-    _, hca, gid_index = min(candidates)
-    return hca, gid_index
-
-
-def _ensure_nccl_ib_env_from_socket_ifname() -> None:
-    if os.environ.get("NCCL_IB_DISABLE", "").strip() == "1":
-        return
-
-    socket_ifname = os.environ.get("NCCL_SOCKET_IFNAME", "").strip()
-    if not socket_ifname:
-        return
-
-    hca_is_explicit = bool(os.environ.get("NCCL_IB_HCA", "").strip())
-    gid_is_explicit = bool(os.environ.get("NCCL_IB_GID_INDEX", "").strip())
-    if hca_is_explicit and gid_is_explicit:
-        return
-
-    hca, gid_index = _detect_nccl_ib_hca_and_gid_index(socket_ifname)
-    if not hca and not gid_index:
-        logger.warning("无法根据 NCCL_SOCKET_IFNAME=%s 推断 NCCL_IB_HCA / NCCL_IB_GID_INDEX", socket_ifname)
-        return
-
-    if not hca_is_explicit and hca:
-        os.environ["NCCL_IB_HCA"] = hca
-        os.environ["DF_AUTO_NCCL_IB_HCA"] = "1"
-    if not gid_is_explicit and gid_index:
-        os.environ["NCCL_IB_GID_INDEX"] = gid_index
-        os.environ["DF_AUTO_NCCL_IB_GID_INDEX"] = "1"
-
-    logger.info(
-        "自动设置 NCCL RDMA 配置: NCCL_SOCKET_IFNAME=%s, NCCL_IB_HCA=%s, NCCL_IB_GID_INDEX=%s",
-        socket_ifname,
-        os.environ.get("NCCL_IB_HCA", ""),
-        os.environ.get("NCCL_IB_GID_INDEX", ""),
-    )
 
 
 def _kill_process_tree(pid: int) -> None:
@@ -270,144 +130,6 @@ def _stream_subprocess(
             ) from exc
 
 
-def _forward_remote_env() -> dict[str, str]:
-    prefixes = (
-        "SFT_",
-        "EVAL_",
-        "HF_",
-        "MATH_",
-        "GLOO_",
-        "NCCL_",
-        "CUDA_",
-        "TORCH_",
-        "OMP_",
-        "MKL_",
-    )
-    exact = {
-        "PATH",
-        "PYTHONPATH",
-        "LD_LIBRARY_PATH",
-        "HF_TOKEN",
-        "HUGGING_FACE_HUB_TOKEN",
-        "TRANSFORMERS_CACHE",
-        "HF_HOME",
-        "HF_DATASETS_CACHE",
-        "XDG_CACHE_HOME",
-        "CUDA_VISIBLE_DEVICES",
-        "CONDA_PREFIX",
-        "CONDA_DEFAULT_ENV",
-        "VIRTUAL_ENV",
-        "NO_PROXY",
-        "no_proxy",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "MASTER_ADDR",
-        "MASTER_PORT",
-        "NNODES",
-        "SFT_NUM_GPUS",
-        "DF_TRAIN_RUN_ID",
-    }
-    env: dict[str, str] = {}
-    auto_ib_hca = os.environ.get("DF_AUTO_NCCL_IB_HCA") == "1"
-    auto_ib_gid = os.environ.get("DF_AUTO_NCCL_IB_GID_INDEX") == "1"
-    for key, value in os.environ.items():
-        if not value:
-            continue
-        if auto_ib_hca and key == "NCCL_IB_HCA":
-            continue
-        if auto_ib_gid and key == "NCCL_IB_GID_INDEX":
-            continue
-        if key in exact or key.startswith(prefixes):
-            env[key] = value
-    return env
-
-
-def _build_remote_worker_ssh_cmd(dataset_path: Path, output_dir: Path, mode: str) -> list[str]:
-    node1_host = _node1_host()
-    if not node1_host:
-        raise RuntimeError("NNODES>1 但未设置 NODE1_HOST，无法从 node0 拉起 node1 worker")
-
-    env = _forward_remote_env()
-    env.update({
-        "NNODES": str(_nnodes()),
-        "NODE_RANK": "1",
-        "MASTER_ADDR": os.environ.get("MASTER_ADDR", ""),
-        "MASTER_PORT": os.environ.get("MASTER_PORT", "29500"),
-        "SFT_NUM_GPUS": os.environ.get("SFT_NUM_GPUS", str(NUM_GPUS)),
-        "FORCE_TORCHRUN": "1",
-        "DF_TRAIN_RUN_ID": TRAIN_RUN_ID,
-        "NODE1_HOST": node1_host,
-        "REMOTE_CWD": _remote_cwd(),
-        "SSH_OPTS": _ssh_opts(),
-        "SFT_REMOTE_PYTHON": _remote_python(),
-    })
-    env_prefix = " ".join(
-        f"{key}={shlex.quote(value)}" for key, value in sorted(env.items())
-    )
-
-    script_path = Path("scripts") / Path(__file__).name
-    remote_inner = " ".join(
-        shlex.quote(token)
-        for token in [
-            _remote_python(),
-            str(script_path),
-            "--dataset",
-            str(dataset_path.resolve()),
-            "--output",
-            str(output_dir.resolve()),
-            "--mode",
-            mode,
-        ]
-    )
-    remote_cmd = f"cd {shlex.quote(_remote_cwd())} && {env_prefix} {remote_inner}"
-    ssh_cmd = ["ssh"]
-    if _ssh_opts():
-        ssh_cmd += shlex.split(_ssh_opts())
-    ssh_cmd += [node1_host, remote_cmd]
-    return ssh_cmd
-
-
-def _launch_remote_worker(dataset_path: Path, output_dir: Path, mode: str) -> subprocess.Popen:
-    ssh_cmd = _build_remote_worker_ssh_cmd(dataset_path, output_dir, mode)
-    remote_log = output_dir / "train_node1.log"
-    logger.info("SSH 拉起 node1 worker：%s", " ".join(ssh_cmd))
-    logf = open(remote_log, "w", encoding="utf-8")  # noqa: SIM115
-    proc = subprocess.Popen(ssh_cmd, stdout=logf, stderr=subprocess.STDOUT, text=True)
-    proc._logfile = logf  # type: ignore[attr-defined]
-    return proc
-
-
-def _close_logfile(proc: subprocess.Popen) -> None:
-    lf = getattr(proc, "_logfile", None)
-    if lf is not None:
-        try:
-            lf.close()
-        except OSError:
-            pass
-
-
-def _stop_remote_worker(proc: subprocess.Popen) -> None:
-    try:
-        _kill_process_tree(proc.pid)
-    except Exception:  # noqa: BLE001
-        pass
-    finally:
-        _close_logfile(proc)
-
-
-def _wait_remote_worker(proc: subprocess.Popen, timeout_sec: int) -> None:
-    try:
-        rc = proc.wait(timeout=timeout_sec)
-    except subprocess.TimeoutExpired as exc:
-        _stop_remote_worker(proc)
-        raise TimeoutError(f"node1 worker 未在 {timeout_sec}s 内收尾") from exc
-    finally:
-        _close_logfile(proc)
-    if rc != 0:
-        raise RuntimeError(f"node1 worker 非零退出（{rc}），详见 train_node1.log")
-
 
 def _load_results_json(results_path: Path) -> dict:
     if not results_path.exists():
@@ -418,7 +140,9 @@ def _load_results_json(results_path: Path) -> dict:
         raise RuntimeError(f"results.json 解析失败：{results_path}") from exc
 
 
-def _run_eval_with_standalone_script(model_dir: Path, output_dir: Path, mode: str, eval_python: str) -> dict:
+def _run_eval_with_standalone_script(
+    model_dir: Path, output_dir: Path, mode: str, eval_python: str, dev_set: str = ""
+) -> dict:
     """使用独立的 vLLM 评测脚本运行评测（避免 CUDA fork 问题）。
 
     DP>1 时由独立脚本内部自动启动 vllm serve + OpenAI API 模式推理。
@@ -438,6 +162,8 @@ def _run_eval_with_standalone_script(model_dir: Path, output_dir: Path, mode: st
         "--max-model-len", str(MAX_MODEL_LEN),
         "--max-new-tokens", str(MAX_NEW_TOKENS),
     ]
+    if dev_set:
+        cmd += ["--dev-set", str(Path(dev_set).resolve())]
 
     env = dict(os.environ)
     env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -453,14 +179,9 @@ def _run_eval_with_standalone_script(model_dir: Path, output_dir: Path, mode: st
         env["CUDA_VISIBLE_DEVICES"] = default_gpus
         logger.info("评测使用默认 GPU: %s", default_gpus)
 
-    # 清理不需要的环境变量
-    for key in (
-        "NODE1_HOST",
-        "FORCE_TORCHRUN",
-        "SFT_REMOTE_PYTHON",
-        "SFT_EVAL_PYTHON",
-        "DF_EVAL_EXTERNAL_LAUNCHER",
-    ):
+    # 清掉训练阶段的分布式痕迹：评测是独立的单进程 vLLM 作业，继承 FORCE_TORCHRUN 之类
+    # 会让它误以为自己在 torchrun 里。SFT_EVAL_PYTHON 留着则会递归再拉一层评测。
+    for key in ("FORCE_TORCHRUN", "SFT_EVAL_PYTHON", "DF_EVAL_EXTERNAL_LAUNCHER"):
         env.pop(key, None)
 
     logger.info("使用独立 vLLM 评测脚本：%s", script_path)
@@ -492,7 +213,7 @@ def _run_eval_with_standalone_script(model_dir: Path, output_dir: Path, mode: st
     return _load_results_json(results_path)
 
 
-def _run_eval_stage(model_dir: Path, output_dir: Path, mode: str) -> dict:
+def _run_eval_stage(model_dir: Path, output_dir: Path, mode: str, dev_set: str = "") -> dict:
     """执行评测阶段。
 
     SFT 的 save_model 直接把 HF bf16 safetensors 落在 model_dir，评测直接使用即可。
@@ -505,7 +226,9 @@ def _run_eval_stage(model_dir: Path, output_dir: Path, mode: str) -> dict:
             "未配置评测环境 python（SFT_EVAL_PYTHON 环境变量为空）。"
             "评测必须在独立的 df-eval 环境中运行。"
         )
-    return _run_eval_with_standalone_script(eval_model_dir, output_dir, mode, eval_python)
+    return _run_eval_with_standalone_script(
+        eval_model_dir, output_dir, mode, eval_python, dev_set
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -611,11 +334,10 @@ def convert_dataset(src_path: Path, dst_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# 2. LlamaFactory Full SFT (LIMO 配置: Qwen2.5-32B + ZeRO-3)
+# 2. LlamaFactory Full SFT（LIMO 超参 + ZeRO-3，单机多卡）
 # ---------------------------------------------------------------------------
 def run_sft(data_dir: Path, output_dir: Path) -> Path:
     """调用 LlamaFactory CLI 执行全量 SFT 训练（LIMO 论文配置）。返回模型输出目录。"""
-    rank = _node_rank()
     model_dir = output_dir / "sft_model"
     model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -699,8 +421,7 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
     import yaml
     sft_yaml_path.write_text(yaml.dump(sft_config, default_flow_style=False), encoding="utf-8")
 
-    # 执行训练：LlamaFactory 内部调用 torchrun 管理分布式。
-    # 双机配置通过环境变量传递（NNODES, NODE_RANK, MASTER_ADDR, MASTER_PORT）
+    # 执行训练：LlamaFactory 内部调用 torchrun 管理单机多卡。
     cmd = [
         sys.executable, "-u", "-m", "llamafactory.cli", "train",
         str(sft_yaml_path),
@@ -709,22 +430,17 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
     env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
     env["PYTHONUNBUFFERED"] = "1"
     env["FORCE_TORCHRUN"] = "1"
-    # 双机配置：需在启动脚本外设置 NNODES=2, NODE_RANK=0/1, MASTER_ADDR, MASTER_PORT
-    env.setdefault("NNODES", "1")  # 单机默认，双机需外部设置为 2
-    env["NPROC_PER_NODE"] = str(NUM_GPUS // int(env.get("NNODES", "1")))  # 每机GPU数
+    env["NPROC_PER_NODE"] = str(NUM_GPUS)
     env.setdefault("MASTER_PORT", "29500")
-    # HF datasets 缓存按 node_rank 隔离：多节点共享 vepfs 时若指向同一 datasets 缓存目录，
-    # 首次生成会竞态——两节点各写各的 *.incomplete/，谁先原子 rename 成最终名，另一节点手里
-    # 的 .incomplete 路径就"文件消失"(OSError: Cannot find data file)。给每个节点独立的绝对
-    # 缓存目录即可根治（数据量小，重复预处理开销可忽略）；硬设覆盖外部转发进来的相对/共享路径。
-    env["HF_DATASETS_CACHE"] = str((output_dir / f"hf_datasets_cache_node{rank}").resolve())
+    # datasets 缓存放进本次输出目录：默认的共享缓存会让并发/连续的多次训练互相踩
+    # （*.incomplete 目录被另一次运行原子 rename 掉 → OSError: Cannot find data file）。
+    # 数据量小，重复预处理的开销可忽略。
+    env["HF_DATASETS_CACHE"] = str((output_dir / "hf_datasets_cache").resolve())
 
     logger.info("开始 Full SFT 训练 (LIMO 配置): %s", " ".join(cmd))
-    logger.info("分布式配置: NNODES=%s, NPROC_PER_NODE=%s, MASTER_ADDR=%s, MASTER_PORT=%s",
-                env.get("NNODES"), env["NPROC_PER_NODE"],
-                env.get("MASTER_ADDR", "localhost"), env.get("MASTER_PORT"))
+    logger.info("单机 %s 卡，MASTER_PORT=%s", env["NPROC_PER_NODE"], env.get("MASTER_PORT"))
 
-    log_path = output_dir / f"sft_train_rank{rank}.log"
+    log_path = output_dir / "sft_train.log"
     returncode = _stream_subprocess(
         cmd,
         cwd=str(output_dir),
@@ -738,9 +454,7 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
 
     logger.info("Full SFT 训练完成，模型保存于：%s", model_dir)
 
-    # 只在 rank0 执行 DeepSpeed checkpoint 转换和清理
-    if rank == 0:
-        _convert_and_cleanup_checkpoint(model_dir, output_dir)
+    _convert_and_cleanup_checkpoint(model_dir, output_dir)
 
     return model_dir
 
@@ -835,6 +549,11 @@ def main() -> None:
         "--mode", default="dev", choices=["dev", "test"],
         help="dev=MATH train only（MCTS 迭代）；test=full math/science benchmark suite（终评）",
     )
+    parser.add_argument(
+        "--dev-set", default="",
+        help="框架物化好的 dev 集 jsonl（core/dev_set.py）。--mode dev 必需：评哪些题由框架"
+             "决定，本脚本不抽样也不猜默认题库。--mode test 忽略此项（终评走固定 benchmark）。",
+    )
     args = parser.parse_args()
 
     dataset_path = Path(args.dataset) if args.dataset else None
@@ -842,16 +561,21 @@ def main() -> None:
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
     mode = args.mode
-    rank = _node_rank()
-    remote_proc: subprocess.Popen | None = None
-
-    _ensure_nccl_ib_env_from_socket_ifname()
 
     # 标记失败发生在哪个阶段：训练/准备阶段的致命错误应以非零退出（上层判「训练失败」），
     # 只有真正进入评测后才允许回写 score=0.0。
     eval_started = False
 
     try:
+        # 缺 dev 题集要在动 GPU 之前就拦下：这条链路是「先 SFT 再评测」，等到评测阶段才发现
+        # 题集没给，一整轮训练已经烧掉了。
+        if mode == "dev" and not args.dev_set:
+            raise RuntimeError(
+                "--mode dev 需要 --dev-set：dev 题集由框架按 trainer.dev_set 物化后下传"
+                "（见 core/dev_set.py）。trainer.dev_set.source 留空则不会物化，请配上它；"
+                "手动跑评测时自行传一份题集文件。"
+            )
+
         if model_dir is not None:
             # --model-dir 模式：本质就是纯评测已有模型
             if not model_dir.exists():
@@ -859,41 +583,26 @@ def main() -> None:
 
             eval_python = _eval_python() or sys.executable
             eval_started = True
-            results = _run_eval_with_standalone_script(model_dir, output_dir, mode, eval_python)
+            results = _run_eval_with_standalone_script(
+                model_dir, output_dir, mode, eval_python, args.dev_set
+            )
         else:
             if dataset_path is None:
                 raise RuntimeError("未提供 --dataset；训练模式下必须指定输入数据集")
-            if _nnodes() > 1 and rank == 0 and not _node1_host():
-                raise RuntimeError("NNODES>1 但未设置 NODE1_HOST")
 
-            # 1. 数据转换完全由 node0 / rank0 负责；node1 worker 不再介入。
+            # 1. 格式转换：DataFlow JSONL → LlamaFactory sharegpt
             data_dir = output_dir / "sft_data"
-            if rank == 0:
-                convert_dataset(dataset_path, data_dir)
+            convert_dataset(dataset_path, data_dir)
 
-            # 2. 双机模式：由 node0 脚本内部先 SSH 拉起 node1 worker，再本地进入 rank0 训练。
-            if _should_launch_remote_worker():
-                remote_proc = _launch_remote_worker(dataset_path, output_dir, mode)
-
-            # 3. Full SFT：torchrun 在两机间协调的分布式作业。
+            # 2. Full SFT：单机多卡，torchrun 由 LlamaFactory 内部拉起
             model_dir = run_sft(data_dir, output_dir)
-            if remote_proc is not None:
-                _wait_remote_worker(remote_proc, timeout_sec=max(60, SFT_TRAIN_TIMEOUT_SEC // 100))
-                remote_proc = None
 
-            # 4. 评测：只在 rank0 单机执行；node1 worker 训练完即退出。
-            if rank != 0:
-                logger.info("rank=%d 训练完成，非 rank0 不参与评测，退出。", rank)
-                return
+            # 3. 评测
             eval_started = True
-            results = _run_eval_stage(model_dir, output_dir, mode=mode)
+            results = _run_eval_stage(model_dir, output_dir, mode=mode, dev_set=args.dev_set)
 
     except Exception as exc:
         logger.error("流程失败：%s", exc, exc_info=True)
-        if remote_proc is not None:
-            _stop_remote_worker(remote_proc)
-        if rank != 0:
-            return  # 非 rank0 失败不写 results.json（由 rank0 统一裁决）
         # 走到这里=训练或评测「没跑成」(基础设施/致命错误)：一律非零退出，让上层 TrainerWrapper
         # 命中 rc!=0 → TrainResult(failed=True) → 节点按「系统级失败」处理。
         # 关键：真·0 分【绝不】经过此异常路径——评测正常跑完(哪怕全错)会把 score=0.0 写进
@@ -903,7 +612,7 @@ def main() -> None:
         logger.error("%s阶段失败，非零退出（判定为系统级失败 failed，非「评测 0 分」）。", stage)
         sys.exit(1)
 
-    # 4. 输出（仅 rank0 到达此处）
+    # 4. 输出
     results_path = output_dir / "results.json"
     results_path.write_text(
         json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
