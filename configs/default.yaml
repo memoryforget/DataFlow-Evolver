@@ -7,7 +7,7 @@ project:
   # 输入语料目录：**放了数据就是 corpus-grounded 合成**（流水线入口指向语料，在其之上加工），
   # 目录空/不存在就是 from-scratch 合成（凭模型知识从零合成）。范式由目录内容决定，无需另设开关。
   input_dir: ./input
-  input_entry: ""                          # 目录内多个数据文件时显式指定入口（相对 input_dir）；留空=自动选
+  input_entry: ${MATH_INPUT_ENTRY:gsm8k_train_pool.jsonl}  # 目录内多个数据文件时显式指定入口（相对 input_dir）；留空=自动选
   data_links_dir: ""                       # 外部数据集下载目录（跨节点共享）；留空=<workspace>/data_links
 
 # 非-SDK 模型后端
@@ -23,9 +23,9 @@ llm:
   # 省略的字段逐字段回退到 api 段；整段删掉=行为与旧版一致（全部用 api）。
   pipeline_llm:
     generation:                              # 题目/数据生成类算子
-      model_name: gpt-5.5
+      model_name: gpt-4o
     reasoning:                               # 推理/解题/CoT 类算子
-      model_name: deepseek-v4-pro
+      model_name: gpt-4o
   vllm:
     hf_model_name_or_path: ${VLLM_MODEL:Qwen/Qwen2.5-7B-Instruct}
     tensor_parallel_size: 1
@@ -76,7 +76,7 @@ discovery:
 
 # 数据生成规模：注入生成 prompt，指导算子产出量（合成式据此设 num_samples，转换式控采样/过滤）
 generation:
-  target_samples: 800                      # 目标产出条数（0=不指定）；按下游 SFT 需求调，Condor 建议 <5000
+  target_samples: ${MATH_TARGET_SAMPLES:4000}  # 目标产出条数（0=不指定）；按下游 SFT 需求调，Condor 建议 <5000
   # 训练前把数据切齐到 target_samples 条（默认 true）。训练配方在框架外冻结，总优化步数
   # 正比于条数，不切齐则多产数据的节点白拿更多梯度步数，分数不再只反映数据质量。
   # 关掉它等于把"数据量"也放进搜索空间——想做"更多数据是否更好"的消融时才关。
@@ -107,7 +107,7 @@ search:
   exploration_constant: 1.414
   exploration_decay: 1.0                    # 探索常数 c 的指数衰减率（按已评估节点数）；1.0=不衰减
   exploration_min: 0.0                      # 衰减下限，防 c 衰减到 0
-  max_iterations: 10
+  max_iterations: ${MATH_MAX_ITERATIONS:5}
   max_children_per_node: 4
   memory_top_k: 5                          # 注入 PipelineAgent prompt 的历史节点条数（按有效质量分降序：有下游真分用真分，否则用 tier1）
   memory_max_issues: 3                     # 每条记忆携带的评审 issues 条数（-1=全部，0=不带）
@@ -190,8 +190,9 @@ trainer:
   # eval 环境的 python 路径（df-eval；负责 vLLM benchmark 评测）
   # 留空则在 train 进程内直接评测（仅适合同环境开发/调试）
   eval_python: /vepfs-mlp2/c20250602/500050/lh/xqf/miniconda3/envs/df-eval/bin/python
-  # 下游训练脚本实际接受的字段名——流水线产出的**权威契约**，会覆盖 TaskProfiler 的推断，
-  # 并作为评审硬门槛（字段对不上在训练前就判不通过，见 review.null_threshold）。
+  # 下游训练脚本实际读取的必需字段名——流水线产出的**权威契约**，会覆盖 TaskProfiler 的推断，
+  # 并作为评审硬门槛（必需字段对不上在训练前就判不通过，见 review.null_threshold）。
+  # 注意：这不是“只能有这些字段”。训练脚本只读取这些字段，额外元数据/溯源字段会被忽略。
   # 留空 = 让 LLM 自行设计字段名，对不上要到训练阶段才炸，且报错看不出根因是字段名。
   # 取值须与训练脚本的取字段逻辑一致：llamafactory_math_sft_eval.py 与
   # posttrainbench_sft_eval.py 都以 instruction/output 为首选键。
@@ -210,9 +211,9 @@ trainer:
   #   框架这套口径就形同虚设。要跑 dev 就得把题集来源明确写在这里。
   dev_set:
     # 源文件不入库，需自行准备（见 data/README.md）。
-    source: data/math_train.jsonl   # MATH competition train（7500 条公开训练语料，非 benchmark test）
-    size: 500                       # 从 source 里抽多少条；0 = 全量
-    seed: 42
+    source: ${MATH_DEV_SET_SOURCE:data/gsm8k_dev.jsonl}   # 从 GSM8K train 预切出的 dev 集（非 benchmark test）
+    size: ${MATH_DEV_SET_SIZE:0}                       # 从 source 里抽多少条；0 = 全量
+    seed: ${MATH_DEV_SET_SEED:42}
   # 防数据泄露纪律（见 docs/design-decisions.md §3）：
   #   dev：仅给 MCTS 当奖励信号，允许被「刷」；test：全程对 loop 不可见，仅终评一次。
   dev_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode dev     # Full SFT + 上面物化的 dev 题集

@@ -248,7 +248,7 @@ class Orchestrator:
             # dev 是搜索直接优化的目标，把 dev 题混进合成数据是最省力的刷分路径——比混 test
             # 更有效，因为 test 全程不参与 loop。它必须在去污染参考集里，且不能指望用户记得配。
             self.contamination.add_file(self.dev_set.path)
-        # 下游训练脚本实际接受的字段。它决定流水线该产出什么、评审按什么打分，是**契约**而非
+        # 下游训练脚本实际读取的必需字段。它决定流水线至少该产出什么、评审按什么打分，是**契约**而非
         # 建议——不配则退回 TaskProfiler 让 LLM 现编字段名，而编出来的名字（problem/solution
         # 之类都很合理）与脚本的取字段逻辑对不上时，评审照样满分放行，直到训练阶段才炸，还会
         # 被记成「训练脚本非零退出」。
@@ -307,15 +307,15 @@ class Orchestrator:
         # 树搜索
         search = cfg.search
         self.tree = TreeManager(
-            exploration_constant=search.get("exploration_constant", 1.414),
-            max_children_per_node=search.get("max_children_per_node", 4),
-            exploration_decay=search.get("exploration_decay", 1.0),
-            exploration_min=search.get("exploration_min", 0.0),
-            memory_top_k=search.get("memory_top_k", 5),
-            memory_max_issues=search.get("memory_max_issues", 3),
-            memory_issue_maxlen=search.get("memory_issue_maxlen", 120),
+            exploration_constant=float(search.get("exploration_constant", 1.414)),
+            max_children_per_node=int(search.get("max_children_per_node", 4)),
+            exploration_decay=float(search.get("exploration_decay", 1.0)),
+            exploration_min=float(search.get("exploration_min", 0.0)),
+            memory_top_k=int(search.get("memory_top_k", 5)),
+            memory_max_issues=int(search.get("memory_max_issues", 3)),
+            memory_issue_maxlen=int(search.get("memory_issue_maxlen", 120)),
         )
-        self.max_iterations = search.get("max_iterations", 10)
+        self.max_iterations = int(search.get("max_iterations", 10))
         # 预算感知（review 两段式专用；0=关闭，仅按 max_iterations 停）：
         #   time_budget_sec 为整轮（搜索+终选+终评）总墙钟预算。搜索会在预留出「终选+终评」
         #   所需时间后停止扩展；预留不足时 _final_selection 会自动缩小 K（极端 K=1）。
@@ -327,8 +327,8 @@ class Orchestrator:
         self.final_eval_reserve_sec = float(
             search.get("final_eval_reserve_sec", train_timeout)
         )
-        self.self_correction_retries = search.get("self_correction_retries", 5)
-        self.review_self_correction_retries = search.get("review_self_correction_retries", 5)
+        self.self_correction_retries = int(search.get("self_correction_retries", 5))
+        self.review_self_correction_retries = int(search.get("review_self_correction_retries", 5))
         # 基础设施（Agent SDK）失败熔断：连续失败达到阈值则主动终止；每次失败退避后重试本轮
         self.max_consecutive_infra = int(search.get("max_consecutive_infra_failures", 5))
         self.infra_backoff_sec = float(search.get("infra_backoff_sec", 30))

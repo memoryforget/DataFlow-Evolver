@@ -44,8 +44,9 @@ def build_profiler_prompt(
     schema_block = ""
     if fixed_schema:
         schema_block = (
-            f"\n【schema 已固定】下游训练脚本只接受这组字段，`target_schema` 必须原样输出它，"
-            f"不要改名、增删或换同义词：\n{fixed_schema}\n"
+            f"\n【schema 已固定】下游训练脚本按这组必需字段读取数据，`target_schema` 必须原样输出它，"
+            f"不要改名或换同义词；最终数据可以保留额外元数据/溯源字段，只要必需字段存在且非空：\n"
+            f"{fixed_schema}\n"
         )
     return PROFILER_PROMPT.format(
         task_description=task_description,
@@ -76,7 +77,8 @@ Entry file: {entry_path}
 算子必须继承 OperatorABC（`from dataflow.core import OperatorABC`），实现 run() 方法。\
 然后把流水线主文件写入 `{node_dir}/pipeline.py`，决策 JSON 写入 `{node_dir}/decision.json`。
 3. {paradigm_rule}
-4. 目标 schema（下游期望字段及类型）：{target_schema}
+4. 目标 schema（下游训练读取的必需字段及类型）：{target_schema}。最终 JSONL 至少要包含这些字段且非空；
+   可额外保留中间字段、溯源字段或辅助标签，下游训练脚本会忽略不使用的字段。
 5. 流水线里的 LLM serving 必须用 `APILLMServing_request`，并严格使用下列参数：
 {llm_block}
 6. FileStorage 的 `cache_path` 设为 `{node_dir}/cache`，使产物落在本节点目录内。\
@@ -537,7 +539,7 @@ REVIEW_PROMPT = """你是数据质量评审员。下面是某条流水线生成�
 以及目标任务画像。请从五个维度评估这批**合成数据**用于微调目标模型的价值（各维 0.0-1.0）。
 
 目标任务：{task_description}
-期望 schema（字段→类型）：{target_schema}
+期望 schema（下游训练读取的必需字段→类型）：{target_schema}
 质量要点：{quality_criteria}
 
 数据抽样（每行一条 JSON）：
@@ -548,7 +550,7 @@ REVIEW_PROMPT = """你是数据质量评审员。下面是某条流水线生成�
 - relevance_score：与目标任务/领域的相关性。
 - difficulty_score：对目标模型是否**非平凡且可学**——中间难度带最高；过于简单（无学习价值）或超纲无法学都要扣分。
 - diversity_score：抽样批内的多样性、是否存在大量近重复/模板化雷同。
-- schema_score：字段齐全度与类型符合度。
+- schema_score：必需字段的齐全度与类型符合度；额外元数据/溯源字段不应扣分。
 
 常见失败信号（若明确命中，请在 failure_signals 中列出对应编号；没有则留空数组）：
 {failure_signal_block}

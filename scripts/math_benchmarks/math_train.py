@@ -49,10 +49,10 @@ def load_math_train(data_path: str, cache_dir: str | None = None) -> list[dict]:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            question = row.get("problem", "")
-            gold = row.get("answer", "")
-            if not gold:
-                gold = extract_boxed(row.get("solution", "")) or ""
+            question = _first_text(row, ("problem", "question", "instruction", "input", "prompt"))
+            if not question:
+                continue
+            gold = _gold_answer(row)
             examples.append({
                 "question": question,
                 "gold_answer": gold,
@@ -61,6 +61,24 @@ def load_math_train(data_path: str, cache_dir: str | None = None) -> list[dict]:
             })
 
     return examples
+
+
+def _first_text(row: dict, keys: tuple[str, ...]) -> str:
+    return next((str(row[k]).strip() for k in keys if row.get(k)), "")
+
+
+def _gold_answer(row: dict) -> str:
+    for key in ("gold_answer", "answer", "output", "generated_cot", "solution"):
+        text = str(row.get(key, "") or "").strip()
+        if not text:
+            continue
+        if "####" in text:
+            return text.split("####")[-1].strip()
+        boxed = extract_boxed(text)
+        if boxed:
+            return boxed
+        return text
+    return ""
 
 
 def build_prompt(question: str) -> str:

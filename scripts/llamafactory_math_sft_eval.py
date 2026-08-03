@@ -13,12 +13,13 @@
 
 流程：
     1. 数据格式转换（DataFlow JSONL → LlamaFactory sharegpt 格式）
-    2. LlamaFactory Full SFT（DeepSpeed ZeRO-3 + FlashAttention-2，单机 SFT_NUM_GPUS 卡）
+    2. LlamaFactory Full SFT（单卡默认走原生 Trainer，多卡默认 DeepSpeed ZeRO-3）
     3. vLLM 推理（直接加载 fine-tuned 模型）对选定 bench 评测
     4. bench 取平均 accuracy → results.json
 
 训练超参沿用 LIMO 论文配置（2502.03387）：序列长度 16384、学习率 5e-6、15 epochs、
-无 warmup（保留 5 步防初期震荡）、ZeRO-3。全局批次 = SFT_NUM_GPUS × BATCH_SIZE × GRAD_ACCUM。
+无 warmup（保留 5 步防初期震荡）。多卡默认 ZeRO-3；单卡默认不启用 DeepSpeed，以提高 A100 利用率。
+全局批次 = SFT_NUM_GPUS × BATCH_SIZE × GRAD_ACCUM。
 基座与卡数经 SFT_BASE_MODEL / SFT_NUM_GPUS 覆盖；换基座时记得同步 CUTOFF_LEN 与 EVAL_* 的
 上下文长度，以及 EVAL_TP_SIZE × EVAL_DP_SIZE（须整除可用卡数）。
 
@@ -57,14 +58,28 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # 配置常量（可通过环境变量覆盖）— LIMO 论文配置
 # ---------------------------------------------------------------------------
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 BASE_MODEL = os.environ.get("SFT_BASE_MODEL", "/vepfs-mlp2/c20250602/500050/models/Qwen2.5-32B-Instruct")
 NUM_EPOCHS = float(os.environ.get("SFT_NUM_EPOCHS", "15"))
 LEARNING_RATE = float(os.environ.get("SFT_LEARNING_RATE", "5.0e-6"))
-BATCH_SIZE = int(os.environ.get("SFT_BATCH_SIZE", "1"))
-GRAD_ACCUM = int(os.environ.get("SFT_GRAD_ACCUM", "4"))
 NUM_GPUS = int(os.environ.get("SFT_NUM_GPUS", "8"))  # 训练：本机参与训练的卡数（torchrun）
+_SINGLE_GPU = NUM_GPUS == 1
+BATCH_SIZE = int(os.environ.get("SFT_BATCH_SIZE", "8" if _SINGLE_GPU else "1"))
+GRAD_ACCUM = int(os.environ.get("SFT_GRAD_ACCUM", "1" if _SINGLE_GPU else "4"))
 CUTOFF_LEN = int(os.environ.get("SFT_CUTOFF_LEN", "16384"))  # LIMO 序列长度
 WARMUP_STEPS = int(os.environ.get("SFT_WARMUP_STEPS", "5"))  # 论文无 warmup，保留5步防初期震荡
+FLASH_ATTN = os.environ.get("SFT_FLASH_ATTN", "sdpa").strip()  # Qwen3 + transformers 5.x 下 fa2 可能返回 None s_aux
+USE_DEEPSPEED = os.environ.get("SFT_USE_DEEPSPEED", "auto").strip().lower()
+SFT_OPTIM = os.environ.get("SFT_OPTIM", "adamw_torch_fused" if _SINGLE_GPU else "adamw_torch")
+SFT_PACKING = _env_flag("SFT_PACKING", _SINGLE_GPU)
+SFT_DATALOADER_PIN_MEMORY = _env_flag("SFT_DATALOADER_PIN_MEMORY", _SINGLE_GPU)
+SFT_GRADIENT_CHECKPOINTING = _env_flag("SFT_GRADIENT_CHECKPOINTING", False)
 # 评测：使用独立 vLLM 脚本，支持 TP（tensor parallel）+ DP（data parallel）。
 # TP × DP 必须整除本机可用卡数；换基座后按权重大小调 TP（单卡放得下就 TP=1、把卡都给 DP 更快）。
 TP_SIZE = int(os.environ.get("EVAL_TP_SIZE", "4"))
@@ -334,12 +349,21 @@ def convert_dataset(src_path: Path, dst_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# 2. LlamaFactory Full SFT（LIMO 超参 + ZeRO-3，单机多卡）
+# 2. LlamaFactory Full SFT（LIMO 超参；单卡默认不开 DeepSpeed，多卡默认 ZeRO-3）
 # ---------------------------------------------------------------------------
+def _should_use_deepspeed() -> bool:
+    if USE_DEEPSPEED in {"1", "true", "yes", "on"}:
+        return True
+    if USE_DEEPSPEED in {"0", "false", "no", "off"}:
+        return False
+    return NUM_GPUS > 1
+
+
 def run_sft(data_dir: Path, output_dir: Path) -> Path:
     """调用 LlamaFactory CLI 执行全量 SFT 训练（LIMO 论文配置）。返回模型输出目录。"""
     model_dir = output_dir / "sft_model"
     model_dir.mkdir(parents=True, exist_ok=True)
+    use_deepspeed = _should_use_deepspeed()
 
     sft_config = {
         "model_name_or_path": BASE_MODEL,
@@ -358,14 +382,16 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
         "lr_scheduler_type": "cosine",
         "warmup_steps": WARMUP_STEPS,
         "bf16": True,
-        "flash_attn": "fa2",
-        "optim": "adamw_torch",
+        "flash_attn": FLASH_ATTN,
+        "optim": SFT_OPTIM,
         "max_grad_norm": 1.0,
         "logging_steps": 10,
         "save_strategy": "no",
         "report_to": "none",
         "overwrite_output_dir": True,
-        "dataloader_pin_memory": False,
+        "dataloader_pin_memory": SFT_DATALOADER_PIN_MEMORY,
+        "gradient_checkpointing": SFT_GRADIENT_CHECKPOINTING,
+        "packing": SFT_PACKING,
     }
 
     # DeepSpeed ZeRO-3 配置 (LIMO 论文)
@@ -409,13 +435,21 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
         # （即 LIMO 的余弦调度）；warmup_max_lr/steps 等 auto 值也由 HF 学习率/warmup_steps 提供。
     }
 
-    # 写临时配置文件
+    # 写临时配置文件。这里是父进程在启动 LlamaFactory/torchrun 之前执行，
+    # 通常还没有 LOCAL_RANK；保留 rank 后缀只是避免未来多进程直接调用时冲突。
+    rank = int(os.environ.get("LOCAL_RANK", "0"))
     config_dir = output_dir / f"sft_configs_rank{rank}"
     config_dir.mkdir(parents=True, exist_ok=True)
 
-    ds_config_path = config_dir / "ds_z3.json"
-    ds_config_path.write_text(json.dumps(ds_config, indent=2), encoding="utf-8")
-    sft_config["deepspeed"] = str(ds_config_path)
+    if use_deepspeed:
+        ds_config_path = config_dir / "ds_z3.json"
+        ds_config_path.write_text(json.dumps(ds_config, indent=2), encoding="utf-8")
+        sft_config["deepspeed"] = str(ds_config_path)
+    else:
+        logger.info(
+            "单卡/原生 Trainer 模式：不启用 DeepSpeed（SFT_USE_DEEPSPEED=%s, NUM_GPUS=%d）",
+            USE_DEEPSPEED, NUM_GPUS,
+        )
 
     sft_yaml_path = config_dir / "sft.yaml"
     import yaml
@@ -429,8 +463,12 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
     env = os.environ.copy()
     env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
     env["PYTHONUNBUFFERED"] = "1"
-    env["FORCE_TORCHRUN"] = "1"
-    env["NPROC_PER_NODE"] = str(NUM_GPUS)
+    if NUM_GPUS > 1 or use_deepspeed:
+        env["FORCE_TORCHRUN"] = "1"
+        env["NPROC_PER_NODE"] = str(NUM_GPUS)
+    else:
+        env.pop("FORCE_TORCHRUN", None)
+        env.pop("NPROC_PER_NODE", None)
     env.setdefault("MASTER_PORT", "29500")
     # datasets 缓存放进本次输出目录：默认的共享缓存会让并发/连续的多次训练互相踩
     # （*.incomplete 目录被另一次运行原子 rename 掉 → OSError: Cannot find data file）。
@@ -438,7 +476,13 @@ def run_sft(data_dir: Path, output_dir: Path) -> Path:
     env["HF_DATASETS_CACHE"] = str((output_dir / "hf_datasets_cache").resolve())
 
     logger.info("开始 Full SFT 训练 (LIMO 配置): %s", " ".join(cmd))
-    logger.info("单机 %s 卡，MASTER_PORT=%s", env["NPROC_PER_NODE"], env.get("MASTER_PORT"))
+    logger.info(
+        "训练配置：NUM_GPUS=%d batch=%d grad_accum=%d effective_batch=%d "
+        "deepspeed=%s optim=%s packing=%s pin_memory=%s grad_ckpt=%s MASTER_PORT=%s",
+        NUM_GPUS, BATCH_SIZE, GRAD_ACCUM, NUM_GPUS * BATCH_SIZE * GRAD_ACCUM,
+        use_deepspeed, SFT_OPTIM, SFT_PACKING, SFT_DATALOADER_PIN_MEMORY,
+        SFT_GRADIENT_CHECKPOINTING, env.get("MASTER_PORT"),
+    )
 
     log_path = output_dir / "sft_train.log"
     returncode = _stream_subprocess(

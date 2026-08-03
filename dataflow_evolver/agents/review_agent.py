@@ -141,16 +141,16 @@ class ReviewAgent(AgentABC):
             result.tier1_score = 0.0
             return result
 
-        # schema 契约：字段名对不上时，训练脚本会把整份数据丢光并非零退出，而那时 GPU 已经
+        # schema 契约：必需字段名对不上时，训练脚本会把整份数据丢光并非零退出，而那时 GPU 已经
         # 烧完，报错还会被记成"训练脚本非零退出"，看不出根因是字段名。这里用纯代码提前拦下，
         # 并把缺失的字段名写进 issues——评审自修正循环据此就能改对，不必等训练。
         if required and metrics.null_rate >= self.null_threshold:
             result.passed = False
             result.issues.append(
-                f"产出字段与下游训练脚本的契约不符：要求 {required}，"
+                f"产出字段与下游训练脚本的必需字段契约不符：要求至少包含 {required}，"
                 f"实测关键字段空缺率 {metrics.null_rate:.1%}（上限 {self.null_threshold:.1%}）。"
-                f"请让流水线最终产出**恰好这些字段名**（可用算子做字段映射），"
-                f"字段名不同的话训练脚本会一条都读不到。"
+                f"请让流水线最终产出这些字段名且非空（可额外保留中间/溯源字段），"
+                f"必需字段名不同的话训练脚本会一条都读不到。"
             )
 
         # 去污染：与 benchmark 测试集重合的数据不是"质量差"，是把评测答案抄进了训练集。
