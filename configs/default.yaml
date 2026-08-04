@@ -38,6 +38,7 @@ agent_sdk:
   setting_sources: [project]               # 从 cwd/.claude 加载技能；技能由 SDK 自动发现，无需在此枚举
   max_turns: 50                            # 单次 SDK 运行最大轮数（MCP发现+读源码+写pipeline+自测修复，需要更多轮次）
   pipeline_filename: pipeline.py           # 约定：Agent 把流水线写到 <node_id>/pipeline.py
+  recipe_max_revisions: 2                  # recipe.json 被确定性校验器拒绝后的最大修订轮数
   # 瞬时错误（429/5xx/连接/超时）鲁棒性：指数退避重试 + 单次运行超时
   max_retries: 4                           # SDK 瞬时错误的最大尝试次数（含首次）；永久错误(CLI缺失/鉴权)不重试
   retry_base_delay: 10                     # 首次重试等待秒数，之后指数递增（10/20/40s...）

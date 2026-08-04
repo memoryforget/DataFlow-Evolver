@@ -148,6 +148,19 @@ def test_pipeline_prompt_injects_target_samples():
     assert "num_samples" in sized                          # 指导从零合成类算子
 
 
+def test_pipeline_prompt_freezes_validated_recipe():
+    from dataflow_evolver.core.schemas import TaskProfile
+    from dataflow_evolver.llm.prompts import build_pipeline_prompt
+
+    profile = TaskProfile("QA", {"instruction": "str", "output": "str"}, [], "sft")
+    prompt = build_pipeline_prompt(
+        profile, SCRATCH, "node_1", validated_recipe={"mode": "synthetic"}, recipe_hash="abc"
+    )
+    assert "已通过框架校验并冻结" in prompt
+    assert "recipe_hash: abc" in prompt
+    assert "_operation_graph" in prompt
+
+
 def test_review_selfcorrect_prompt_points_to_intermediate_cache():
     """评审自修正 prompt 应告知 Agent：cache 下有每个算子的中间产物，去 Read 定位坏在哪一步。"""
     from dataflow_evolver.llm.prompts import build_review_selfcorrect_prompt
@@ -155,4 +168,3 @@ def test_review_selfcorrect_prompt_points_to_intermediate_cache():
     p = build_review_selfcorrect_prompt("node_1", ["answer 字段为空"])
     assert "answer 字段为空" in p
     assert "每个算子" in p and "cache" in p and "forward()" in p
-

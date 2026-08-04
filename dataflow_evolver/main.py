@@ -586,6 +586,7 @@ class Orchestrator:
             parent_review=parent.review_result,
             parent_train_result=parent.train_result,
             siblings=[line for _, line in siblings],
+            parent_recipe=parent.config.recipe if parent.config else None,
         )
         if config is None:
             logger.warning("PipelineAgent 生成失败（agent 跑完但未产出有效流水线），惩罚该扩展并跳过。")
@@ -647,7 +648,8 @@ class Orchestrator:
         # 5. Phase-1 快反馈（含立即自修正：失败则看中间 step 产物定位、修复、重审，限次）
         evidence_path = self._review_evidence_path(node_dir)
         review = self.reviewer.review(
-            exec_result.dataset_path, profile, evidence_path=evidence_path, phase="search"
+            exec_result.dataset_path, profile, evidence_path=evidence_path, phase="search",
+            recipe=node.config.recipe,
         )
         node.review_result = review
         r_retries = 0
@@ -691,6 +693,7 @@ class Orchestrator:
                 profile,
                 evidence_path=evidence_path,
                 phase=f"search_recheck_{r_retries}",
+                recipe=node.config.recipe,
             )
             summary = _fix_round_summary(r_retries, review, new_review)
             fix_history.append(summary)
@@ -791,6 +794,7 @@ class Orchestrator:
                 profile,
                 evidence_path=self._review_evidence_path(node_dir),
                 phase="tier2",
+                recipe=node.config.recipe,
             )
             node.tier2_review_result = re_review
             if self._quality_collapsed(node.review_result, re_review):

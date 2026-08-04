@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import json
+
 from dataflow_evolver.core.input_corpus import InputCorpus
 from dataflow_evolver.core.schemas import DiagnosticReport, ReviewResult, TaskProfile, TrainResult
 
@@ -281,6 +283,8 @@ def build_pipeline_prompt(
     init_reference_code: str | None = None,
     init_instruction: str | None = None,
     data_links_dir: str = "",
+    validated_recipe: dict | None = None,
+    recipe_hash: str = "",
 ) -> str:
     # 目标产出规模：注入后让 Agent 据此设置算子参数（合成式调 num_samples / 转换式控采样过滤）。
     # 关键：产出条数必须【从环境变量 DF_TARGET_SAMPLES 运行时读取】，不要写死——这样同一份
@@ -379,7 +383,7 @@ def build_pipeline_prompt(
             f"   \n"
             f"   **注意**：MCP 提供的是**实现参考**，不要直接复用已有算子，而是学习其编码风格后写自定义算子。\n"
         )
-    return PIPELINE_AGENT_PROMPT.format(
+    prompt = PIPELINE_AGENT_PROMPT.format(
         target=profile.task_description,
         entry_path=corpus.entry_path,
         input_block=corpus.prompt_block(),
@@ -400,6 +404,73 @@ def build_pipeline_prompt(
         sibling_block=sibling_block,
         memory_block=memory_block,
     )
+    if validated_recipe:
+        prompt += (
+            "\n【已通过框架校验并冻结的 Data Recipe】\n"
+            f"recipe_hash: {recipe_hash}\n"
+            f"```json\n{json.dumps(validated_recipe, ensure_ascii=False, sort_keys=True, indent=2)}\n```\n"
+            "你现在只负责实现这份 recipe，不得更改 recipe.json。pipeline.py、operators 和 "
+            "decision.json 必须忠实实现其 mode、coverage buckets、proposal strategies、verification "
+            "和 selection。hybrid/synthetic 产物必须为每条记录保留 `_bucket`、`_generation_strategy` "
+            "与 `_operation_graph` 元数据，供框架做覆盖和结构坍塌审计。纯合成不得用固定 prompt "
+            "+ variant/index number 充当多样性；应按 recipe 的不同技能、运算结构、上下文和难度生成候选，"
+            "再验证、规范化去重并按 bucket 配额选择。\n"
+        )
+    return prompt
+
+
+def build_recipe_prompt(
+    profile: TaskProfile,
+    corpus: InputCorpus,
+    node_dir: str,
+    target_samples: int,
+    external_data: bool,
+    parent_recipe: dict | None = None,
+) -> str:
+    modes = ["external", "hybrid"] if corpus.grounded else (
+        ["external", "hybrid", "synthetic"] if external_data else ["synthetic"]
+    )
+    parent = json.dumps(parent_recipe, ensure_ascii=False, sort_keys=True, indent=2) if parent_recipe else "none"
+    return f"""Plan the data-generation strategy before any pipeline code is written.
+Write exactly one artifact: `{node_dir}/recipe.json`. Do not create or edit pipeline.py,
+decision.json, or operators in this stage. The framework, not you, will validate the file.
+
+Target: {profile.task_description}
+Required output schema: {profile.target_schema}
+Input corpus: {corpus.prompt_block()}
+Allowed modes: {modes}
+Target samples: {target_samples}
+Parent recipe to improve (if any):
+{parent}
+
+recipe.json must be a JSON object with this contract:
+{{
+  "version": 1,
+  "mode": "external|hybrid|synthetic",
+  "target_samples": {target_samples},
+  "candidate_multiplier": 1.5,
+  "coverage_buckets": [{{
+    "name": "stable unique name", "skills": ["..."], "operations": ["..."],
+    "contexts": ["..."], "difficulty": "...", "answer_type": "...", "quota": 100
+  }}],
+  "proposal_strategies": {{"program_first": 0.5, "constraint_composition": 0.5}},
+  "verification": {{"methods": ["symbolic_check", "independent_recompute"]}},
+  "selection": {{"normalized_dedup": true, "coverage_aware": true}}
+}}
+
+For hybrid/synthetic, bucket quotas must sum to at least target_samples, over-generate candidates,
+then verify/deduplicate/select. Synthetic requires at least two genuinely different proposal strategies.
+A fixed prompt with only a variant/index number is explicitly forbidden. Do not ask questions or use git.
+"""
+
+
+def build_recipe_repair_prompt(node_dir: str, errors: list[str]) -> str:
+    listed = "\n".join(f"- {error}" for error in errors)
+    return f"""The framework rejected `{node_dir}/recipe.json` for these deterministic errors:
+{listed}
+Edit only `{node_dir}/recipe.json` so it satisfies every error. Do not write pipeline code,
+decision.json, or operators. Do not ask questions or use git.
+"""
 
 
 def build_selfcorrect_prompt(node_dir: str, traceback: str) -> str:

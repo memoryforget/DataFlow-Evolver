@@ -26,6 +26,8 @@ class PipelineConfig:
     field_flow: str                        # "text -> chunk -> qa_pairs"
     code: str                              # 完整可执行的 DataFlow 流水线 Python 源码
     rationale: str
+    recipe: dict[str, Any] = field(default_factory=dict)  # 已由框架校验并冻结的数据设计契约
+    recipe_hash: str = ""                  # canonical recipe 的 SHA-256，便于审计/续跑
 
 
 @dataclass
@@ -53,6 +55,10 @@ class ReviewResult:
     null_rate: float = 0.0                 # schema 关键字段空缺率
     parse_valid_rate: float = 1.0          # 可解析（合法 JSON + 字段齐全）占比
     contamination_rate: float = 0.0        # 与 benchmark 测试集的 n-gram 重合率（未配参考集时恒 0）
+    normalized_dup_rate: float = 0.0       # 规范化内容近重率（去格式/数字表面差异）
+    structural_dup_rate: float = 0.0       # 相同 operation graph/archetype 的集中度
+    coverage_score: float = 1.0            # recipe 预期 coverage bucket 的覆盖率
+    largest_bucket_fraction: float = 0.0   # 最大 bucket 占比，监测单一模板坍塌
 
     # --- 复合分：作为 Tier-1 reward 回传 MCTS ---
     llm_composite: float = 0.0             # 五维加权（固定权重）

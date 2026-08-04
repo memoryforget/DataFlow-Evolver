@@ -30,6 +30,7 @@ from typing import NamedTuple
 
 from dataflow_evolver.agents.base import AgentABC
 from dataflow_evolver.core.decontamination import ContaminationIndex
+from dataflow_evolver.core.diversity import scan_diversity
 from dataflow_evolver.core.schemas import ReviewResult, TaskProfile
 from dataflow_evolver.llm.prompts import FAILURE_SIGNALS, build_review_prompt
 
@@ -120,7 +121,11 @@ class ReviewAgent(AgentABC):
         return result
 
     def apply_hard_metrics(
-        self, result: ReviewResult, dataset_path: str, profile: TaskProfile
+        self,
+        result: ReviewResult,
+        dataset_path: str,
+        profile: TaskProfile,
+        recipe: dict | None = None,
     ) -> ReviewResult:
         """扫全份文件得硬指标并叠加惩罚，写回 result 并返回。"""
         required = list(profile.target_schema.keys()) if profile.target_schema else []
@@ -128,6 +133,11 @@ class ReviewAgent(AgentABC):
         result.dup_rate = metrics.dup_rate
         result.null_rate = metrics.null_rate
         result.parse_valid_rate = metrics.parse_valid_rate
+        diversity = scan_diversity(dataset_path, required, recipe)
+        result.normalized_dup_rate = diversity.normalized_dup_rate
+        result.structural_dup_rate = diversity.structural_dup_rate
+        result.coverage_score = diversity.coverage_score
+        result.largest_bucket_fraction = diversity.largest_bucket_fraction
         if metrics.field_dup_rate > metrics.record_dup_rate:
             self.logger.info(
                 "重复率由字段 %s 主导：字段级 %.3f > 整记录 %.3f"
@@ -170,13 +180,23 @@ class ReviewAgent(AgentABC):
                     f"{'；'.join(contam.examples)}。请去掉直接取自基准测试集的数据来源。"
                 )
 
+        recipe_diversity = bool(recipe and recipe.get("mode") in {"hybrid", "synthetic"})
+        duplicate_penalty = max(metrics.dup_rate, diversity.normalized_dup_rate)
         result.tier1_score = (
             result.llm_composite
-            * (1.0 - metrics.dup_rate)
+            * (1.0 - (duplicate_penalty if recipe_diversity else metrics.dup_rate))
             * (1.0 - metrics.null_rate)
             * (1.0 - contam.rate)
             * metrics.parse_valid_rate
+            * ((1.0 - diversity.structural_dup_rate) if recipe_diversity else 1.0)
+            * (diversity.coverage_score if recipe_diversity else 1.0)
         )
+        if recipe and recipe.get("mode") in {"hybrid", "synthetic"} and not diversity.metadata_complete:
+            result.passed = False
+            result.issues.append(
+                "Recipe diversity metadata is incomplete: every row must contain _bucket, "
+                "_generation_strategy, and _operation_graph."
+            )
         return result
 
     def review(
@@ -185,6 +205,7 @@ class ReviewAgent(AgentABC):
         profile: TaskProfile,
         evidence_path: str | None = None,
         phase: str = "search",
+        recipe: dict | None = None,
     ) -> ReviewResult:
         """随机抽样 → LLM 五维打分 → 硬指标惩罚 → ReviewResult。失败时保守返回未通过。
 
@@ -206,13 +227,15 @@ class ReviewAgent(AgentABC):
             return result
         result = self.parse(raw)
         if self.hard_metrics:
-            self.apply_hard_metrics(result, dataset_path, profile)
+            self.apply_hard_metrics(result, dataset_path, profile, recipe=recipe)
         self.logger.info(
             "Review：corr=%.2f rel=%.2f diff=%.2f div=%.2f schema=%.2f "
-            "| dup=%.2f null=%.2f parse=%.2f | composite=%.3f tier1=%.3f passed=%s | signals=%s",
+            "| dup=%.2f norm_dup=%.2f structural_dup=%.2f coverage=%.2f null=%.2f parse=%.2f "
+            "| composite=%.3f tier1=%.3f passed=%s | signals=%s",
             result.correctness_score, result.relevance_score, result.difficulty_score,
             result.diversity_score, result.schema_score,
-            result.dup_rate, result.null_rate, result.parse_valid_rate,
+            result.dup_rate, result.normalized_dup_rate, result.structural_dup_rate,
+            result.coverage_score, result.null_rate, result.parse_valid_rate,
             result.llm_composite, result.tier1_score, result.passed,
             ",".join(result.failure_signals) or "-",
         )

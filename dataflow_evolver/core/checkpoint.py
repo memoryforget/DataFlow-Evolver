@@ -166,6 +166,8 @@ def _config_from_dict(d: dict[str, Any] | None, code: str = "") -> PipelineConfi
         field_flow=d.get("field_flow", ""),
         code=code,
         rationale=d.get("rationale", ""),
+        recipe=d.get("recipe", {}),
+        recipe_hash=d.get("recipe_hash", ""),
     )
 
 
