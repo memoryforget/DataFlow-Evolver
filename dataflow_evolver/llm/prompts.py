@@ -405,6 +405,25 @@ def build_pipeline_prompt(
         memory_block=memory_block,
     )
     if validated_recipe:
+        mode = validated_recipe.get("mode", "")
+        sources = [s.get("source_id") for s in validated_recipe.get("sources", []) if isinstance(s, dict)]
+        mode_rules = {
+            "external": (
+                "external：最终每行必须标记 `_source_type=external`，`_source_id` 必须来自 recipe.sources，"
+                "并有全局唯一 `_record_id`；不得生成独立 synthetic 行。优先让 FileStorage.first_entry "
+                "指向真实数据，再做清洗、映射、过滤或有来源约束的改写。"
+            ),
+            "hybrid": (
+                "hybrid：推荐拓扑为 external first_entry → 规范化并保留 external 行 → 基于每个 seed 生成 "
+                "synthetic 行 → pandas.concat → 验证/去重/覆盖选择。external 行必须有 recipe source_id 和唯一 "
+                "`_record_id`；synthetic 行必须有 `_source_type=synthetic`、唯一 `_record_id` 和指向保留 external "
+                "行的 `_seed_id`。最终比例必须满足 mixing_policy。"
+            ),
+            "synthetic": (
+                "synthetic：first_entry 必须是空入口，不得读取真实/外部数据。最终每行必须标记 "
+                "`_source_type=synthetic`、非空 `_source_id` 和全局唯一 `_record_id`。"
+            ),
+        }.get(mode, "")
         prompt += (
             "\n【已通过框架校验并冻结的 Data Recipe】\n"
             f"recipe_hash: {recipe_hash}\n"
@@ -415,6 +434,9 @@ def build_pipeline_prompt(
             "与 `_operation_graph` 元数据，供框架做覆盖和结构坍塌审计。纯合成不得用固定 prompt "
             "+ variant/index number 充当多样性；应按 recipe 的不同技能、运算结构、上下文和难度生成候选，"
             "再验证、规范化去重并按 bucket 配额选择。\n"
+            f"【mode 数据来源硬契约】声明的 source_id：{sources}\n{mode_rules}\n"
+            "框架会扫描最终 JSONL 的来源比例、source_id、record_id 和 hybrid seed link；仅在 decision.json "
+            "里声称遵守不会通过审计。\n"
         )
     return prompt
 
@@ -449,6 +471,14 @@ def build_recipe_prompt(
   "mode": "external|hybrid|synthetic",
   "target_samples": {target_samples},
   "candidate_multiplier": 1.5,
+  "sources": [{{
+    "source_id": "stable-source-id", "kind": "input_corpus|external_dataset",
+    "location": "absolute local path", "license": "license name", "split": "train"
+  }}],
+  "mixing_policy": {{
+    "external_min_fraction": 0.3, "synthetic_min_fraction": 0.5,
+    "require_seed_link": true, "preserve_external_rows": true
+  }},
   "coverage_buckets": [{{
     "name": "stable unique name", "skills": ["..."], "operations": ["..."],
     "contexts": ["..."], "difficulty": "...", "answer_type": "...", "quota": 100
@@ -461,6 +491,11 @@ def build_recipe_prompt(
 对于 hybrid/synthetic：各 bucket 的 quota 总和不得低于 target_samples；必须先过量生成候选，
 再执行验证、规范化去重和按覆盖配额选择。synthetic 至少需要两种实质不同的 proposal strategy。
 严禁用固定 prompt 仅追加 variant/index number 来伪造多样性。
+mode 特定来源契约：
+- external：sources 至少一个；只使用真实来源，必须记录 location/license/train split。
+- hybrid：sources 至少一个且必须提供 mixing_policy；真实行必须保留，以便 synthetic 行通过 seed_id 追溯。
+- synthetic：sources 必须严格为 []，不得读取真实或外部数据。
+所有 mode 都必须配置 verification.methods 和 selection.normalized_dedup=true。
 这是无头运行：不要提问，不要使用 git/gh，只写上述 `recipe.json`。
 """
 

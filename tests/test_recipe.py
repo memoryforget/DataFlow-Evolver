@@ -16,6 +16,7 @@ def _synthetic():
         "mode": "synthetic",
         "target_samples": 4,
         "candidate_multiplier": 2.0,
+        "sources": [],
         "coverage_buckets": [
             {"name": "add", "operations": ["addition"], "quota": 2},
             {"name": "rate", "skills": ["rate"], "quota": 2},
@@ -137,3 +138,39 @@ def test_recipe_resume_nudge_does_not_switch_to_pipeline(tmp_path, monkeypatch):
         (None, RECIPE_SYSTEM_PROMPT_APPEND),
         ("session-1", RECIPE_SYSTEM_PROMPT_APPEND),
     ]
+
+
+def test_external_requires_auditable_real_source():
+    recipe = _synthetic()
+    recipe.update({"mode": "external", "candidate_multiplier": 1.0})
+    recipe["proposal_strategies"] = {}
+    recipe["coverage_buckets"] = []
+    recipe["selection"] = {"normalized_dedup": True}
+    missing = validate_recipe(recipe, grounded=False, external_data=True)
+    assert not missing.valid and any("至少一个真实数据 source" in e for e in missing.errors)
+
+    recipe["sources"] = [{
+        "source_id": "math-train", "kind": "external_dataset",
+        "location": "/data/math.jsonl", "license": "MIT", "split": "train",
+    }]
+    assert validate_recipe(recipe, grounded=False, external_data=True).valid
+
+
+def test_hybrid_requires_mixing_policy_and_forbids_eval_split():
+    recipe = _synthetic()
+    recipe["mode"] = "hybrid"
+    recipe["sources"] = [{
+        "source_id": "seed", "kind": "external_dataset", "location": "/data/seed.jsonl",
+        "license": "MIT", "split": "test",
+    }]
+    result = validate_recipe(recipe, grounded=False, external_data=True)
+    assert not result.valid
+    assert any("split='test'" in e for e in result.errors)
+    assert any("mixing_policy" in e for e in result.errors)
+
+    recipe["sources"][0]["split"] = "train"
+    recipe["mixing_policy"] = {
+        "external_min_fraction": 0.25, "synthetic_min_fraction": 0.5,
+        "require_seed_link": True, "preserve_external_rows": True,
+    }
+    assert validate_recipe(recipe, grounded=False, external_data=True).valid

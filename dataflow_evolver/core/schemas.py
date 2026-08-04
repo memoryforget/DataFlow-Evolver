@@ -59,6 +59,11 @@ class ReviewResult:
     structural_dup_rate: float = 0.0       # 相同 operation graph/archetype 的集中度
     coverage_score: float = 1.0            # recipe 预期 coverage bucket 的覆盖率
     largest_bucket_fraction: float = 0.0   # 最大 bucket 占比，监测单一模板坍塌
+    external_fraction: float = 0.0         # 最终数据中声明为 external 的比例
+    synthetic_fraction: float = 0.0        # 最终数据中声明为 synthetic 的比例
+    source_id_valid_rate: float = 1.0      # provenance source_id 合法率
+    seed_link_rate: float = 1.0            # hybrid 合成行追溯到保留 external seed 的比例
+    source_compliance_score: float = 1.0   # mode 来源/比例/追溯契约的确定性复合分
 
     # --- 复合分：作为 Tier-1 reward 回传 MCTS ---
     llm_composite: float = 0.0             # 五维加权（固定权重）

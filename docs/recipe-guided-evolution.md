@@ -27,13 +27,21 @@ and downstream evaluation approve the outcome.
 
 ## Modes
 
-- `external`: primarily selects, cleans, maps, filters, and rewrites real input/external data.
-- `hybrid`: uses real data as seeds and adds controlled synthesis.
-- `synthetic`: builds candidates from multiple semantic strategies and coverage buckets, then
-  verifies, normalizes/deduplicates, and selects them.
+- `external`: declares at least one licensed `input_corpus` or `external_dataset` source and emits
+  only external rows. It primarily selects, cleans, maps, filters, and rewrites real data.
+- `hybrid`: declares real sources plus a `mixing_policy`, preserves external seed rows, and adds
+  controlled synthetic rows whose `_seed_id` resolves to a retained external `_record_id`.
+- `synthetic`: declares `sources: []`, may not reference external data, builds candidates from
+  multiple semantic strategies and coverage buckets, then verifies, deduplicates, and selects them.
 
 Mode availability is bounded by actual capabilities: without a corpus or External Data MCP only
 `synthetic` is valid; a grounded corpus cannot be discarded in favor of pure synthesis.
+
+Every final row carries a unique `_record_id`, `_source_type`, and `_source_id`. The framework
+cross-checks source declarations in three places: recipe validation, a pre-execution static scan of
+pipeline data references, and a post-execution full-dataset audit. Hybrid additionally enforces the
+minimum external/synthetic fractions in `mixing_policy` and requires 100% synthetic-to-seed linkage.
+Unmanaged direct downloads fail external/hybrid preflight; any external reference fails synthetic.
 
 ## Dataset feedback added by the MVP
 

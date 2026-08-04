@@ -181,6 +181,32 @@ def test_scan_of_missing_node_dir_is_harmless(tmp_path):
     assert record["scanned_files"] == [] and record["unmanaged"] is False
 
 
+def test_mode_source_preflight_cross_checks_recipe_and_code():
+    from dataflow_evolver.main import _mode_source_preflight_issues
+
+    linked = {"data_links": [{"path": "/data/a.jsonl"}], "unmanaged": False}
+    assert _mode_source_preflight_issues(
+        {"mode": "synthetic", "sources": []}, corpus_grounded=False, source_record=linked
+    )
+
+    unmanaged = {"data_links": [], "unmanaged": True}
+    assert _mode_source_preflight_issues(
+        {"mode": "external", "sources": [{"kind": "input_corpus"}]},
+        corpus_grounded=True,
+        source_record=unmanaged,
+    )
+
+    external_recipe = {
+        "mode": "hybrid", "sources": [{"kind": "external_dataset", "source_id": "a"}]
+    }
+    assert _mode_source_preflight_issues(
+        external_recipe, corpus_grounded=False, source_record={"data_links": [], "unmanaged": False}
+    )
+    assert not _mode_source_preflight_issues(
+        external_recipe, corpus_grounded=False, source_record=linked
+    )
+
+
 # ---- 接线：Agent 的工具调用落到节点目录 ------------------------------------
 def test_tool_uses_of_a_failed_attempt_are_not_lost(tmp_path, monkeypatch):
     from dataflow_evolver.llm import agent_sdk

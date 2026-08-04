@@ -624,6 +624,21 @@ class Orchestrator:
         node_dir = node.node_dir_name
         config = node.config
         assert config is not None, "_evaluate_node 要求节点已持有 config"
+        # mode 不能只靠最终行自报来源：执行前先静态审计代码中的数据入口。synthetic 若引用
+        # data_links/ 或直连远程数据立即拒绝；external/hybrid 禁止绕过 MCP 的 unmanaged 来源，
+        # 且声明 external_dataset 时 pipeline 必须实际引用已审计的 data_links 路径。
+        mode = config.recipe.get("mode") if config.recipe else None
+        if mode in {"external", "hybrid", "synthetic"}:
+            source_record = provenance.scan_node(
+                self.agent_root / node_dir, data_links_dir=self.data_links_dir, write=False
+            )
+            source_issues = _mode_source_preflight_issues(
+                config.recipe, corpus_grounded=self.corpus.grounded, source_record=source_record
+            )
+            if source_issues:
+                logger.warning("%s mode 来源预检失败：%s", node_dir, source_issues)
+                node.dead = True
+                return None
         search_env = self.strategy.search_env(self)
         # 无 env 要注入时不传该参数：保持对旧执行器/测试桩的调用签名完全不变。
         exec_kwargs = {} if search_env is None else {"env_overrides": search_env}
@@ -968,6 +983,32 @@ def _sibling_summaries(
         if len(out) >= max_items:
             break
     return out
+
+
+def _mode_source_preflight_issues(
+    recipe: dict,
+    *,
+    corpus_grounded: bool,
+    source_record: dict,
+) -> list[str]:
+    """用代码引用审计交叉验证 recipe.mode，阻止只在输出元数据里伪造来源。"""
+    mode = recipe.get("mode")
+    linked = source_record.get("data_links", [])
+    unmanaged = bool(source_record.get("unmanaged"))
+    declared_external = any(
+        isinstance(src, dict) and src.get("kind") == "external_dataset"
+        for src in recipe.get("sources", [])
+    )
+    issues: list[str] = []
+    if mode == "synthetic" and (linked or unmanaged):
+        issues.append("synthetic mode 的 pipeline 引用了真实/外部数据")
+    if mode in {"external", "hybrid"} and unmanaged:
+        issues.append("external/hybrid mode 检出绕过 External Data MCP 的 unmanaged 数据引用")
+    if mode in {"external", "hybrid"} and declared_external and not linked:
+        issues.append("recipe 声明了 external_dataset，但 pipeline 未引用任何已审计 data_links 文件")
+    if mode in {"external", "hybrid"} and not corpus_grounded and not linked:
+        issues.append("无输入语料的 external/hybrid mode 必须实际引用 External Data MCP 落盘文件")
+    return issues
 
 
 def _read_reference_pipeline(path: str) -> str:

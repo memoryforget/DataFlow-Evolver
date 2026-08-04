@@ -59,6 +59,41 @@ def validate_recipe(
         errors.append("target_samples 必须是正整数")
     recipe["target_samples"] = target
 
+    sources = recipe.get("sources")
+    if not isinstance(sources, list):
+        errors.append("sources 必须是 array；synthetic 使用空数组 []")
+        sources = []
+    source_ids: set[str] = set()
+    for i, source in enumerate(sources):
+        if not isinstance(source, dict):
+            errors.append(f"sources[{i}] 必须是 object")
+            continue
+        source_id = str(source.get("source_id", "")).strip()
+        kind = str(source.get("kind", "")).strip()
+        location = str(source.get("location", "")).strip()
+        license_name = str(source.get("license", "")).strip()
+        split = str(source.get("split", "")).strip().lower()
+        if not source_id:
+            errors.append(f"sources[{i}].source_id 不能为空")
+        elif source_id in source_ids:
+            errors.append(f"source_id 重复：{source_id}")
+        source_ids.add(source_id)
+        if kind not in {"input_corpus", "external_dataset"}:
+            errors.append(f"sources[{i}].kind 必须是 input_corpus 或 external_dataset")
+        if not location:
+            errors.append(f"sources[{i}].location 不能为空，必须记录绝对路径或输入语料入口")
+        if not license_name:
+            errors.append(f"sources[{i}].license 不能为空")
+        if kind == "external_dataset" and not split:
+            errors.append(f"sources[{i}].split 不能为空")
+        if split in {"test", "validation", "eval", "evaluation"}:
+            errors.append(f"sources[{i}].split={split!r} 禁止用于训练数据")
+
+    if mode in {"external", "hybrid"} and not sources:
+        errors.append(f"{mode} mode 必须声明至少一个真实数据 source")
+    if mode == "synthetic" and sources:
+        errors.append("synthetic mode 的 sources 必须为空数组，禁止声明真实数据源")
+
     multiplier = recipe.get("candidate_multiplier", 1.0)
     if not isinstance(multiplier, (int, float)) or isinstance(multiplier, bool) or multiplier < 1.0:
         errors.append("candidate_multiplier 必须是大于等于 1.0 的数值")
@@ -98,6 +133,28 @@ def validate_recipe(
     methods = verification.get("methods", []) if isinstance(verification, dict) else []
     selection = recipe.get("selection", {})
 
+    if not isinstance(methods, list) or not methods:
+        errors.append("所有 mode 都必须提供 verification.methods")
+    if not isinstance(selection, dict) or selection.get("normalized_dedup") is not True:
+        errors.append("所有 mode 都要求 selection.normalized_dedup=true")
+
+    if mode == "hybrid":
+        policy = recipe.get("mixing_policy")
+        if not isinstance(policy, dict):
+            errors.append("hybrid mode 必须提供 mixing_policy")
+            policy = {}
+        ext_min = policy.get("external_min_fraction")
+        syn_min = policy.get("synthetic_min_fraction")
+        for name, value in (("external_min_fraction", ext_min), ("synthetic_min_fraction", syn_min)):
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 < value <= 1:
+                errors.append(f"mixing_policy.{name} 必须在 (0, 1] 范围内")
+        if isinstance(ext_min, (int, float)) and isinstance(syn_min, (int, float)) and ext_min + syn_min > 1:
+            errors.append("hybrid mixing_policy 的两个最低占比之和不能超过 1")
+        if policy.get("require_seed_link") is not True:
+            errors.append("hybrid 要求 mixing_policy.require_seed_link=true")
+        if policy.get("preserve_external_rows") is not True:
+            errors.append("MVP hybrid 要求 mixing_policy.preserve_external_rows=true，以便验证 seed 追溯")
+
     if mode in {"hybrid", "synthetic"}:
         if not buckets:
             errors.append("hybrid/synthetic 必须提供非空 coverage_buckets")
@@ -105,10 +162,6 @@ def validate_recipe(
             errors.append("coverage bucket 的 quota 总和必须覆盖 target_samples")
         if not positive_strategies:
             errors.append("hybrid/synthetic 至少需要一种正权重 proposal strategy")
-        if not isinstance(methods, list) or not methods:
-            errors.append("hybrid/synthetic 必须提供 verification.methods")
-        if not isinstance(selection, dict) or selection.get("normalized_dedup") is not True:
-            errors.append("hybrid/synthetic 要求 selection.normalized_dedup=true")
         if not isinstance(selection, dict) or selection.get("coverage_aware") is not True:
             errors.append("hybrid/synthetic 要求 selection.coverage_aware=true")
 

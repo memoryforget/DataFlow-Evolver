@@ -32,6 +32,7 @@ from dataflow_evolver.agents.base import AgentABC
 from dataflow_evolver.core.decontamination import ContaminationIndex
 from dataflow_evolver.core.diversity import scan_diversity
 from dataflow_evolver.core.schemas import ReviewResult, TaskProfile
+from dataflow_evolver.core.source_audit import audit_mode_dataset
 from dataflow_evolver.llm.prompts import FAILURE_SIGNALS, build_review_prompt
 
 # Tier-1 复合分的固定权重（对应设计文档 DEITA/IFD/CoT-Self-Instruct/InsTag 的经验分工）。
@@ -138,6 +139,12 @@ class ReviewAgent(AgentABC):
         result.structural_dup_rate = diversity.structural_dup_rate
         result.coverage_score = diversity.coverage_score
         result.largest_bucket_fraction = diversity.largest_bucket_fraction
+        source_audit = audit_mode_dataset(dataset_path, recipe)
+        result.external_fraction = source_audit.external_fraction
+        result.synthetic_fraction = source_audit.synthetic_fraction
+        result.source_id_valid_rate = source_audit.source_id_valid_rate
+        result.seed_link_rate = source_audit.seed_link_rate
+        result.source_compliance_score = source_audit.compliance_score
         if metrics.field_dup_rate > metrics.record_dup_rate:
             self.logger.info(
                 "重复率由字段 %s 主导：字段级 %.3f > 整记录 %.3f"
@@ -190,7 +197,11 @@ class ReviewAgent(AgentABC):
             * metrics.parse_valid_rate
             * ((1.0 - diversity.structural_dup_rate) if recipe_diversity else 1.0)
             * (diversity.coverage_score if recipe_diversity else 1.0)
+            * source_audit.compliance_score
         )
+        if source_audit.issues:
+            result.passed = False
+            result.issues.extend(source_audit.issues)
         if recipe and recipe.get("mode") in {"hybrid", "synthetic"} and not diversity.metadata_complete:
             result.passed = False
             result.issues.append(
@@ -230,12 +241,15 @@ class ReviewAgent(AgentABC):
             self.apply_hard_metrics(result, dataset_path, profile, recipe=recipe)
         self.logger.info(
             "Review：corr=%.2f rel=%.2f diff=%.2f div=%.2f schema=%.2f "
-            "| dup=%.2f norm_dup=%.2f structural_dup=%.2f coverage=%.2f null=%.2f parse=%.2f "
+            "| dup=%.2f norm_dup=%.2f structural_dup=%.2f coverage=%.2f source=%.2f "
+            "ext=%.2f syn=%.2f seed_link=%.2f null=%.2f parse=%.2f "
             "| composite=%.3f tier1=%.3f passed=%s | signals=%s",
             result.correctness_score, result.relevance_score, result.difficulty_score,
             result.diversity_score, result.schema_score,
             result.dup_rate, result.normalized_dup_rate, result.structural_dup_rate,
-            result.coverage_score, result.null_rate, result.parse_valid_rate,
+            result.coverage_score, result.source_compliance_score,
+            result.external_fraction, result.synthetic_fraction, result.seed_link_rate,
+            result.null_rate, result.parse_valid_rate,
             result.llm_composite, result.tier1_score, result.passed,
             ",".join(result.failure_signals) or "-",
         )
