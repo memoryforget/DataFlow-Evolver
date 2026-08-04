@@ -430,20 +430,20 @@ def build_recipe_prompt(
     modes = ["external", "hybrid"] if corpus.grounded else (
         ["external", "hybrid", "synthetic"] if external_data else ["synthetic"]
     )
-    parent = json.dumps(parent_recipe, ensure_ascii=False, sort_keys=True, indent=2) if parent_recipe else "none"
-    return f"""Plan the data-generation strategy before any pipeline code is written.
-Write exactly one artifact: `{node_dir}/recipe.json`. Do not create or edit pipeline.py,
-decision.json, or operators in this stage. The framework, not you, will validate the file.
+    parent = json.dumps(parent_recipe, ensure_ascii=False, sort_keys=True, indent=2) if parent_recipe else "无"
+    return f"""在编写任何流水线代码之前，先规划数据生成策略。
+本阶段只能写入 `{node_dir}/recipe.json`；禁止创建或修改 `pipeline.py`、`decision.json`
+和 `operators/`。配方将由框架的确定性校验器验证，不由你自行验收。
 
-Target: {profile.task_description}
-Required output schema: {profile.target_schema}
-Input corpus: {corpus.prompt_block()}
-Allowed modes: {modes}
-Target samples: {target_samples}
-Parent recipe to improve (if any):
+目标任务：{profile.task_description}
+必需输出 schema：{profile.target_schema}
+输入语料：{corpus.prompt_block()}
+允许的 mode：{modes}
+目标样本数：{target_samples}
+待改进的父节点 recipe（如有）：
 {parent}
 
-recipe.json must be a JSON object with this contract:
+`recipe.json` 必须是符合以下 contract 的 JSON object：
 {{
   "version": 1,
   "mode": "external|hybrid|synthetic",
@@ -458,18 +458,19 @@ recipe.json must be a JSON object with this contract:
   "selection": {{"normalized_dedup": true, "coverage_aware": true}}
 }}
 
-For hybrid/synthetic, bucket quotas must sum to at least target_samples, over-generate candidates,
-then verify/deduplicate/select. Synthetic requires at least two genuinely different proposal strategies.
-A fixed prompt with only a variant/index number is explicitly forbidden. Do not ask questions or use git.
+对于 hybrid/synthetic：各 bucket 的 quota 总和不得低于 target_samples；必须先过量生成候选，
+再执行验证、规范化去重和按覆盖配额选择。synthetic 至少需要两种实质不同的 proposal strategy。
+严禁用固定 prompt 仅追加 variant/index number 来伪造多样性。
+这是无头运行：不要提问，不要使用 git/gh，只写上述 `recipe.json`。
 """
 
 
 def build_recipe_repair_prompt(node_dir: str, errors: list[str]) -> str:
     listed = "\n".join(f"- {error}" for error in errors)
-    return f"""The framework rejected `{node_dir}/recipe.json` for these deterministic errors:
+    return f"""框架的确定性校验器拒绝了 `{node_dir}/recipe.json`，错误如下：
 {listed}
-Edit only `{node_dir}/recipe.json` so it satisfies every error. Do not write pipeline code,
-decision.json, or operators. Do not ask questions or use git.
+请逐条修复所有错误，并且只修改 `{node_dir}/recipe.json`。禁止编写 pipeline code、
+`decision.json` 或 `operators/`。不要提问，不要使用 git/gh。
 """
 
 

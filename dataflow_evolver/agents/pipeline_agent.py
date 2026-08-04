@@ -22,7 +22,11 @@ from dataflow_evolver.core.schemas import (
     TaskProfile,
     TrainResult,
 )
-from dataflow_evolver.llm.agent_sdk import AgentInfraError, run_pipeline_agent
+from dataflow_evolver.llm.agent_sdk import (
+    RECIPE_SYSTEM_PROMPT_APPEND,
+    AgentInfraError,
+    run_pipeline_agent,
+)
 from dataflow_evolver.llm.mcp_operators import _recommend_categories
 from dataflow_evolver.llm.prompts import (
     build_pipeline_prompt,
@@ -259,6 +263,7 @@ class PipelineAgent:
                 agent_cfg=self.agent_cfg,
                 tool_log_dir=str(self.agent_root / node_dir_name),
                 phase="plan_recipe" if attempt == 0 else f"repair_recipe_{attempt}",
+                system_prompt_append=RECIPE_SYSTEM_PROMPT_APPEND,
             )
             if not result.success:
                 raise AgentInfraError(

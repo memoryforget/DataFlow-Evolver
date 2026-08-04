@@ -51,7 +51,9 @@ agent_sdk:
   external_data: true
   discovery: true                          # external_data 打开时是否连带挂 data-discovery（找线索）
   # 工具：用 claude_code 预设放开全部内置工具（见 llm/agent_sdk.py），不再设白名单
-  # 系统提示：保留 claude_code 预设，仅 append DataFlow 指令；可用 system_prompt_append 覆盖该 append 文本
+  # 系统提示：实现/修复阶段保留 claude_code 预设，仅 append DataFlow 指令；可用
+  # system_prompt_append 覆盖。recipe 规划/修订阶段始终使用只允许写 recipe.json 的专属提示，
+  # 避免通用实现提示诱导 Agent 提前生成 pipeline/operators。
 
 # dataset-search MCP：取数（HuggingFace + ModelScope）。仅在 agent_sdk.external_data: true 时生效。
 # 注意：这些工具是 in-process MCP，跑在编排器自己的进程里，**读不到 agent_sdk.env**

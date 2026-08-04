@@ -141,6 +141,22 @@ _DEFAULT_SYSTEM_PROMPT_APPEND = (
     "- If compile/import fails, Read source to debug — fix in place.\n"
 )
 
+# Recipe 阶段不能复用上面的流水线实现提示：后者要求立即读 API、写 operators/pipeline 并
+# compile，会与“本阶段只规划 recipe.json”直接冲突。这里保留 claude_code 预设，只追加
+# 阶段专属边界；JSON 字段、枚举和文件名仍保持英文，避免协议名翻译漂移。
+RECIPE_SYSTEM_PROMPT_APPEND = (
+    "你是 DataFlow-Evolver 的数据配方规划者。本阶段只规划数据分布与生成策略，不实现流水线。\n\n"
+    "## 唯一可写产物\n"
+    "- 只允许创建或修改用户 prompt 指定节点下的 `recipe.json`。\n"
+    "- 禁止创建或修改 `pipeline.py`、`decision.json`、`operators/` 及其他项目文件。\n"
+    "- 可以只读检查任务、输入语料、父 recipe，并可使用已挂载的外部数据发现工具收集规划依据。\n\n"
+    "## 工作边界\n"
+    "- 严格使用用户 prompt 给出的 JSON contract、allowed modes 与 target_samples。\n"
+    "- 只提出 recipe；是否通过由框架的确定性校验器决定，不要自行宣布验证通过。\n"
+    "- 收到校验错误时只修订 `recipe.json`，逐条解决错误，不转入代码实现。\n"
+    "- 无头运行：禁止 AskUserQuestion，禁止 git/gh 子流程。\n"
+)
+
 
 
 @dataclass
@@ -179,7 +195,12 @@ def _agent_env(agent_cfg: Config) -> dict[str, str]:
     return env
 
 
-def _build_options(agent_cfg: Config, cwd: str, resume: str | None = None) -> Any:
+def _build_options(
+    agent_cfg: Config,
+    cwd: str,
+    resume: str | None = None,
+    system_prompt_append: str | None = None,
+) -> Any:
     """据 agent_sdk 配置段构造 ClaudeAgentOptions。
 
     - tools：用 claude_code 预设放开**全部内置工具**（不再用 allowed_tools 白名单限制）。
@@ -214,7 +235,11 @@ def _build_options(agent_cfg: Config, cwd: str, resume: str | None = None) -> An
 
             mcp_servers["data-discovery"] = discovery_mcp_server
 
-    append_text = agent_cfg.get("system_prompt_append", _DEFAULT_SYSTEM_PROMPT_APPEND)
+    append_text = (
+        system_prompt_append
+        if system_prompt_append is not None
+        else agent_cfg.get("system_prompt_append", _DEFAULT_SYSTEM_PROMPT_APPEND)
+    )
     effort = agent_cfg.get("effort", None) or None  # 空串/None → 不传，走模型默认
     thinking_mode = (agent_cfg.get("thinking", "adaptive") or "adaptive").lower()
     thinking = {"type": "adaptive"} if thinking_mode == "adaptive" else None
@@ -333,6 +358,11 @@ _RESUME_NUDGE = (
     "with DF_COMPILE_ONLY=1 until it compiles."
 )
 
+_RECIPE_RESUME_NUDGE = (
+    "上一次 recipe 规划因瞬时 API 错误中断。请从中断处继续，并完成原任务："
+    "只创建或修订目标节点的 recipe.json。不要创建或修改 pipeline.py、decision.json 或 operators。"
+)
+
 
 def run_pipeline_agent(
     prompt: str,
@@ -340,6 +370,7 @@ def run_pipeline_agent(
     agent_cfg: Config,
     tool_log_dir: str | None = None,
     phase: str = "",
+    system_prompt_append: str | None = None,
 ) -> AgentRunResult:
     """供同步 MCTS 循环调用：在 `cwd` 下跑一次 Agent SDK（带瞬时错误退避重试 + 运行超时 + 续跑）。
 
@@ -365,8 +396,16 @@ def run_pipeline_agent(
     result = AgentRunResult(False, error="未发起任何 SDK 运行", error_type="NoAttempt")
     for attempt in range(1, max_retries + 1):
         used_resume = resume_enabled and resume_id is not None
-        options = _build_options(agent_cfg, cwd, resume=resume_id if used_resume else None)
-        cur_prompt = _RESUME_NUDGE if used_resume else prompt
+        options = _build_options(
+            agent_cfg,
+            cwd,
+            resume=resume_id if used_resume else None,
+            system_prompt_append=system_prompt_append,
+        )
+        if used_resume:
+            cur_prompt = _RECIPE_RESUME_NUDGE if phase.startswith(("plan_recipe", "repair_recipe")) else _RESUME_NUDGE
+        else:
+            cur_prompt = prompt
         logger.info(
             "启动 Agent SDK 运行（尝试 %d/%d，%s）：cwd=%s",
             attempt, max_retries,

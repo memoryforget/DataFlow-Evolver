@@ -8,7 +8,9 @@ evaluation intact.
 
 1. **PipelineAgent / planning stage** proposes `node_N/recipe.json`. It may inspect the task,
    available corpus, parent recipe, and (when enabled) external-data options. It may not write
-   pipeline code during this stage.
+   pipeline code during this stage. This stage has its own system-prompt append; it does not inherit
+   the implementation-stage instruction to write operators and compile a pipeline. Transient-error
+   resume messages are phase-aware and keep the same recipe-only boundary.
 2. **Framework `RecipeValidator`** parses and validates the proposal deterministically. It checks
    mode availability, sample budget, coverage buckets, proposal strategies, verification, and
    selection policy. In synthetic mode it rejects fixed-prompt/index variants and requires at least
