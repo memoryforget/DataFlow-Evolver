@@ -1,9 +1,12 @@
 # PostTrainBench 本地适配（feat/posttrainbench-adapt）
 
-把 DataFlow-Evolver 从「每节点全量 SFT+评测驱动 MCTS」的数学路径，扩展成能在**本机单卡**上按
-PostTrainBench 的评测口径，对给定 base model 做 post-training 并最大化任一 benchmark 分数的
-**两段式（Tier-1 / Tier-2）框架**。所有改动**additive、走配置开关**，默认 `search.reward_source: train`
-时行为与原数学 SFT 路径完全一致。
+DataFlow-Evolver 的默认链路已收敛为 PostTrainBench official evaluation：按 PTB 的评测口径，
+对给定 base model 做 post-training 并最大化任一 benchmark 分数。当前 `configs/default.yaml`
+使用 `search.reward_source: train`，即每个通过 ReviewAgent 的 node 都执行 SFT +
+官方 `evaluate.py --limit N`，把真实 PTB dev 分反馈给 MCTS。
+
+历史上本文件描述过 review-only 的两段式 PTB 适配；`configs/posttrainbench_gsm8k.yaml`
+仍保留该消融配置，但当前默认路径已经改为 PTB official train reward。
 
 ---
 
@@ -198,18 +201,16 @@ PostTrainBench 的任务目录只提供评测口径，**不提供 train split**�
    分数无法与榜单直接比。
 2. **另建 dev 源**：GSM8K 官方有 train split（7473 条，`inspect_evals` 目前只拿它做 few-shot），
    从那里物化一份 dev 与 test 天然不相交。但官方 `evaluate.py` 写死读 benchmark 自己的题池，
-   指不到外部文件，需要自定义一个 inspect task 或改走本仓库的 vLLM 评测路径。
+   指不到外部文件，需要自定义一个 inspect task；这样就不再是原封不动的 PTB 官方脚本。
 
-### 6.2 外部数据（web search / Hub 取数）：PTB 链路默认不启用
+### 6.2 外部数据（web search / Hub 取数）
 
-`configs/posttrainbench_gsm8k.yaml` 里没有 `agent_sdk.external_data`，而 `load_config` **不做
-跨文件继承**（`utils/config.py` 只读单份 YAML），所以取值是代码里的 `False`——`dataset-search`
-与 `data-discovery` 两个 MCP 都不会挂载，PTB 的 Agent 只能从零合成。
+框架可以挂载 `dataset-search` 与 `data-discovery`。当前 PTB 配置允许外部数据，但必须与去污染
+一起使用：gsm8k / gpqa / aime 这些 benchmark 本体就在 HuggingFace 上，test split 触手可及，
+而 PostTrainBench 明令禁止拿 test 训练（`src/eval/general/prompt.txt`）。缺了
+`review.decontamination.reference_files`，等于给搜索开了一条比改进数据省力得多的刷分路径。
 
-这不是不兼容，打开只是加一行；但 PTB 场景下**开之前必须先配去污染**：gsm8k / gpqa / aime 这些
-benchmark 本体就在 HuggingFace 上，test split 触手可及，而 PostTrainBench 明令禁止拿 test 训练
-（`src/eval/general/prompt.txt`）。缺了 `review.decontamination.reference_files`，等于给搜索开了
-一条比改进数据省力得多的刷分路径——而 MCTS 一定会找到它。要启用的话，这三项要一起加：
+三项必须同步配置：
 
 ```yaml
 agent_sdk:

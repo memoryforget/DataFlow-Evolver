@@ -175,18 +175,17 @@ DataMaster 面对的是完全相同的局面——template 冻结、Red node 下
 这条 prompt 里一直写着。缺的是**「另一套字段」到底由谁说了算**。
 
 原先由 `TaskProfiler` 让 LLM 现编 `target_schema`，配置里没有任何锚点。而真正的契约写在训练
-脚本的取字段逻辑里，且两份脚本并不一致：
+脚本的取字段逻辑里。当前 PTB 官方路径的桥接脚本兼容多个别名，但框架权威契约仍应固定：
 
 | | instruction 侧 | output 侧 |
 |---|---|---|
-| `llamafactory_math_sft_eval.py` | `instruction` / `question` / `input` | `generated_cot` / `output` / `answer` |
-| `posttrainbench_sft_eval.py` | 上述 + `prompt` / `query` | 上述 + `response` / `completion` / `solution` / `code` |
+| `posttrainbench_sft_eval.py` | `instruction` / `question` / `prompt` / `input` / `query` | `generated_cot` / `output` / `answer` / `response` / `completion` / `solution` / `code` |
 
-于是有一条完整的静默错误链：Profiler 给数学任务编出 `{problem, solution}`——完全合理的输出，
-在 PTB 下甚至能跑——流水线照做，ReviewAgent 拿**同一份编出来的 schema** 去量 `schema_score`
-和 `null_rate`，双双满分放行，然后 MATH 的 `convert_dataset` 一条都读不到，抛"数据集为空或
-字段不匹配"。框架把它记成「训练脚本非零退出」，节点判死。**GPU 烧完才暴露，归因还是错的**；
-部分不匹配更隐蔽，不合规的行被 `if instruction and output` 静默丢掉，只表现为条数变少。
+于是有一条完整的静默错误链：Profiler 给任务编出 `{problem, solution}`，流水线照做，
+ReviewAgent 拿**同一份编出来的 schema** 去量 `schema_score` 和 `null_rate`，双双满分放行；
+但训练桥接按自己的字段表转换数据时可能一条都读不到，抛"数据集为空或字段不匹配"。框架把它记成
+「训练脚本非零退出」，节点判死。**GPU 烧完才暴露，归因还是错的**；部分不匹配更隐蔽，
+不合规的行被转换逻辑静默丢掉，只表现为条数变少。
 
 现在 `trainer.dataset_schema` 是权威：写进 Profiler prompt（让模型的 quality_criteria 也围绕
 真字段展开），解析后覆盖模型输出（prompt 说了不许改，模型仍可能改），续跑时对 checkpoint 里的
@@ -430,10 +429,10 @@ checkpoint、对不上直接抛 `DevSetChanged`。**Agent 全程碰不到这份�
 还有一层结构性差异：DataMaster 的 val 是从任务自带训练集里切出来的，而我们没有可切的训练集（训练
 数据是每个节点现合成的），所以我们固定的是**评测子集**，不是 train/val split。
 
-`source` 留空只表示**框架不物化**，不代表评测脚本就该自己挑题——本仓库的两条链路里，数学 SFT
-脚本会直接拒绝跑 dev（见上），PTB 则因官方 `evaluate.py` 读死自己的题池而用不上物化。留空这个
-选项存在，是因为不是每个下游任务都有一份可枚举的 dev 文件；但"框架不管"与"脚本随便"之间没有
-默认通路，得由脚本作者显式决定并写进它自己的契约。
+`source` 留空只表示**框架不物化**，不代表评测脚本就该自己挑题。当前 PTB 官方默认配置就是留空：
+官方 `evaluate.py` 读死自己的题池，验证反馈通过 `--limit N` 给出，终评通过 `--limit -1`
+给出。留空这个选项存在，是因为不是每个下游任务都有一份可枚举的 dev 文件；但"框架不管"与
+"脚本随便"之间没有默认通路，得由脚本作者显式决定并写进它自己的契约。
 换口径不静默改写而是抛 `DevSetChanged`：已跑节点的分数出自旧题集，混在一棵树里比较就是错的。
 
 **benchmark 本身仍是黑箱**：框架只决定"评哪批题、调哪条命令"，不介入判分逻辑与 test 切分。

@@ -120,6 +120,24 @@ def _hf_api():
     return HfApi()
 
 
+def _looks_like_modelscope_id(dataset_id: str) -> bool:
+    """Heuristic guard for IDs returned by ModelScope tools.
+
+    The HF Hub can technically have an org named "modelscope", but in practice an ID
+    beginning with this prefix usually came from `search_ms_datasets`. Routing it to
+    HF `inspect_dataset` sends the agent back through a slow/unreachable HF endpoint.
+    """
+    return dataset_id.lower().startswith("modelscope/")
+
+
+def _modelscope_route_error(tool_name: str) -> dict[str, Any]:
+    return _err(
+        f"{tool_name} 是 HuggingFace-only 工具，不能处理 ModelScope 数据集 ID。"
+        "如果 ID 来自 search_ms_datasets，请改用 inspect_ms_dataset；随后用 "
+        "preview_ms_dataset / download_ms_dataset。"
+    )
+
+
 def _safe_name(hub: str, dataset_id: str, config: str, split: str) -> str:
     """落盘文件名。带 hub 短码：同名数据集在两个 hub 上未必是同一份内容，不能共用一个缓存键。"""
     parts = [p for p in (_HUB_CODE[hub], dataset_id, config, split) if p]
@@ -170,6 +188,8 @@ async def inspect_dataset(args: dict[str, Any]) -> dict[str, Any]:
     dataset_id = (args.get("dataset_id") or "").strip()
     if not dataset_id:
         return _err("dataset_id is required")
+    if _looks_like_modelscope_id(dataset_id):
+        return _modelscope_route_error("inspect_dataset")
     try:
         info = _hf_api().dataset_info(dataset_id)
     except Exception as exc:
@@ -204,6 +224,8 @@ async def preview_dataset(args: dict[str, Any]) -> dict[str, Any]:
     dataset_id = (args.get("dataset_id") or "").strip()
     if not dataset_id:
         return _err("dataset_id is required")
+    if _looks_like_modelscope_id(dataset_id):
+        return _modelscope_route_error("preview_dataset")
     config = (args.get("config") or "").strip() or None
     split = (args.get("split") or "train").strip()
     rows = _as_int(args.get("rows"), DEFAULT_PREVIEW_ROWS, cap=20)
@@ -250,6 +272,8 @@ def _download(hub: str, args: dict[str, Any]) -> dict[str, Any]:
     dataset_id = (args.get("dataset_id") or "").strip()
     if not dataset_id:
         return _err("dataset_id is required")
+    if hub == HF and _looks_like_modelscope_id(dataset_id):
+        return _modelscope_route_error("download_dataset")
     config = (args.get("config") or "").strip() or None
     split = (args.get("split") or "train").strip()
     max_rows = _as_int(args.get("max_rows"), 0)     # 0 = 全量
@@ -312,8 +336,8 @@ def _dataset_url(hub: str, dataset_id: str) -> str:
 @tool(
     "search_ms_datasets",
     "Search ModelScope for datasets by keyword. Use this when HuggingFace is unreachable, or "
-    "when looking for Chinese-language corpora (ModelScope covers them better). Results already "
-    "carry license / tags / tasks / downloads, so there is no separate inspect step.",
+    "when looking for Chinese-language corpora (ModelScope covers them better). Next call "
+    "inspect_ms_dataset on the selected dataset_id, not HuggingFace inspect_dataset.",
     {
         "query": Annotated[str, "Keyword query, e.g. '数学 推理'"],
         "limit": Annotated[str, f"Max results (default {DEFAULT_SEARCH_LIMIT})"],
@@ -331,6 +355,24 @@ async def search_ms_datasets(args: dict[str, Any]) -> dict[str, Any]:
     if not items:
         return _ok(f"没有匹配 '{query}' 的 ModelScope 数据集，换个关键词或改用 HuggingFace。")
     return _ok(items)
+
+
+@tool(
+    "inspect_ms_dataset",
+    "Inspect a ModelScope dataset without downloading rows or executing dataset scripts. Returns "
+    "license, tags, tasks, downloads, visibility, description and repository file list. Use this "
+    "after search_ms_datasets and before preview_ms_dataset/download_ms_dataset.",
+    {"dataset_id": Annotated[str, "e.g. 'modelscope/gsm8k'"]},
+)
+async def inspect_ms_dataset(args: dict[str, Any]) -> dict[str, Any]:
+    dataset_id = (args.get("dataset_id") or "").strip()
+    if not dataset_id:
+        return _err("dataset_id is required")
+    try:
+        detail = _ms_inspect(dataset_id)
+    except Exception as exc:
+        return _err(_explain(exc, f"获取 ModelScope 数据集 {dataset_id} 的元信息"))
+    return _ok(detail)
 
 
 @tool(
@@ -395,6 +437,38 @@ def _ms_search(query: str, limit: int) -> list[dict[str, Any]]:
 
     page = HubApi().list_repos("dataset", search=query, page_size=limit)
     return [_ms_repo_info(r) for r in page.items]
+
+
+def _ms_inspect(dataset_id: str) -> dict[str, Any]:
+    """Metadata-only ModelScope inspect.
+
+    Do not call `MsDataset.load()` here: script-based ModelScope datasets may require
+    `trust_remote_code=True`, which would execute repository code in the orchestrator process.
+    """
+    from modelscope import HubApi
+
+    api = HubApi()
+    repo = api.get_repo(dataset_id, repo_type="dataset")
+    info = _ms_repo_info(repo)
+    try:
+        files = api.get_dataset_files(dataset_id)
+    except Exception as exc:  # noqa: BLE001 - metadata is still useful without file listing.
+        files_detail: Any = f"（无法列出文件：{type(exc).__name__}）"
+    else:
+        files_detail = [
+            {
+                "path": f.get("Path") or f.get("Name"),
+                "size": f.get("Size"),
+                "is_lfs": f.get("IsLFS"),
+            }
+            for f in files[:40]
+        ]
+    info["files"] = files_detail
+    info["inspect_note"] = (
+        "这是 metadata-only inspect：不会下载样本行，也不会执行数据集脚本。"
+        "下一步请用 preview_ms_dataset 查看字段/样式，或用 download_ms_dataset 落盘。"
+    )
+    return info
 
 
 def _ms_repo_info(repo: Any) -> dict[str, Any]:
@@ -602,6 +676,6 @@ dataset_mcp_server = create_sdk_mcp_server(
     version="2.0.0",
     tools=[
         search_datasets, inspect_dataset, preview_dataset, download_dataset,
-        search_ms_datasets, preview_ms_dataset, download_ms_dataset,
+        search_ms_datasets, inspect_ms_dataset, preview_ms_dataset, download_ms_dataset,
     ],
 )

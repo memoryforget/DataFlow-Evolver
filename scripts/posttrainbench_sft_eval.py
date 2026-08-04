@@ -30,6 +30,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import shlex
 import subprocess
 import sys
@@ -51,6 +52,7 @@ NUM_GPUS = int(os.environ.get("SFT_NUM_GPUS", "1"))            # 单卡 1×H100
 CUTOFF_LEN = int(os.environ.get("SFT_CUTOFF_LEN", "4096"))
 WARMUP_RATIO = float(os.environ.get("SFT_WARMUP_RATIO", "0.03"))
 GRAD_CKPT = os.environ.get("SFT_GRAD_CKPT", "1") == "1"        # 4B 显存吃紧时开梯度检查点
+FLASH_ATTN = os.environ.get("SFT_FLASH_ATTN", "sdpa").strip()
 # 4B 全量 SFT 单卡吃紧时可开 DeepSpeed ZeRO-2（优化器 CPU offload）：SFT_DEEPSPEED=zero2_offload
 DEEPSPEED_MODE = os.environ.get("SFT_DEEPSPEED", "").strip()
 SFT_TRAIN_TIMEOUT_SEC = int(os.environ.get("SFT_TRAIN_TIMEOUT_SEC", "5400"))
@@ -62,6 +64,7 @@ EVAL_CUDA_VISIBLE_DEVICES = os.environ.get("EVAL_CUDA_VISIBLE_DEVICES", "0").str
 # inspect 家族 evaluate.py 的并发（官方默认仅 2，全量评测会极慢）；只影响吞吐，不影响分数。
 EVAL_MAX_CONNECTIONS = os.environ.get("EVAL_MAX_CONNECTIONS", "").strip()
 VLLM_API_KEY = os.environ.get("VLLM_API_KEY", "inspectai")
+DEFAULT_HF_ENDPOINT = os.environ.get("PTB_HF_ENDPOINT", "https://hf-mirror.com")
 
 
 # ---------------------------------------------------------------------------
@@ -243,11 +246,11 @@ def build_sft_config(base_model: str, data_dir: Path, model_dir: Path, template:
         "stage": "sft",
         "do_train": True,
         "finetuning_type": "full",            # 全量 SFT，不使用 LoRA
-        "dataset_dir": str(data_dir),
+        "dataset_dir": str(data_dir.resolve()),
         "dataset": "train",
         "template": template,
         "cutoff_len": CUTOFF_LEN,
-        "output_dir": str(model_dir),
+        "output_dir": str(model_dir.resolve()),
         "num_train_epochs": NUM_EPOCHS,
         "learning_rate": LEARNING_RATE,
         "per_device_train_batch_size": BATCH_SIZE,
@@ -255,7 +258,7 @@ def build_sft_config(base_model: str, data_dir: Path, model_dir: Path, template:
         "lr_scheduler_type": "cosine",
         "warmup_ratio": WARMUP_RATIO,
         "bf16": True,
-        "flash_attn": "fa2",
+        "flash_attn": FLASH_ATTN,
         "optim": "adamw_torch",
         "gradient_checkpointing": GRAD_CKPT,
         "max_grad_norm": 1.0,
@@ -287,7 +290,7 @@ def run_sft(base_model: str, data_dir: Path, output_dir: Path, template: str) ->
     sft_yaml = config_dir / "sft.yaml"
     sft_yaml.write_text(yaml.dump(sft_config, default_flow_style=False), encoding="utf-8")
 
-    cmd = [sys.executable, "-u", "-m", "llamafactory.cli", "train", str(sft_yaml)]
+    cmd = [sys.executable, "-u", "-m", "llamafactory.cli", "train", str(sft_yaml.resolve())]
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     apply_env_prefix_fixups(env, sys.executable)
@@ -307,8 +310,29 @@ def run_sft(base_model: str, data_dir: Path, output_dir: Path, template: str) ->
         raise RuntimeError(f"SFT 训练失败（exit={rc}），日志：{log_path}")
     if not any(model_dir.glob("*.safetensors")):
         raise RuntimeError(f"SFT 未产出 HF safetensors 权重：{model_dir}")
+    _sync_model_metadata_from_base(base_model, model_dir)
     logger.info("SFT 完成，模型目录：%s", model_dir)
     return model_dir
+
+
+def _sync_model_metadata_from_base(base_model: str, model_dir: Path) -> None:
+    """用 base 模型元数据覆盖 SFT 输出，避免 tokenizer/config 漂移影响官方评测。"""
+    base = Path(base_model)
+    if not base.exists():
+        logger.warning("base model 不存在：%s，跳过模型元数据同步", base)
+        return
+    names = [
+        "tokenizer_config.json", "tokenizer.json", "vocab.json", "merges.txt",
+        "special_tokens_map.json", "added_tokens.json", "config.json", "generation_config.json",
+    ]
+    copied = [
+        name for name in names
+        if (base / name).exists() and (shutil.copy2(base / name, model_dir / name) or True)
+    ]
+    jinja = model_dir / "chat_template.jinja"
+    if jinja.exists():
+        jinja.unlink()
+    logger.info("已用 base 模型元数据覆盖 %s：%s", model_dir, copied)
 
 
 def apply_env_prefix_fixups(env: dict, python_exe: str) -> dict:
@@ -375,8 +399,8 @@ def run_official_eval(
     model_path: Path,
     output_dir: Path,
     limit: int,
-) -> float:
-    """在 df-eval（SFT_EVAL_PYTHON）里跑官方 <task>/evaluate.py，返回聚合 accuracy。
+) -> dict:
+    """在 df-eval（SFT_EVAL_PYTHON）里跑官方 <task>/evaluate.py，返回官方聚合 metrics。
 
     只读 --json-output-file 的聚合标量，绝不解析 per-sample test 内容。
     """
@@ -406,6 +430,7 @@ def run_official_eval(
     apply_env_prefix_fixups(env, eval_python)
     env["VLLM_API_KEY"] = VLLM_API_KEY
     env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+    env.setdefault("HF_ENDPOINT", DEFAULT_HF_ENDPOINT)
     if EVAL_CUDA_VISIBLE_DEVICES:
         env["CUDA_VISIBLE_DEVICES"] = EVAL_CUDA_VISIBLE_DEVICES
     if bench.get("needs_judge") and not env.get("OPENAI_API_KEY"):
@@ -423,7 +448,7 @@ def run_official_eval(
     score_key = bench["score_key"]
     if score_key not in metrics:
         raise RuntimeError(f"metrics 缺少聚合分键 {score_key!r}：{sorted(metrics.keys())}")
-    return float(metrics[score_key])
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -444,9 +469,17 @@ def _resolve_task_dir(arg_value: str) -> Path:
     return Path(val).resolve()
 
 
-def _write_results(output_dir: Path, score: float, benchmark: str) -> None:
-    """按框架契约回写 results.json：bad_cases 恒为 []，只含聚合分。"""
-    results = {"score": float(score), "metric_name": benchmark, "bad_cases": []}
+def _write_results(output_dir: Path, score: float, benchmark: str, metrics: dict | None = None) -> None:
+    """按框架契约回写 results.json：保留 score 三件套，附带官方聚合 metrics。"""
+    results = {
+        "score": float(score),
+        "metric_name": benchmark,
+        "bad_cases": [],
+    }
+    if metrics is not None:
+        results["metrics"] = metrics
+        if "stderr" in metrics:
+            results["stderr"] = metrics["stderr"]
     (output_dir / "results.json").write_text(
         json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -482,7 +515,7 @@ def main() -> None:
             if not model_dir.exists():
                 raise RuntimeError(f"评测模型目录不存在：{model_dir}")
             limit = -1 if args.mode == "test" else args.dev_limit
-            score = run_official_eval(benchmark, ptb_task_dir, model_dir, output_dir, limit)
+            metrics = run_official_eval(benchmark, ptb_task_dir, model_dir, output_dir, limit)
         elif args.mode == "test":
             raise RuntimeError("--mode test 需要 --model-dir（只评测不训练）。")
         else:
@@ -496,14 +529,15 @@ def main() -> None:
             data_dir = output_dir / "sft_data"
             convert_dataset(Path(args.dataset), data_dir, benchmark, base_model)
             sft_model = run_sft(base_model, data_dir, output_dir, template)
-            score = run_official_eval(benchmark, ptb_task_dir, sft_model, output_dir, args.dev_limit)
+            metrics = run_official_eval(benchmark, ptb_task_dir, sft_model, output_dir, args.dev_limit)
     except Exception as exc:  # noqa: BLE001
         # 训练/评测未跑成（基础设施/致命错误）：非零退出，让上层 TrainerWrapper 判 failed=True，
         # 而非伪装成「评测 0 分」。真·0 分只会在评测正常跑完后经 _write_results 落盘。
         logger.error("流程失败：%s", exc, exc_info=True)
         sys.exit(1)
 
-    _write_results(output_dir, score, benchmark)
+    score = float(metrics[ptb.get_benchmark(benchmark)["score_key"]])
+    _write_results(output_dir, score, benchmark, metrics)
 
 
 if __name__ == "__main__":

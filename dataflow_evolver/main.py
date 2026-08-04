@@ -584,6 +584,7 @@ class Orchestrator:
             parent_code=parent.config.code if parent.config else None,
             parent_rationale=parent.config.rationale if parent.config else None,
             parent_review=parent.review_result,
+            parent_train_result=parent.train_result,
             siblings=[line for _, line in siblings],
         )
         if config is None:

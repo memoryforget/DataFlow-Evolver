@@ -95,7 +95,7 @@ def test_diagnostic_empty_bad_cases_short_circuits():
     agent = DiagnosticAgent(StubServing(["{}"]))
     rep = agent.analyze([], downstream_task="sft")
     assert rep.actionable_suggestions == []
-    assert "表现良好" in rep.summary
+    assert rep.summary == ""
 
 
 def test_diagnostic_parses_report():

@@ -528,7 +528,7 @@ class DiagnosticReport:       # DiagnosticAgent 产物，回写节点，指导�
       `math_train.jsonl`（可再生的训练语料）不同类，不出库。
 
 ### M16 — 死代码清理（2026-08-02）
-> LIMO 判分迁移后，`vllm_eval_standalone._score_benchmark` 统一了打分口径，各 benchmark 模块
+> 旧 LIMO 判分迁移后，统一 scorer 接管了打分口径，各 benchmark 模块
 > 里的老判分函数没人调用却还在；配置里也留了一个不会被读取的开关。
 - [x] **删 5 个 `score_predictions`**（gsm8k / math500 / math_train / aime2024 / amc23）：
       `__init__.py` 只导出 loader 与 prompt，判分函数从包外不可达，确认无动态派发后连同变成
@@ -546,7 +546,7 @@ class DiagnosticReport:       # DiagnosticAgent 产物，回写节点，指导�
 - [x] **删 `additional_benchmarks.py` 的 10 个判分函数**：`_grade` 接管 MCQ 之后它们才真正变成
       死代码（此前 `_mcq_score` 是"没接线的正确实现"，不能当死代码删）。模块降为纯 loader。
 - [x] **测试改测线上路径**：原 `test_project_gpqa_..._scores_letter_answer` 测的是没接线的
-      `gpqa_score`，bug 正是这么活下来的。改为直接调 `_score_benchmark`，并把 `math_benchmarks.grader`
+      `gpqa_score`，bug 正是这么活下来的。改为直接调统一 scorer，并把数学等价判分器
       换成"被调到就断言失败"的替身：选择题本就不该走 sympy 判分，被调到即说明分支走错；替身同时
       绕开了 `grader` 在 `df-agent` 里装不了的问题（见 §7）。
 
@@ -573,8 +573,8 @@ class DiagnosticReport:       # DiagnosticAgent 产物，回写节点，指导�
 > 就不该在脚本里留第二套机制——留着就迟早会被走回去，而且每次都不报错。
 - [x] **`load_math_train` 降为纯 loader**：`data_path` 改必填，删掉 `_SAMPLE_SIZE` /
       `_SAMPLE_SEED` / `MATH_TRAIN_SAMPLE_SIZE` 与内置默认题库路径。读进来多少条就返回多少条。
-- [x] **`--mode dev` 缺 `--dev-set` 直接报错**：`vllm_eval_standalone._load_benchmarks` 与
-      `llamafactory_math_sft_eval.main` 两处都拦。后者的校验放在 **SFT 之前**——这条链路
+- [x] **`--mode dev` 缺 `--dev-set` 直接报错**：旧自定义评测脚本的 loader 与 SFT 入口两处都拦。
+      SFT 入口的校验放在 **SFT 之前**——这条链路
       先训数小时再评测，等评测阶段才报错就白烧一轮。
       代价：`dev_set.source` 留空时数学链路跑不了 dev（旧行为是脚本自己挑 500 条）。这是想要的。
 - [x] **README 补「脚本负责什么、不负责什么」**：把职责边界从散落的注释提炼成两张表
@@ -620,12 +620,11 @@ class DiagnosticReport:       # DiagnosticAgent 产物，回写节点，指导�
       `EVAL_TP_SIZE`（LIMO 的 lr 与 epochs 是针对 32B + 800 条调的，换小模型要重调）。
 - [x] **补回超时测试**：SSH 那四个测试里只有超时降级是 `DownstreamTrainerWrapper` 没覆盖的，
       移植成 `test_trainer_times_out_and_degrades`，其余三个删除。
-- [x] **scripts 死代码清理**：删整个 `math_benchmarks/math_normalization.py`（唯一引用是
+- [x] **scripts 死代码清理**：删旧数学归一化模块（唯一引用是
       `grader.py` 里一个从未被调用的 import）；删 `grader.py` 的 `timeout_handler` /
       `math_equal_process` / `math_equal_simple` / `check_is_correct_simple` / `_test_math_equal`
       与随之失效的 4 个 import；删 `__init__.py` 里零外部引用的 `extract_gsm8k_answer`、
-      `SYSTEM_PROMPT` 导出（前者是 `extract_answer` 的内部实现，后者与
-      `vllm_eval_standalone` 里的同名硬编码重复）。
+      `SYSTEM_PROMPT` 导出（前者是 `extract_answer` 的内部实现，后者与旧自定义评测脚本里的同名硬编码重复）。
       `reference_train_eval.py` 与 `ptb_benchmarks.list_benchmarks` 经核查**不是**死代码：
       前者被 `test_engine.py` 真实 subprocess 调用并作为 I/O 契约示例，后者用在未知 benchmark
       的报错文案里（`get_benchmark` 抛 KeyError 时枚举可选值）。

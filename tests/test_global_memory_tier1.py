@@ -10,7 +10,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dataflow_evolver.core.global_memory import GlobalMemory  # noqa: E402
-from dataflow_evolver.core.schemas import PipelineConfig, ReviewResult, TrainResult  # noqa: E402
+from dataflow_evolver.core.schemas import (  # noqa: E402
+    DiagnosticReport,
+    PipelineConfig,
+    ReviewResult,
+    TrainResult,
+)
 from dataflow_evolver.core.tree_node import PipelineNode  # noqa: E402
 
 
@@ -64,6 +69,18 @@ def test_render_marks_review_rejected():
     mem = GlobalMemory()
     mem.update(_node(2, tier1=0.21, passed=False))
     assert "评审=未通过" in mem.render()
+
+
+def test_empty_diagnostic_evidence_not_rendered():
+    node = _node(2, tier1=0.4)
+    node.diagnostic_report = DiagnosticReport(summary="无失败样例：模型在评估集上表现良好。")
+
+    mem = GlobalMemory()
+    mem.update(node)
+
+    text = mem.render()
+    assert "诊断:" not in text
+    assert "表现良好" not in text
 
 
 def test_header_reflects_actual_sort_basis():

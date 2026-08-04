@@ -46,11 +46,34 @@ def _fake_modelscope(monkeypatch, rows_factory):
     pkg = types.ModuleType("modelscope")
     sub = types.ModuleType("modelscope.msdatasets")
 
+    class HubApi:
+        def get_repo(self, repo_id, repo_type="dataset"):
+            assert repo_type == "dataset"
+            return types.SimpleNamespace(
+                repo_id=repo_id,
+                downloads=123,
+                license="Apache-2.0",
+                gated=False,
+                tasks=["text-generation"],
+                tags=["math"],
+                likes=7,
+                file_size=4096,
+                last_modified="2026-01-01",
+                description="grade school math",
+            )
+
+        def get_dataset_files(self, dataset_id):
+            return [
+                {"Path": "README.md", "Size": 406, "IsLFS": False},
+                {"Path": "dataset_infos.json", "Size": 1768, "IsLFS": False},
+            ]
+
     class MsDataset:
         @staticmethod
         def load(ds, subset_name=None, split=None, use_streaming=False):
             return rows_factory()
 
+    pkg.HubApi = HubApi
     sub.MsDataset = MsDataset
     pkg.msdatasets = sub
     monkeypatch.setitem(sys.modules, "modelscope", pkg)
@@ -246,6 +269,33 @@ def test_ms_search_result_carries_the_fields_that_decide_usability(links, monkey
     assert "likes" not in hit and "file_size" not in hit and "gated" not in hit
 
 
+def test_modelscope_inspect_returns_metadata_without_loading_rows(links, monkeypatch):
+    def _boom():
+        raise AssertionError("inspect_ms_dataset must not stream dataset rows")
+
+    _fake_modelscope(monkeypatch, _boom)
+
+    payload = json.loads(_call(
+        mcp_datasets.inspect_ms_dataset, dataset_id="modelscope/gsm8k"
+    )[0])
+
+    assert payload["dataset_id"] == "modelscope/gsm8k"
+    assert payload["license"] == "Apache-2.0"
+    assert payload["files"][0]["path"] == "README.md"
+    assert "不会执行数据集脚本" in payload["inspect_note"]
+
+
+def test_hf_tools_reject_modelscope_ids_before_network(links):
+    for tool in (
+        mcp_datasets.inspect_dataset,
+        mcp_datasets.preview_dataset,
+        mcp_datasets.download_dataset,
+    ):
+        text, is_error = _call(tool, dataset_id="modelscope/gsm8k")
+        assert is_error
+        assert "ModelScope" in text and "inspect_ms_dataset" in text
+
+
 def test_script_datasets_are_refused_with_a_way_out(links, monkeypatch):
     def _boom(*a, **k):
         raise ValueError("Loading x requires ... set the option `trust_remote_code=True` ...")
@@ -279,6 +329,8 @@ def test_huggingface_call_kwargs_match_the_installed_sdk():
 def test_modelscope_call_kwargs_match_the_installed_sdk():
     ms = pytest.importorskip("modelscope")
     _binds(ms.HubApi.list_repos, None, "dataset", search="q", page_size=5)
+    _binds(ms.HubApi.get_repo, None, "owner/name", repo_type="dataset")
+    _binds(ms.HubApi.get_dataset_files, None, "owner/name")
 
     msd = pytest.importorskip("modelscope.msdatasets")
     _binds(
@@ -366,7 +418,8 @@ def test_prompt_block_only_when_tools_are_mounted():
     assert "整个 split" in on
     assert "不要传 `max_rows` 去限制下载量" in on
     # 两个 hub + 三个发现渠道
-    assert "download_ms_dataset" in on and "HuggingFace 连不上时改用它" in on
+    assert "inspect_ms_dataset" in on and "HuggingFace 连不上时改用 ModelScope" in on
+    assert "ModelScope ID" in on and "*_ms_dataset" in on
     assert "search_papers" in on and "只找线索、不取数" in on
 
 

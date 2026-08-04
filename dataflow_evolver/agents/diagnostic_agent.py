@@ -43,7 +43,9 @@ class DiagnosticAgent(AgentABC):
     def analyze(self, bad_cases: list[BadCase], downstream_task: str = "") -> DiagnosticReport:
         """对 bad cases 归因。无 bad case 或解析失败时返回空报告（不阻塞主循环）。"""
         if not bad_cases:
-            return DiagnosticReport(summary="无失败样例：模型在评估集上表现良好。")
+            # PTB official evaluation only exposes aggregate metrics by design. Do not render a
+            # "no failures" diagnosis, because that would be interpreted as actionable evidence.
+            return DiagnosticReport(summary="")
         prompt = self.build_prompt(downstream_task, bad_cases)
         raw = self.run_json(prompt)
         if raw is None:

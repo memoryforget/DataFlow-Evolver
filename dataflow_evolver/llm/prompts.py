@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataflow_evolver.core.input_corpus import InputCorpus
-from dataflow_evolver.core.schemas import DiagnosticReport, ReviewResult, TaskProfile
+from dataflow_evolver.core.schemas import DiagnosticReport, ReviewResult, TaskProfile, TrainResult
 
 # ---------------------------------------------------------------------------
 # TaskProfilerAgent
@@ -176,8 +176,14 @@ def _external_data_block(data_links_dir: str) -> str:
         "  2. `inspect_dataset(dataset_id)` 看 license / configs / splits，**先确认 license 允许使用**；\n"
         "  3. `preview_dataset(dataset_id, config, split)` 取几行真实数据，确认字段与风格对得上目标 schema；\n"
         "  4. `download_dataset(dataset_id, config, split)` 把**整个 split** 落成 jsonl，返回**绝对路径**。\n"
-        "  ModelScope 侧有对应的 `search_ms_datasets` / `preview_ms_dataset` / `download_ms_dataset`，"
-        "契约完全一致。**HuggingFace 连不上时改用它**，找中文语料时也优先考虑。\n"
+        "  ModelScope 侧是**独立工具链**，不要把 ModelScope 的 dataset_id 传给 HuggingFace 工具：\n"
+        "  1. `search_ms_datasets(query)` 按关键词找候选（返回项已带 license/tags/tasks/downloads 等元信息）；\n"
+        "  2. `inspect_ms_dataset(dataset_id)` 看仓库元信息与文件列表，**不会下载样本行，也不会执行数据集脚本**；\n"
+        "  3. `preview_ms_dataset(dataset_id, config, split)` 取几行真实数据，确认字段与风格；\n"
+        "  4. `download_ms_dataset(dataset_id, config, split)` 把 split 落成 jsonl，返回绝对路径。\n"
+        "  **HuggingFace 连不上时改用 ModelScope**，找中文语料时也优先考虑。"
+        "注意：`inspect_dataset` / `preview_dataset` / `download_dataset` 只用于 HuggingFace；"
+        "ModelScope ID（如 `modelscope/...`）只能走 `*_ms_dataset` 工具。\n"
         "  **data-discovery MCP（只找线索、不取数）**：`search_web`（网页）、`search_github`"
         "（数据集仓库）、`search_papers`（arXiv）。Hub 的关键词搜索找不到你想要的东西时用它们——"
         "很多语料是先在论文或博客里被提到，你才知道它叫什么。拿到名字后仍要回上面的 download 工具取数。\n"
@@ -228,13 +234,15 @@ def _paradigm_rule(grounded: bool, external: bool) -> str:
 def _init_block(reference_code: str | None, instruction: str | None) -> str:
     """Init node（node_0）专属指引，三档启动方式各渲染一段。
 
-    共同的硬约束是"简单可靠优先"：整棵搜索树都从这一个节点变异出去，起点跑不稳
-    等于整轮搜索报废，而复杂度本就该由后续变异节点按反馈逐步加上去。
+    共同约束是"可靠且有竞争力"：整棵搜索树都从这一个节点变异出去，起点跑不稳
+    等于整轮搜索报废；但起点也不应被限制为最小流水线，应允许在有依据时使用外部数据、
+    多步处理和质量控制，形成一个可继续变异的强基线。
     """
     common = (
         "\n【初始节点（node_0）】这是整棵搜索树的起点，没有父节点可继承。后续所有变异都基于"
-        "它演化，所以**稳定跑通优先于精巧**：结构尽量简单、算子数量克制、不要预先堆叠"
-        "各种过滤与增强——那些留给后续节点按评审反馈有依据地加。\n"
+        "它演化，所以请设计一条**稳定、可复现、且具备竞争力**的初始流水线。不要为了追求"
+        "最小实现而刻意压低复杂度；如果外部数据、分层采样、过滤、增强或质量控制能带来明确收益，"
+        "可以在 node_0 中直接使用，但每个步骤都要有清晰目的并保持可调、可审计。\n"
     )
     if reference_code:
         return common + (
@@ -250,7 +258,8 @@ def _init_block(reference_code: str | None, instruction: str | None) -> str:
         )
     return common + (
         "\n【自主设计】没有给定参考实现或指令，请你根据上面的 Target 与目标 schema 自行设计"
-        "一条最小可行的流水线：能稳定产出符合 schema 的数据即可。\n"
+        "一条完整且有竞争力的初始流水线：既要稳定产出符合 schema 的数据，也要为后续节点留下"
+        "可解释、可局部变异的改进空间。\n"
     )
 
 
@@ -266,6 +275,7 @@ def build_pipeline_prompt(
     recommended_categories: dict | None = None,
     parent_rationale: str | None = None,
     parent_review: ReviewResult | None = None,
+    parent_train_result: TrainResult | None = None,
     siblings: list[str] | None = None,
     is_init: bool = False,
     init_reference_code: str | None = None,
@@ -316,6 +326,13 @@ def build_pipeline_prompt(
                 f"（父节点代码本次不可用，需从零编写流水线。）这是父节点的设计取舍，可作为方向参考："
                 f"延续其中站得住的部分，或明确判断它不成立后另走一条路。\n"
             )
+    if parent_train_result is not None and not parent_train_result.failed:
+        parent_block += (
+            f"\n【父节点下游验证反馈】父节点在下游验证集上的聚合分数："
+            f"{parent_train_result.metric_name}={parent_train_result.score:.4f}。"
+            f"请把它当作当前变异起点的真实效果基线：保留可能贡献分数的设计，"
+            f"并优先修正评审反馈中指出的弱项。\n"
+        )
     diagnostic_block = ""
     if diagnostic and diagnostic.actionable_suggestions:
         suggestions = "\n".join(f"  - {s}" for s in diagnostic.actionable_suggestions)

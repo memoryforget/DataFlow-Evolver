@@ -135,6 +135,18 @@ def test_parent_review_marks_rejected():
     assert "评审未通过" in prompt
 
 
+def test_parent_train_result_injected_as_validation_feedback():
+    prompt = build_pipeline_prompt(
+        PROFILE,
+        SCRATCH,
+        "node_2",
+        parent_train_result=TrainResult(score=0.125, metric_name="accuracy"),
+    )
+    assert "父节点下游验证反馈" in prompt
+    assert "accuracy=0.1250" in prompt
+    assert "真实效果基线" in prompt
+
+
 # ---- 3. 兄弟负面清单 -------------------------------------------------------
 def test_sibling_block_injected():
     prompt = build_pipeline_prompt(

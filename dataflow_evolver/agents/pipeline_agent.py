@@ -19,6 +19,7 @@ from dataflow_evolver.core.schemas import (
     PipelineConfig,
     ReviewResult,
     TaskProfile,
+    TrainResult,
 )
 from dataflow_evolver.llm.agent_sdk import AgentInfraError, run_pipeline_agent
 from dataflow_evolver.llm.mcp_operators import _recommend_categories
@@ -92,6 +93,7 @@ class PipelineAgent:
         parent_code: str | None = None,
         parent_rationale: str | None = None,
         parent_review: ReviewResult | None = None,
+        parent_train_result: TrainResult | None = None,
         siblings: list[str] | None = None,
     ) -> PipelineConfig | None:
         """运行一次 Agent SDK 生成流水线；成功则组装 PipelineConfig，否则 None。
@@ -119,6 +121,7 @@ class PipelineAgent:
             data_links_dir=self.data_links_dir,
             parent_rationale=parent_rationale,
             parent_review=parent_review,
+            parent_train_result=parent_train_result,
             siblings=siblings,
         )
         return self._run_and_assemble(prompt, node_dir_name)

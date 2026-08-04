@@ -35,7 +35,7 @@ class ReviewResult:
     历史上仅有 schema/relevance 两维 + passed 门槛。PostTrainBench 适配把它升级为
     Tier-1 复合打分器：新增 correctness/difficulty/diversity 三个 LLM 维度，以及纯代码
     扫描得到的硬指标（dup_rate/null_rate/parse_valid_rate），并合成 tier1_score 作为
-    MCTS 每节点 reward。所有新增字段均带默认值，旧的两维调用与数学 SFT 路径保持不变。
+    MCTS 每节点 reward。所有新增字段均带默认值，旧的两维调用保持兼容。
     """
 
     schema_score: float                    # 0-1

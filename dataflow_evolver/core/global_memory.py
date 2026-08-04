@@ -72,13 +72,17 @@ class GlobalMemory:
         ]
         review = node.review_result
         train = node.train_result
+        diagnostic = node.diagnostic_report
+        diagnostic_summary = None
+        if diagnostic and (diagnostic.failure_patterns or diagnostic.actionable_suggestions):
+            diagnostic_summary = diagnostic.summary
         self._entries[node.id] = MemoryEntry(
             node_id=node.id,
             field_flow=node.config.field_flow,
             operators=op_entries,
             score=train.score if train else None,
             review_passed=review.passed if review else None,
-            diagnostic_summary=node.diagnostic_report.summary if node.diagnostic_report else None,
+            diagnostic_summary=diagnostic_summary,
             tier1_score=review.tier1_score if review else None,
             dup_rate=review.dup_rate if review else None,
             null_rate=review.null_rate if review else None,

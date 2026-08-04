@@ -144,8 +144,7 @@ review:
 # Phase-2 / Tier-2：单卡全量 SFT + 官方 evaluate.py（只取聚合 accuracy）
 trainer:
   # posttrainbench_sft_eval.py 的 _INSTRUCTION_KEYS / _OUTPUT_KEYS 首选键。
-  # 注意它与 llamafactory_math_sft_eval.py 的别名表并不相同（例如 solution 只有前者认），
-  # 所以契约按脚本逐份声明，不做全局默认。
+  # PTB bridge 接受 question/answer/solution 等别名，但 instruction/output 仍是框架权威契约。
   dataset_schema:
     instruction: str
     output: str

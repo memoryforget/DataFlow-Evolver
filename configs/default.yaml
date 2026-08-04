@@ -4,10 +4,10 @@
 project:
   workspace_dir: ./workspace
   agent_root: ./workspace/_agent_root      # Agent SDK 的 cwd；内含 .claude/skills + dataflow 源码副本
-  # 输入语料目录：**放了数据就是 corpus-grounded 合成**（流水线入口指向语料，在其之上加工），
-  # 目录空/不存在就是 from-scratch 合成（凭模型知识从零合成）。范式由目录内容决定，无需另设开关。
-  input_dir: ./input
-  input_entry: ${MATH_INPUT_ENTRY:gsm8k_train_pool.jsonl}  # 目录内多个数据文件时显式指定入口（相对 input_dir）；留空=自动选
+  # 当前 PTB 官方测试配置默认不向 Agent 提供 input/ 语料：from-scratch 合成，避免把外部输入当作
+  # benchmark 先验喂给搜索。若要做消融，可显式设置 PTB_INPUT_DIR/PTB_INPUT_ENTRY。
+  input_dir: ${PTB_INPUT_DIR:}
+  input_entry: ${PTB_INPUT_ENTRY:}
   data_links_dir: ""                       # 外部数据集下载目录（跨节点共享）；留空=<workspace>/data_links
 
 # 非-SDK 模型后端
@@ -47,7 +47,7 @@ agent_sdk:
   # 搜索/预览/下载真实数据集到 project.data_links_dir，并在流水线里读取。
   # 是否允许引入外部数据属于实验设定的一部分，故须显式打开；开启时务必同时配好
   # review.decontamination.reference_files，否则很容易把 benchmark 的镜像数据集拉进来。
-  external_data: false
+  external_data: true
   discovery: true                          # external_data 打开时是否连带挂 data-discovery（找线索）
   # 工具：用 claude_code 预设放开全部内置工具（见 llm/agent_sdk.py），不再设白名单
   # 系统提示：保留 claude_code 预设，仅 append DataFlow 指令；可用 system_prompt_append 覆盖该 append 文本
@@ -56,11 +56,11 @@ agent_sdk:
 # 注意：这些工具是 in-process MCP，跑在编排器自己的进程里，**读不到 agent_sdk.env**
 # （那一段是发给 Agent SDK 子进程的）。连接信息只能配在这里或直接 export。
 dataset_search:
-  endpoint: ""                    # HF_ENDPOINT；国内直连不通时填镜像，如 https://hf-mirror.com
+  endpoint: ${HF_ENDPOINT:https://hf-mirror.com}  # HF_ENDPOINT；默认走 HF-Mirror
   token: ""                       # HF_TOKEN；gated 数据集需要。留空=沿用环境变量/本地登录态
   cache_dir: ""                   # HF_HOME；留空=沿用环境（注意 datasets 的缓存也会占盘）
-  max_download_mb: 2048           # 单份数据集落盘上限；触顶截断（保留 split 头部）并在 meta 标明
-  modelscope_endpoint: ""         # MODELSCOPE_ENDPOINT；留空=https://modelscope.cn
+  max_download_mb: 8192           # 单份数据集落盘上限；触顶截断（保留 split 头部）并在 meta 标明
+  modelscope_endpoint: "https://modelscope.cn"         # MODELSCOPE_ENDPOINT；留空=https://modelscope.cn
   modelscope_token: ""            # MODELSCOPE_API_TOKEN；仅私有/受限数据集需要，公开数据集免登录
   # 下载默认取**整个 split**：取多少、怎么采样、按什么过滤本就是流水线该做的决策，也正是被
   # 搜索的对象；固化在工具里等于替搜索先做了一个它无从推翻的选择。只取单个 split 而非整仓库，
@@ -76,7 +76,7 @@ discovery:
 
 # 数据生成规模：注入生成 prompt，指导算子产出量（合成式据此设 num_samples，转换式控采样/过滤）
 generation:
-  target_samples: ${MATH_TARGET_SAMPLES:4000}  # 目标产出条数（0=不指定）；按下游 SFT 需求调，Condor 建议 <5000
+  target_samples: ${PTB_TARGET_SAMPLES:10000}  # 目标产出条数（0=不指定）；按下游 SFT 需求调，Condor 建议 <5000
   # 训练前把数据切齐到 target_samples 条（默认 true）。训练配方在框架外冻结，总优化步数
   # 正比于条数，不切齐则多产数据的节点白拿更多梯度步数，分数不再只反映数据质量。
   # 关掉它等于把"数据量"也放进搜索空间——想做"更多数据是否更好"的消融时才关。
@@ -94,11 +94,11 @@ init:
 
 # MCTS 树搜索
 search:
-  # reward_source:（PostTrainBench 两段式新增）每节点 reward 来源。默认 train=沿用现状
-  #   （每节点跑 trainer.dev_eval_cmd 做 SFT+评测取真分，数学 SFT 路径不变）。
+  # reward_source：每节点 reward 来源。当前 PTB 官方测试配置默认 train：
+  #   每个通过 ReviewAgent 的 node 都跑 SFT + 官方 evaluate.py --limit N，取真分反馈 MCTS。
   #   review=Tier-1：每节点只产 generation.probe_samples 条交 ReviewAgent 打复合分作 reward
   #   （搜索期不训练/不占 GPU），搜索结束再对 top-K 重产 target_samples 做真实 SFT+评测选模。
-  # reward_source: train
+  reward_source: train
   # 以下三项仅 reward_source=review 生效：
   # time_budget_sec:  整轮（搜索+终选+终评）总墙钟预算秒；0=只按 max_iterations 停。
   #                   搜索会预留「终选+终评」时间后停止扩展。
@@ -107,8 +107,8 @@ search:
   exploration_constant: 1.414
   exploration_decay: 1.0                    # 探索常数 c 的指数衰减率（按已评估节点数）；1.0=不衰减
   exploration_min: 0.0                      # 衰减下限，防 c 衰减到 0
-  max_iterations: ${MATH_MAX_ITERATIONS:5}
-  max_children_per_node: 4
+  max_iterations: ${PTB_MAX_ITERATIONS:4}
+  max_children_per_node: 2
   memory_top_k: 5                          # 注入 PipelineAgent prompt 的历史节点条数（按有效质量分降序：有下游真分用真分，否则用 tier1）
   memory_max_issues: 3                     # 每条记忆携带的评审 issues 条数（-1=全部，0=不带）
   memory_issue_maxlen: 120                 # 单条 issue 截断长度（<=0=不截断）
@@ -161,23 +161,12 @@ review:
   collapse_null_rate: 0.3
   collapse_parse_valid_rate: 0.7
   collapse_tier1_frac: 0.6        # tier1 相对探针回退到此比例以下判塌陷
-  # 去污染（见 core/decontamination.py）：合成数据与评测基准测试集的 n-gram 重合检测。
-  # 搜索的目标函数就是下游分数，把测试题混进训练集是提分最省力的路径——不量化扣分，MCTS 迟早
-  # 会走过去。开了外部数据搜索后尤其要配（Hub 上大量数据集本身就是 benchmark 的镜像）。
-  # 下面列的就是 test_eval_cmd 终评用的那 11 份题集；dev 题集由框架物化后自动并入，不必重复写。
+  # 去污染（见 core/decontamination.py）：合成数据与 PTB 官方测试题的 n-gram 重合检测。
+  # PTB 规则禁止使用 benchmark test data 训练；默认 benchmark=gsm8k，因此参考集指向
+  # 本仓库携带的 GSM8K test 镜像。更换 PTB_BENCHMARK 时同步设置 PTB_DECONTAM_REF。
   decontamination:
     reference_files:              # benchmark 测试集文件（jsonl/json/txt）；留空=不检测
-      - data/benchmarks/limo_eval/gsm8k/test.jsonl
-      - data/benchmarks/limo_eval/math/test.jsonl
-      - data/benchmarks/limo_eval/aime/test.jsonl
-      - data/benchmarks/limo_eval/amc/test.jsonl
-      - data/benchmarks/limo_eval/olympiadbench/test.jsonl
-      - data/benchmarks/limo_eval/cn_math_2024/test.jsonl
-      - data/benchmarks/limo_eval/gaokao/test.jsonl
-      - data/benchmarks/limo_eval/kaoyan/test.jsonl
-      - data/benchmarks/limo_eval/grade_school_math/test.jsonl
-      - data/benchmarks/limo_eval/minerva/test.jsonl
-      - data/benchmarks/limo_eval/gpqa/test.jsonl
+      - ${PTB_DECONTAM_REF:data/benchmarks/limo_eval/gsm8k/test.jsonl}
     ngram: 13                     # 归一化后的 n-gram 长度；短文本退回整串精确匹配
     fields: []                    # 参与比对的字段；留空=该行所有字符串字段
     max_rate: 0.02                # 污染率上限，超过即判 passed=False（低于上限只按比例扣分）
@@ -194,32 +183,27 @@ trainer:
   # 并作为评审硬门槛（必需字段对不上在训练前就判不通过，见 review.null_threshold）。
   # 注意：这不是“只能有这些字段”。训练脚本只读取这些字段，额外元数据/溯源字段会被忽略。
   # 留空 = 让 LLM 自行设计字段名，对不上要到训练阶段才炸，且报错看不出根因是字段名。
-  # 取值须与训练脚本的取字段逻辑一致：llamafactory_math_sft_eval.py 与
-  # posttrainbench_sft_eval.py 都以 instruction/output 为首选键。
+  # 取值须与 PTB 桥接脚本的取字段逻辑一致：posttrainbench_sft_eval.py
+  # 以 instruction/output 为首选键，兼容 question/answer/solution 等别名。
   dataset_schema:
     instruction: str                # 题面 / 指令
     output: str                     # 参考解答（含推理过程）
 
-  # dev 题集由框架物化，评测脚本不参与决策（见 core/dev_set.py）。启动时按
-  # (source_sha, seed, size) 固定成 workspace/eval/dev.jsonl 并以 --dev-set 下传：
-  #   - 所有节点保证评在同一批题上（奖励是节点之间比出来的，口径漂移会静默毁掉排序）；
-  #   - 落盘后 dev 才能进去污染参考集——dev 是搜索直接优化的目标，把 dev 题混进合成数据
-  #     比混 test 更能刷分，这一条会自动接线，不需要在下面的 reference_files 里重复配；
-  #   - 口径进 checkpoint，续跑时对不上直接报错。
-  # ★ source 留空 = 不物化 = 不下传 --dev-set，而 llamafactory_math_sft_eval.py --mode dev
-  #   会**直接报错**（在 SFT 之前，不烧 GPU）。这是有意的：脚本一旦有「自己挑题」的退路，
-  #   框架这套口径就形同虚设。要跑 dev 就得把题集来源明确写在这里。
-  dev_set:
-    # 源文件不入库，需自行准备（见 data/README.md）。
-    source: ${MATH_DEV_SET_SOURCE:data/gsm8k_dev.jsonl}   # 从 GSM8K train 预切出的 dev 集（非 benchmark test）
-    size: ${MATH_DEV_SET_SIZE:0}                       # 从 source 里抽多少条；0 = 全量
-    seed: ${MATH_DEV_SET_SEED:42}
-  # 防数据泄露纪律（见 docs/design-decisions.md §3）：
-  #   dev：仅给 MCTS 当奖励信号，允许被「刷」；test：全程对 loop 不可见，仅终评一次。
-  dev_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode dev     # Full SFT + 上面物化的 dev 题集
-  test_eval_cmd: python scripts/llamafactory_math_sft_eval.py --mode test   # 终评：完整 benchmark suite（GSM8K/AIME/MATH500/AMC23/OlympiadBench/CHMath/Gaokao/Kaoyan/GradeSchool/MinervaMath/GPQA）
-  timeout_sec: 7200                                             # 流水线执行（纯数据合成）超时=2h；4算子约30min，5算子(交叉验证+精修)会超1h，留足余量
-  train_timeout_sec: 28800                                      # dev/test 评测（含内层 Full SFT 训练 + benchmark suite 评测）超时=8h
+  # PTB official evaluate.py 写死读取自身 benchmark 题池，不接受外部 --dev-set。
+  # 因此这里不配置 trainer.dev_set；每个 node 的验证反馈由 --dev-limit N 给出，
+  # final/test 固定 --limit -1 全量官方评测。
+  dev_eval_cmd: >-
+    python scripts/posttrainbench_sft_eval.py --mode dev
+    --base-model ${PTB_BASE_MODEL:/vepfs-mlp2/c20250602/500050/models/Qwen3-1.7B-Base}
+    --ptb-task-dir ${PTB_TASK_DIR:/vepfs-mlp2/c20250602/500050/lh/xqf/PostTrainBench/src/eval/tasks/gsm8k}
+    --dev-limit ${PTB_DEV_LIMIT:150}
+    --benchmark ${PTB_BENCHMARK:gsm8k}
+  test_eval_cmd: >-
+    python scripts/posttrainbench_sft_eval.py --mode test
+    --ptb-task-dir ${PTB_TASK_DIR:/vepfs-mlp2/c20250602/500050/lh/xqf/PostTrainBench/src/eval/tasks/gsm8k}
+    --benchmark ${PTB_BENCHMARK:gsm8k}
+  timeout_sec: 1200                                             # 流水线执行（纯数据合成）超时
+  train_timeout_sec: 16200                                       # 单次 SFT + PTB dev/test 评测超时
 
 # Phase-2 慢反馈：诊断
 diagnostic:
