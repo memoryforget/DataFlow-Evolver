@@ -39,9 +39,8 @@ class ExecutionWrapperABC(ABC):
     ) -> ExecutionResult:
         """在 `node_dir` 下执行 `config.code`，返回数据集路径或崩溃栈。
 
-        `env_overrides` 为本次执行追加/覆盖的环境变量（在 `extra_env` 之上再覆盖），
-        用于两档生成规模：搜索期注入 ``DF_TARGET_SAMPLES=probe_samples``，终选重产时注入
-        ``DF_TARGET_SAMPLES=target_samples``，无需重新生成 pipeline.py。
+        `env_overrides` adds or overrides variables for this iteration, such as the
+        optional ``DF_TARGET_SAMPLES`` value.
         """
         raise NotImplementedError
 

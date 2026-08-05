@@ -1,17 +1,11 @@
-"""input/ 契约：把用户放进输入目录的语料变成「流水线入口 + prompt 里可读的预览」。
-
-**范式由目录内容自动决定，不设开关**：
-
-- 目录里有数据文件 → corpus-grounded 合成：入口指向真实语料，流水线在它之上加工/增强/蒸馏。
-- 目录空或不存在   → from-scratch 合成：入口指向 0 字节 `empty.jsonl`（仅为满足 DataFlow 的
-  `first_entry_file_name` 形参），流水线凭模型知识从零合成。
+"""Turn the user-provided raw corpus into a deterministic entry and prompt preview.
 
 不做成配置项，是因为「配了 grounded 却没语料」「放了语料却按 scratch 跑」两种组合都只可能是
 误配：前者必崩，后者白白浪费了用户准备的数据。让目录内容本身作为唯一事实来源，就没有可漂移的
 第二处状态。
 
 预览是**尽力而为**的：语料格式千奇百怪，解析失败只会少一段 prompt 上下文，绝不该让整轮搜索起不来。
-因此除「显式指定的入口文件不存在」外，本模块不抛异常——那一条是真正的误配，必须启动即报错。
+The review-only loop requires a real structured entry and fails fast when it is absent.
 """
 from __future__ import annotations
 
@@ -61,7 +55,7 @@ class CorpusFile:
 
 @dataclass(frozen=True)
 class InputCorpus:
-    """一次运行的输入契约：入口文件 + 全部素材文件 + 供 prompt/Profiler 使用的预览。"""
+    """一次运行的固定输入契约：入口文件、全部素材文件及 prompt 预览。"""
 
     entry_path: str
     root: Path | None = None
@@ -70,18 +64,18 @@ class InputCorpus:
 
     @property
     def grounded(self) -> bool:
-        """有真实语料即 corpus-grounded；否则 from-scratch。"""
+        """是否已绑定真实语料。轻量入口要求此值始终为真。"""
         return self.entry_file is not None
 
     def sample_text(self) -> str | None:
-        """给 TaskProfiler 的样例文本：入口文件的前几行，没有入口就退回任一可预览文件。"""
+        """返回入口文件的前几行；无预览时退回其他素材文件。"""
         for f in ((self.entry_file,) if self.entry_file else ()) + self.files:
             if f is not None and f.preview_lines:
                 return "\n".join(f.preview_lines)
         return None
 
     def prompt_block(self) -> str:
-        """注入 PipelineAgent prompt 的【输入语料】段；from-scratch 时为空串。"""
+        """渲染注入 PipelineAgent prompt 的输入语料段。"""
         if not self.grounded:
             return ""
         lines = [f"\n【输入语料】目录 {self.root}，流水线的 Entry file 即下表中标注 ← 的那个："]
@@ -102,39 +96,33 @@ class InputCorpus:
 
 def discover(
     input_dir: str | Path | None,
-    empty_entry_path: Path,
     entry_name: str = "",
 ) -> InputCorpus:
-    """扫描输入目录，决定范式与入口文件。
+    """Scan a required raw-data directory and choose one deterministic entry.
 
     `entry_name`：多文件时显式指定入口（相对输入目录的路径）。不指定则按
     `ENTRY_SUFFIX_PRIORITY` + 路径字典序确定性地选一个，并在文件多于一个时告警——
     静默挑一个再让用户去日志里猜是哪个，比多打一行告警糟糕得多。
     """
-    scratch = InputCorpus(entry_path=str(empty_entry_path))
     if not input_dir:
-        return scratch
+        raise ValueError("project.input_dir 不能为空：review-only loop 需要固定 raw data")
     root = Path(input_dir).expanduser().resolve()
     if not root.is_dir():
-        logger.info("输入目录不存在（%s），按从零合成运行。", root)
-        return scratch
+        raise FileNotFoundError(f"raw data 目录不存在：{root}")
 
     files = tuple(_scan(root))
     if not files:
-        logger.info("输入目录为空（%s），按从零合成运行。", root)
-        return scratch
+        raise ValueError(f"raw data 目录为空：{root}")
 
     entry = _pick_entry(files, entry_name, root)
     if entry is None:
-        logger.warning(
-            "输入目录 %s 里没有可作为 Entry file 的结构化数据（%s），按从零合成运行；"
-            "目录内的其它文件不会被自动读取。",
-            root, "/".join(ENTRY_SUFFIX_PRIORITY),
+        raise ValueError(
+            f"raw data 目录 {root} 中没有可作为 Entry file 的结构化文件："
+            f"{', '.join(ENTRY_SUFFIX_PRIORITY)}"
         )
-        return scratch
 
     logger.info(
-        "语料 grounded 合成：Entry file=%s（%s），目录内共 %d 个文件。",
+        "固定 raw corpus：Entry file=%s（%s），目录内共 %d 个文件。",
         entry.rel, entry.describe(), len(files),
     )
     return InputCorpus(

@@ -43,7 +43,7 @@ class Candidate:
 
     @property
     def score(self) -> float:
-        return self.review.tier1_score if self.review is not None else 0.0
+        return self.review.review_score if self.review is not None else 0.0
 
 
 class ReviewOnlyLoop:
@@ -134,7 +134,7 @@ class ReviewOnlyLoop:
         if best is not None:
             self._write_manifest(best)
             logger.info(
-                "Review-only 最优候选：%s tier1=%.4f passed=%s",
+                "Review-only 最优候选：%s review_score=%.4f passed=%s",
                 best.node_dir_name,
                 best.score,
                 best.review.passed if best.review else False,
@@ -199,7 +199,7 @@ class ReviewOnlyLoop:
             "run_name": self.run_name,
             "max_iterations": self.max_iterations,
             "completed_iterations": len(self.candidates),
-            "selection_rule": "passed first, then highest tier1_score",
+            "selection_rule": "passed first, then highest review_score",
             "best": _candidate_record(best, self.agent_root),
             "all_candidates": [_candidate_record(c, self.agent_root) for c in self.candidates],
             "manual_next_step": "Use best.dataset_path for downstream training/evaluation outside this loop.",
@@ -212,7 +212,7 @@ class ReviewOnlyLoop:
 
 
 def select_best(candidates: list[Candidate]) -> Candidate | None:
-    """Prefer a passed review, then maximize its Tier-1 score."""
+    """Prefer a passed review, then maximize its Review score."""
     reviewed = [candidate for candidate in candidates if candidate.review is not None]
     if not reviewed:
         return None
@@ -226,28 +226,19 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
     agent_root = Path(project.agent_root)
     agent_root.mkdir(parents=True, exist_ok=True)
 
-    empty_entry = agent_root / "empty.jsonl"
-    empty_entry.touch(exist_ok=True)
     corpus = input_corpus.discover(
         project.get("input_dir", "") or "",
-        empty_entry,
         entry_name=str(project.get("input_entry", "") or ""),
     )
-    if not corpus.grounded:
-        raise ValueError(
-            "lightweight review loop 要求用户提供固定 raw data：请设置 project.input_dir，"
-            "且目录中至少包含一个 jsonl/json/csv/parquet 文件。"
-        )
 
     task_cfg = cfg.task
     target_schema = _plain_dict(task_cfg.get("target_schema"))
     if not target_schema:
-        raise ValueError("task.target_schema 不能为空；轻量入口不会额外调用 TaskProfiler 猜测字段")
+        raise ValueError("task.target_schema 不能为空；轻量入口不会自动猜测输出字段")
     profile = TaskProfile(
         task_description="",  # CLI --task is injected in main() after construction.
         target_schema={str(k): str(v) for k, v in target_schema.items()},
         quality_criteria=list(task_cfg.get("quality_criteria", []) or []),
-        downstream_task=str(task_cfg.get("downstream_task", "") or ""),
     )
 
     serving = build_serving(cfg.llm)
@@ -270,11 +261,7 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
         null_threshold=float(review_cfg.get("null_threshold", 0.5)),
     )
 
-    # Force external-data capabilities off even if a broader config is accidentally reused.
-    agent_data = dict(cfg.agent_sdk.to_dict())
-    agent_data["external_data"] = False
-    agent_data["discovery"] = False
-    agent_cfg = Config(agent_data)
+    agent_cfg = cfg.agent_sdk
 
     pipeline_llm = _resolve_pipeline_llm(cfg.llm)
     llm_block, extra_env = _pipeline_runtime_contract(pipeline_llm)
@@ -286,7 +273,6 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
         corpus=corpus,
         llm_block=llm_block,
         target_samples=target_samples,
-        data_links_dir="",
     )
 
     loop_cfg = cfg.loop
@@ -407,7 +393,7 @@ def main() -> None:
         return
     print(f"\n最优流水线：{loop.agent_root / best.node_dir_name / 'pipeline.py'}")
     print(f"最优数据：{best.dataset_path}")
-    print(f"Review Tier-1：{best.score:.4f}（passed={best.review.passed}）")
+    print(f"Review score：{best.score:.4f}（passed={best.review.passed}）")
     print(f"运行清单：{loop.workspace / f'{loop.run_name}_best.json'}")
     print("训练和下游评测未执行；请根据清单中的 best.dataset_path 人工启动。")
 

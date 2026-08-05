@@ -12,7 +12,7 @@ from dataflow_evolver.core import decontamination
 from dataflow_evolver.core.schemas import TaskProfile
 from dataflow_evolver.llm.serving import LLMServingABC
 
-PROFILE = TaskProfile("t", {"instruction": "str", "answer": "str"}, [], "sft")
+PROFILE = TaskProfile("t", {"instruction": "str", "answer": "str"}, [])
 
 TEST_Q = (
     "Natalia sold clips to 48 of her friends in April and then she sold half "
@@ -148,7 +148,7 @@ def test_light_contamination_only_discounts_score(tmp_path):
 
     assert result.contamination_rate == pytest.approx(1 / 101, abs=1e-6)
     assert result.passed is True
-    assert result.tier1_score < result.llm_composite     # 但确实被扣了分
+    assert result.review_score < result.llm_composite     # 但确实被扣了分
 
 
 def test_clean_data_is_not_penalized(tmp_path):
@@ -156,4 +156,4 @@ def test_clean_data_is_not_penalized(tmp_path):
     result = _review(tmp_path, [{"instruction": "Explain why the sum of two even integers is always even", "answer": "proof"}], index)
     assert result.contamination_rate == 0.0
     assert result.passed is True
-    assert result.tier1_score == pytest.approx(result.llm_composite)
+    assert result.review_score == pytest.approx(result.llm_composite)

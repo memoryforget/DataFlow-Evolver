@@ -18,8 +18,7 @@ manual follow-up steps after the review loop finishes.
 ## Inputs and outputs
 
 - `project.input_dir` is required and must contain raw `jsonl/json/csv/parquet` data.
-- `task.target_schema` is required. This entry point does not call TaskProfiler to
-  infer it.
+- `task.target_schema` is required and is never inferred at runtime.
 - `loop.max_iterations` is the total number of candidates, including `node_0`.
 - Every run needs a fresh `project.run_name`; a non-empty existing run directory is
   rejected to prevent stale files from contaminating the result.
@@ -27,7 +26,7 @@ manual follow-up steps after the review loop finishes.
 - `<workspace>/<run_name>_best.json` points to the selected pipeline and dataset.
 
 Selection prefers candidates that pass ReviewAgent's thresholds, then chooses the
-highest `tier1_score`. Review failures do not trigger an opaque inner optimization
+highest `review_score`. Review failures do not trigger an opaque inner optimization
 loop: their structured metrics, failure signals, and issues become the next
 PipelineAgent prompt directly. Runtime crashes may receive the small number of
 code-repair retries configured by `loop.execution_retries`.

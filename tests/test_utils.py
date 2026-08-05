@@ -8,12 +8,14 @@ from dataflow_evolver.utils.parsing import extract_json, extract_code
 
 
 def test_config_loads_and_expands():
-    cfg = load_config(Path(__file__).resolve().parents[1] / "configs" / "default.yaml")
-    assert cfg.search.exploration_constant == 1.414
+    cfg = load_config(
+        Path(__file__).resolve().parents[1] / "configs" / "lightweight_review.yaml"
+    )
+    assert int(cfg.loop.max_iterations) == 4
     assert cfg.agent_sdk.setting_sources == ["project"]
     # env default expansion
-    assert cfg.llm.api.model_name  # ${DF_MODEL:gpt-4o} -> gpt-4o by default
-    assert cfg.search.get("missing", 42) == 42
+    assert cfg.llm.api.model_name == "gpt-5.5"
+    assert cfg.loop.get("missing", 42) == 42
 
 
 def test_extract_json_fenced():

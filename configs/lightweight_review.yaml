@@ -12,7 +12,7 @@ project:
   run_name: ${DF_RUN_NAME:review_only}
 
 task:
-  # Fixed contract; this lightweight entry does not call TaskProfiler to guess it.
+  # Fixed contract; the lightweight entry never infers the output schema.
   target_schema:
     instruction: str
     output: str
@@ -20,7 +20,6 @@ task:
     - 内容正确且与任务相关
     - 输出字段完整、可解析
     - 数据具有足够难度和多样性
-  downstream_task: ""
 
 llm:
   backend: api
@@ -46,9 +45,6 @@ agent_sdk:
   retry_base_delay: 10
   run_timeout_sec: 1800
   resume_on_retry: true
-  # build_loop() also forcibly disables both fields if a broader config is reused.
-  external_data: false
-  discovery: false
 
 generation:
   # 0 means: process the fixed raw corpus without imposing a synthetic sample target.

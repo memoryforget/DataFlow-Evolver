@@ -1,7 +1,7 @@
 """AgentABC：非-SDK 辅助 Agent 的统一基类。
 
-封装"拼 prompt → 调 LLM → 解析（可重试）"的样板。TaskProfiler / Review / Diagnostic
-继承它；PipelineAgent 不继承（它走 Agent SDK）。
+封装“拼 prompt → 调 LLM → 解析（可重试）”的样板。ReviewAgent 继承它；
+PipelineAgent 不继承（它走 Agent SDK）。
 """
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ class AgentABC(ABC):
         """调用 LLM 并要求 JSON；调用异常或解析失败均重试，最终失败返回 None。
 
         关键：把 `serving.generate_one` 的**任何异常**（网络/超时/鉴权等）接住并降级为
-        一次失败尝试，绝不抛到主循环——与 executor/trainer/SDK 的"失败不拖垮编排器"
+        一次失败尝试，绝不抛到主循环——与 executor/SDK 的"失败不拖垮编排器"
         原则保持一致（见 code review H1）。
         """
         last_err: Exception | None = None

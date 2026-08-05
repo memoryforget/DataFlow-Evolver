@@ -8,36 +8,29 @@ __pycache__/
 # HuggingFace 本地缓存（运行期产物，勿提交）
 hf_cache/
 
-# 本地运行日志（scripts/run_posttrainbench_local.sh 的 tee 产物）
+# 本地运行日志
 logs/
 
-# 输入语料目录：保留目录结构，语料本身按任务各不相同、体积也大，不入库
+# 用户输入语料按任务变化且通常较大，不入库
 input/*
-!input/.gitkeep
 
-# 评测数据：跑哪个 benchmark 就取哪份，属于数据不属于代码。获取方式见 data/README.md。
-# benchmarks/ 是终评集，暂仍入库（约 2.3 MB）。
+# 本地数据属于运行输入或产物，不入库
 data/*
-!data/README.md
-!data/benchmarks/
-!data/benchmarks/**
 
-# 1. 忽略 workspace 下的所有内容（但保留目录结构，允许进入）
+# 忽略 workspace 运行产物
 workspace/*
-!workspace/.gitkeep
 
-# 2. 放行 _agent_root 目录本身
+# 放行 PipelineAgent 所需的 _agent_root
 !workspace/_agent_root/
 workspace/_agent_root/*
-# 3. 放行 vendored DataFlow 源码副本（已提交进仓库，Apache-2.0，见 dataflow/VENDOR.md）
+# 放行 vendored DataFlow 源码副本（Apache-2.0，见 dataflow/VENDOR.md）
 !workspace/_agent_root/dataflow/
 !workspace/_agent_root/dataflow/**
-# 3b. 但 vendored 目录内的 Python 编译产物仍忽略（上面的 ** 放行会盖掉顶部规则，需在此重新忽略）
+# 但继续忽略 vendored 目录内的 Python 编译产物
 workspace/_agent_root/dataflow/**/__pycache__/
 workspace/_agent_root/dataflow/**/*.py[cod]
 
-# 4. 放行 _agent_root 下的 .claude 目录
+# 放行 dataflow-dev skill
 !workspace/_agent_root/.claude/
-# 5. 放行 skills 目录及其所有子内容
 !workspace/_agent_root/.claude/skills/
 !workspace/_agent_root/.claude/skills/**

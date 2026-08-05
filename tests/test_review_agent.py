@@ -1,4 +1,4 @@
-"""Tier-1 ReviewAgent 升级单测：五维复合分、硬指标惩罚、随机蓄水池采样。"""
+"""Review ReviewAgent 升级单测：五维复合分、硬指标惩罚、随机蓄水池采样。"""
 import json
 import sys
 from pathlib import Path
@@ -151,49 +151,49 @@ def test_non_string_field_values_do_not_crash(tmp_path):
     assert 0.0 <= m.dup_rate <= 1.0
 
 
-def test_apply_hard_metrics_tier1(tmp_path):
+def test_apply_hard_metrics_review_score(tmp_path):
     ds = tmp_path / "d.jsonl"
-    # 全部合法、无重复、字段齐全 → 无惩罚，tier1 == composite
+    # 全部合法、无重复、字段齐全 → 无惩罚，review_score == composite
     ds.write_text(
         '{"instruction":"q1","answer":"a1"}\n'
         '{"instruction":"q2","answer":"a2"}\n', encoding="utf-8",
     )
-    profile = TaskProfile("t", {"instruction": "str", "answer": "str"}, [], "sft")
+    profile = TaskProfile("t", {"instruction": "str", "answer": "str"}, [])
     agent = _agent()
     r = agent.parse({"correctness_score": 0.8, "relevance_score": 0.8, "difficulty_score": 0.8,
                      "diversity_score": 0.8, "schema_score": 0.8})
     agent.apply_hard_metrics(r, str(ds), profile)
     assert r.dup_rate == 0.0 and r.null_rate == 0.0 and r.parse_valid_rate == 1.0
-    assert r.tier1_score == pytest.approx(r.llm_composite)
-    assert r.tier1_score == pytest.approx(0.8)
+    assert r.review_score == pytest.approx(r.llm_composite)
+    assert r.review_score == pytest.approx(0.8)
 
 
-def test_tier1_penalized_by_dup_and_null(tmp_path):
+def test_review_score_penalized_by_dup_and_null(tmp_path):
     ds = tmp_path / "d.jsonl"
     ds.write_text(
         '{"instruction":"a","answer":"x"}\n'
         '{"instruction":"a","answer":"x"}\n'   # 重复
         '{"instruction":"b","answer":""}\n', encoding="utf-8",
     )
-    profile = TaskProfile("t", {"instruction": "str", "answer": "str"}, [], "sft")
+    profile = TaskProfile("t", {"instruction": "str", "answer": "str"}, [])
     agent = _agent()
     r = agent.parse({"correctness_score": 1.0, "relevance_score": 1.0, "difficulty_score": 1.0,
                      "diversity_score": 1.0, "schema_score": 1.0})
     agent.apply_hard_metrics(r, str(ds), profile)
     expected = r.llm_composite * (1 - r.dup_rate) * (1 - r.null_rate) * r.parse_valid_rate
-    assert r.tier1_score == pytest.approx(expected)
-    assert r.tier1_score < r.llm_composite   # 有惩罚
+    assert r.review_score == pytest.approx(expected)
+    assert r.review_score < r.llm_composite   # 有惩罚
 
 
-def test_empty_dataset_tier1_zero(tmp_path):
+def test_empty_dataset_review_score_zero(tmp_path):
     ds = tmp_path / "empty.jsonl"
     ds.write_text("", encoding="utf-8")
-    profile = TaskProfile("t", {"instruction": "str"}, [], "sft")
+    profile = TaskProfile("t", {"instruction": "str"}, [])
     agent = _agent()
     r = agent.parse({"correctness_score": 1.0, "relevance_score": 1.0, "difficulty_score": 1.0,
                      "diversity_score": 1.0, "schema_score": 1.0})
     agent.apply_hard_metrics(r, str(ds), profile)
-    assert r.tier1_score == 0.0
+    assert r.review_score == 0.0
 
 
 def test_reservoir_sampling_deterministic_and_subset(tmp_path):
@@ -228,17 +228,17 @@ def test_reservoir_not_prefix_biased(tmp_path):
     assert max(idxs) >= 100    # 至少抽到前 100 之外的样本
 
 
-def test_review_end_to_end_tier1_exposed(tmp_path):
+def test_review_end_to_end_review_score_exposed(tmp_path):
     ds = tmp_path / "d.jsonl"
     ds.write_text('{"instruction":"q","answer":"a"}\n', encoding="utf-8")
-    profile = TaskProfile("t", {"instruction": "str", "answer": "str"}, [], "sft")
+    profile = TaskProfile("t", {"instruction": "str", "answer": "str"}, [])
     resp = ('{"correctness_score":0.9,"relevance_score":0.8,"difficulty_score":0.7,'
             '"diversity_score":0.6,"schema_score":1.0,"issues":[]}')
     agent = ReviewAgent(StubServing([resp]), seed=0)
     r = agent.review(str(ds), profile)
     assert r.passed is True
-    assert 0.0 < r.tier1_score <= 1.0
-    assert r.tier1_score == pytest.approx(r.llm_composite)   # 单行、无重复、字段齐 → 无惩罚
+    assert 0.0 < r.review_score <= 1.0
+    assert r.review_score == pytest.approx(r.llm_composite)   # 单行、无重复、字段齐 → 无惩罚
 
 
 # --------------------------- F1-F7 失败信号（借鉴 ANDES） ---------------------------
@@ -281,7 +281,7 @@ def test_parse_no_signals_leaves_issues_untouched():
 
 
 def test_review_prompt_lists_all_signals():
-    profile = TaskProfile("t", {"instruction": "str"}, ["q1"], "sft")
+    profile = TaskProfile("t", {"instruction": "str"}, ["q1"])
     prompt = build_review_prompt(profile, '{"instruction":"x"}')
     for sid in FAILURE_SIGNALS:
         assert sid in prompt

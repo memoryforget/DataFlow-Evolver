@@ -1,21 +1,19 @@
-"""ReviewAgent：Phase-1 快反馈 / Tier-1 打分器。
+"""Review-only scorer: one sampled LLM review plus deterministic full-file metrics.
 
-历史职责：训练前抽样评审生成数据集的 schema 符合度与任务相关性，作为「是否放行训练」的门槛。
-
-PostTrainBench 适配后升级为 **Tier-1 复合打分器**（1 次 LLM 调用 + 纯代码硬指标）：
+The five review dimensions are combined into one comparable score:
 - 五维 LLM-judge（各 0-1）：correctness / relevance / difficulty / diversity / schema。
 - 固定权重复合分：``llm_composite = 0.35·correctness + 0.20·relevance
   + 0.15·difficulty + 0.15·diversity + 0.15·schema``。
 - 硬指标惩罚（扫全份文件，不花 LLM）：``dup_rate`` / ``null_rate`` / ``parse_valid_rate``
-  / ``contamination_rate``，``tier1 = llm_composite × (1-dup)(1-null)(1-contam) × parse_valid``。
+  / ``contamination_rate``，``review_score = llm_composite × (1-dup)(1-null)(1-contam) × parse_valid``。
   其中 ``dup_rate`` 取「整记录哈希」与「训练字段级」两种口径的较大值——只看整记录会漏掉
   同一道题配不同措辞 CoT 的情形（详见 ``_scan_hard_metrics``）；``contamination_rate``
   是与 benchmark 测试集的 n-gram 重合率，超阈值直接判 ``passed=False``（见 core/decontamination.py）。
 - 抽样从「取前 N 行」改为**随机蓄水池采样**（一趟遍历、O(k) 内存、全份等概率）。
 - ``passed`` 门槛保留（schema/relevance 阈值），用于剔除垃圾节点。
 
-合规：五维 + 硬指标只看我们**自己合成**的数据。唯一"接触" benchmark test 的是去污染扫描，
-且只做 n-gram 命中判定、不读分数、不把测试内容回流给任何 Agent——它的作用恰恰是阻止泄露。
+Optional decontamination references are used only for n-gram overlap detection and are
+never included in an Agent prompt.
 """
 from __future__ import annotations
 
@@ -33,7 +31,7 @@ from dataflow_evolver.core.decontamination import ContaminationIndex
 from dataflow_evolver.core.schemas import ReviewResult, TaskProfile
 from dataflow_evolver.llm.prompts import FAILURE_SIGNALS, build_review_prompt
 
-# Tier-1 复合分的固定权重（对应设计文档 DEITA/IFD/CoT-Self-Instruct/InsTag 的经验分工）。
+# Review 复合分的固定权重。
 DEFAULT_REVIEW_WEIGHTS: dict[str, float] = {
     "correctness": 0.35,
     "relevance": 0.20,
@@ -63,7 +61,7 @@ class ReviewAgent(AgentABC):
         self.schema_threshold = schema_threshold
         self.relevance_threshold = relevance_threshold
         # 关键字段空缺率的一票否决线。字段名整体对不上时空缺率≈1，取 0.5 能果断拦住，
-        # 又不会因个别行缺字段就毙掉整个节点（那种情况仍按比例扣 tier1）。
+        # 又不会因个别行缺字段就毙掉整个节点（那种情况仍按比例扣 review_score）。
         self.null_threshold = null_threshold
         self.sample_size = sample_size
         self.weights = _normalize_weights(weights)
@@ -115,8 +113,8 @@ class ReviewAgent(AgentABC):
             failure_signals=signals,
         )
         result.llm_composite = self.compute_composite(result)
-        # 未叠加硬指标前，tier1 先等于复合分（review() 会用硬指标覆盖）。
-        result.tier1_score = result.llm_composite
+        # 未叠加硬指标前，review_score 先等于复合分（review() 会用硬指标覆盖）。
+        result.review_score = result.llm_composite
         return result
 
     def apply_hard_metrics(
@@ -137,20 +135,18 @@ class ReviewAgent(AgentABC):
                 metrics.record_dup_rate,
             )
         if metrics.total == 0:
-            # 空文件：复合分再高也没有可训练数据，tier1 直接归零。
-            result.tier1_score = 0.0
+            # An empty output cannot be selected regardless of sampled LLM scores.
+            result.review_score = 0.0
             return result
 
-        # schema 契约：必需字段名对不上时，训练脚本会把整份数据丢光并非零退出，而那时 GPU 已经
-        # 烧完，报错还会被记成"训练脚本非零退出"，看不出根因是字段名。这里用纯代码提前拦下，
-        # 并把缺失的字段名写进 issues——评审自修正循环据此就能改对，不必等训练。
+        # Fail fast on a dataset that does not satisfy the configured output contract.
         if required and metrics.null_rate >= self.null_threshold:
             result.passed = False
             result.issues.append(
-                f"产出字段与下游训练脚本的必需字段契约不符：要求至少包含 {required}，"
+                f"产出字段与目标 schema 不符：要求至少包含 {required}，"
                 f"实测关键字段空缺率 {metrics.null_rate:.1%}（上限 {self.null_threshold:.1%}）。"
                 f"请让流水线最终产出这些字段名且非空（可额外保留中间/溯源字段），"
-                f"必需字段名不同的话训练脚本会一条都读不到。"
+                f"必需字段名不同会导致后续消费者无法读取。"
             )
 
         # 去污染：与 benchmark 测试集重合的数据不是"质量差"，是把评测答案抄进了训练集。
@@ -170,7 +166,7 @@ class ReviewAgent(AgentABC):
                     f"{'；'.join(contam.examples)}。请去掉直接取自基准测试集的数据来源。"
                 )
 
-        result.tier1_score = (
+        result.review_score = (
             result.llm_composite
             * (1.0 - metrics.dup_rate)
             * (1.0 - metrics.null_rate)
@@ -188,10 +184,8 @@ class ReviewAgent(AgentABC):
     ) -> ReviewResult:
         """随机抽样 → LLM 五维打分 → 硬指标惩罚 → ReviewResult。失败时保守返回未通过。
 
-        `evidence_path`：给定则把本次评审的证据（抽样原文 + LLM 原始响应 + 解析结果）**追加**
-        写入该 JSONL。tier1 是搜索期唯一的 MCTS reward，但过去只留下一个标量分：抽样和原始
-        响应用完即弃，事后既无法判断这个分是否可信，也无法离线复算/换权重重打。
-        `phase`：区分同一节点的多次评审（首评 / 自纠后重评 / Tier-2 放大后重评）。
+        `evidence_path` appends the exact sample, raw response, and parsed result so every
+        feedback step can be audited or rescored offline.
         """
         samples_text = _sample_jsonl(dataset_path, self.sample_size, seed=self.seed)
         if not samples_text:
@@ -209,11 +203,11 @@ class ReviewAgent(AgentABC):
             self.apply_hard_metrics(result, dataset_path, profile)
         self.logger.info(
             "Review：corr=%.2f rel=%.2f diff=%.2f div=%.2f schema=%.2f "
-            "| dup=%.2f null=%.2f parse=%.2f | composite=%.3f tier1=%.3f passed=%s | signals=%s",
+            "| dup=%.2f null=%.2f parse=%.2f | composite=%.3f review_score=%.3f passed=%s | signals=%s",
             result.correctness_score, result.relevance_score, result.difficulty_score,
             result.diversity_score, result.schema_score,
             result.dup_rate, result.null_rate, result.parse_valid_rate,
-            result.llm_composite, result.tier1_score, result.passed,
+            result.llm_composite, result.review_score, result.passed,
             ",".join(result.failure_signals) or "-",
         )
         self._dump_evidence(evidence_path, phase, dataset_path, samples_text, raw, result)
@@ -230,8 +224,7 @@ class ReviewAgent(AgentABC):
     ) -> None:
         """把一次评审的完整证据追加为一行 JSON。落盘失败绝不影响主流程。
 
-        用**追加**而非覆盖：同一节点会被评审多次（首评、自纠后重评、Tier-2 放大后重评），
-        覆盖会丢掉自纠轨迹——而"改了之后哪一维真的涨了"正是最需要留存的证据。
+        Append instead of overwrite so repeated review calls remain auditable.
         """
         if not evidence_path:
             return
@@ -294,7 +287,7 @@ def _sample_jsonl(path: str, n: int, seed: int | None = None) -> str:
     """随机蓄水池采样：一趟遍历、O(n) 内存、全份非空行等概率抽 n 条。
 
     相比旧的「取前 N 行」，蓄水池采样避免只看到数据集开头（生成类算子常按类别/难度
-    顺序产出，前 N 行有偏），使 Tier-1 打分更能代表整份数据。
+    顺序产出，前 N 行有偏），使 Review 打分更能代表整份数据。
     """
     p = Path(path)
     if not p.exists():

@@ -1,6 +1,4 @@
 import json
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -8,22 +6,6 @@ import pytest
 from dataflow_evolver.core.schemas import PipelineConfig, ReviewResult, TaskProfile
 from dataflow_evolver.engine.execution_wrapper import ExecutionResult
 from dataflow_evolver.lightweight_main import Candidate, ReviewOnlyLoop, select_best
-
-
-def test_lightweight_import_does_not_load_removed_stages():
-    code = """
-import sys
-import dataflow_evolver.lightweight_main
-forbidden = {
-    'dataflow_evolver.core.evaluation',
-    'dataflow_evolver.engine.trainer_wrapper',
-    'dataflow_evolver.agents.recipe_agent',
-    'dataflow_evolver.llm.mcp_datasets',
-    'dataflow_evolver.llm.mcp_discovery',
-}
-assert forbidden.isdisjoint(sys.modules), sorted(forbidden.intersection(sys.modules))
-"""
-    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def _config(code: str) -> PipelineConfig:
@@ -45,7 +27,7 @@ def _review(score: float, passed: bool, issue: str) -> ReviewResult:
         difficulty_score=0.7,
         diversity_score=0.6,
         llm_composite=score,
-        tier1_score=score,
+        review_score=score,
     )
 
 
@@ -95,7 +77,7 @@ def test_review_feedback_is_passed_directly_to_next_pipeline_prompt(tmp_path):
         pipeline_agent=agent,
         executor=FakeExecutor(tmp_path),
         reviewer=FakeReviewer(),
-        profile=TaskProfile("clean raw data", {"instruction": "str", "output": "str"}, [], ""),
+        profile=TaskProfile("clean raw data", {"instruction": "str", "output": "str"}, []),
         workspace=tmp_path / "reports",
         agent_root=tmp_path,
         run_name="run_a",
@@ -106,7 +88,7 @@ def test_review_feedback_is_passed_directly_to_next_pipeline_prompt(tmp_path):
     best = loop.run()
 
     assert best is not None and best.iteration == 1
-    assert [review.tier1_score for review in agent.feedback] == [0.3, 0.8]
+    assert [review.review_score for review in agent.feedback] == [0.3, 0.8]
     assert agent.feedback[0].issues == ["improve correctness"]
     manifest = json.loads((tmp_path / "reports" / "run_a_best.json").read_text(encoding="utf-8"))
     assert manifest["mode"] == "review_only"
@@ -129,7 +111,7 @@ def test_existing_run_directory_is_rejected(tmp_path):
         pipeline_agent=FakePipelineAgent(),
         executor=FakeExecutor(tmp_path),
         reviewer=FakeReviewer(),
-        profile=TaskProfile("task", {"instruction": "str"}, [], ""),
+        profile=TaskProfile("task", {"instruction": "str"}, []),
         workspace=tmp_path / "reports",
         agent_root=tmp_path,
         run_name="same_run",
@@ -146,7 +128,7 @@ def test_run_name_cannot_escape_agent_root(tmp_path, name):
             pipeline_agent=FakePipelineAgent(),
             executor=FakeExecutor(tmp_path),
             reviewer=FakeReviewer(),
-            profile=TaskProfile("task", {"instruction": "str"}, [], ""),
+            profile=TaskProfile("task", {"instruction": "str"}, []),
             workspace=tmp_path / "reports",
             agent_root=tmp_path,
             run_name=name,

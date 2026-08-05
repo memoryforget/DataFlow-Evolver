@@ -1,3 +1,3 @@
-"""DataFlow-Evolve: 多智能体、MCTS 驱动的自动数据工程框架。"""
+"""Fixed-corpus DataFlow pipeline refinement with direct review feedback."""
 
 __version__ = "0.1.0"

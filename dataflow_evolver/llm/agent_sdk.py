@@ -1,4 +1,4 @@
-"""Claude Agent SDK 封装：把异步 query() 包成供同步 MCTS 循环调用的 run_pipeline_agent()。
+"""Claude Agent SDK wrapper used by the review-only PipelineAgent loop.
 
 PipelineAgent 通过它启动一次无头 Agent 运行，让 SDK 内的 Claude 借助本地技能与文件
 工具把完整 DataFlow 流水线写到节点 workspace。详见 TODO.md §5.9。
@@ -6,13 +6,14 @@ PipelineAgent 通过它启动一次无头 Agent 运行，让 SDK 内的 Claude �
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
-from dataflow_evolver.core.provenance import record_tool_uses, truncate_arg
 from dataflow_evolver.utils.config import Config
 from dataflow_evolver.utils.logging import get_logger
 
@@ -42,7 +43,8 @@ _TRANSIENT_MARKERS = (
 )
 
 _DEFAULT_SYSTEM_PROMPT_APPEND = (
-    "You write DataFlow pipelines with CUSTOM operators for Math SFT.\n\n"
+    "You write DataFlow pipelines with custom operators that process the fixed raw corpus.\n"
+    "Do not fetch or download external datasets. Network calls are allowed only for the configured LLM serving API.\n\n"
 
     "## CRITICAL: Read API Reference FIRST\n"
     "Before writing ANY code, you MUST read:\n"
@@ -155,9 +157,38 @@ class AgentRunResult:
     exit_code: int | None = None           # ProcessError 时填充
     retryable: bool = False                # 失败是否为瞬时可重试错误（供上层区分基础设施失败类型）
     session_id: str | None = None          # 本次运行的会话 id（用于失败后 resume 续跑，见 run_pipeline_agent）
-    # 本次运行调用过的工具（含参数，长串已截断）。用于回答「这个节点搜过/取过哪些外部数据」，
-    # 由 run_pipeline_agent 落到节点目录，见 core/provenance.py。
+    # Tool trace for debugging PipelineAgent behavior.
     tool_uses: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _truncate_arg(value: Any, maxlen: int = 600) -> Any:
+    if isinstance(value, str):
+        return value if len(value) <= maxlen else value[:maxlen] + f"…({len(value)} chars)"
+    if isinstance(value, dict):
+        return {str(key): _truncate_arg(item, maxlen) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_truncate_arg(item, maxlen) for item in value[:20]]
+    return value
+
+
+def _record_tool_uses(node_dir: str | Path, uses: list[dict[str, Any]], phase: str) -> None:
+    if not uses:
+        return
+    path = Path(node_dir) / "agent_tools.jsonl"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            for use in uses:
+                handle.write(
+                    json.dumps(
+                        {"phase": phase, **use},
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    + "\n"
+                )
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning("写 Agent 工具日志失败（%s）：%s", path, exc)
 
 
 def _agent_env(agent_cfg: Config) -> dict[str, str]:
@@ -184,11 +215,7 @@ def _build_options(agent_cfg: Config, cwd: str, resume: str | None = None) -> An
 
     - tools：用 claude_code 预设放开**全部内置工具**（不再用 allowed_tools 白名单限制）。
     - system_prompt：保留 claude_code 预设，仅 **append** 我们的 DataFlow 指令（不覆盖系统提示）。
-    - mcp_servers：挂载 dataflow-operators（算子源码参考）；`external_data=true` 时再挂
-      dataset-search（HuggingFace / ModelScope 数据集预览与下载）与 data-discovery（网页/
-      GitHub/论文检索，只找线索不取数，可用 `discovery: false` 单独关掉）。这两台默认不挂——
-      它们会把"去搜真实数据"变成一个随时可走的分支，而是否允许引入外部数据是实验设定的一
-      部分，须显式打开。
+    - mcp_servers：只挂 dataflow-operators，用于读取实现参考；不提供任何外部取数工具。
     - max_turns：单次 SDK 运行的最大轮数（默认 50）。
     - resume：非空则续跑指定会话（载入其历史对话），用于瞬时失败后接着上次进度跑，
       不 fork（继续同一会话 id，把新 turn 追加进去）。
@@ -205,14 +232,6 @@ def _build_options(agent_cfg: Config, cwd: str, resume: str | None = None) -> An
     from dataflow_evolver.llm.mcp_operators import operator_mcp_server
 
     mcp_servers: dict[str, Any] = {"dataflow-operators": operator_mcp_server}
-    if agent_cfg.get("external_data", False):
-        from dataflow_evolver.llm.mcp_datasets import dataset_mcp_server
-
-        mcp_servers["dataset-search"] = dataset_mcp_server
-        if agent_cfg.get("discovery", True):
-            from dataflow_evolver.llm.mcp_discovery import discovery_mcp_server
-
-            mcp_servers["data-discovery"] = discovery_mcp_server
 
     append_text = agent_cfg.get("system_prompt_append", _DEFAULT_SYSTEM_PROMPT_APPEND)
     effort = agent_cfg.get("effort", None) or None  # 空串/None → 不传，走模型默认
@@ -270,7 +289,7 @@ async def _run(prompt: str, options: Any) -> AgentRunResult:
                         tool_uses.append({
                             "turn": turn,
                             "name": block.name,
-                            "input": truncate_arg(getattr(block, "input", None)),
+                            "input": _truncate_arg(getattr(block, "input", None)),
                         })
             elif isinstance(msg, ResultMessage):
                 result_text = msg.result or ""
@@ -341,11 +360,10 @@ def run_pipeline_agent(
     tool_log_dir: str | None = None,
     phase: str = "",
 ) -> AgentRunResult:
-    """供同步 MCTS 循环调用：在 `cwd` 下跑一次 Agent SDK（带瞬时错误退避重试 + 运行超时 + 续跑）。
+    """Run one PipelineAgent session with timeout, retry, and optional resume.
 
     `tool_log_dir` 非空时，**每次尝试**结束都把该次的工具调用追加到该目录的 agent_tools.jsonl。
-    按尝试而非按最终结果落盘：失败那次的工具调用同样是行为轨迹的一部分（尤其"下载了什么"
-    这类有副作用的调用，失败重试并不会把已落盘的文件收回去），只记最后一次会漏掉它们。
+    每次尝试的工具调用都追加落盘，便于复盘失败会话。
 
     - 瞬时错误（429/5xx/连接/超时）→ 指数退避重试 `max_retries` 次；
     - 续跑（resume_on_retry，默认开）：若上次运行已建立会话（拿到 session_id），重试时
@@ -383,7 +401,7 @@ def run_pipeline_agent(
 
         if tool_log_dir:
             label = phase if attempt == 1 else f"{phase}#retry{attempt - 1}"
-            record_tool_uses(tool_log_dir, result.tool_uses, phase=label)
+            _record_tool_uses(tool_log_dir, result.tool_uses, phase=label)
 
         # 记录会话 id（成功/失败都可能带出），供下次重试续跑
         if result.session_id:

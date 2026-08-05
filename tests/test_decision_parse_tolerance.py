@@ -2,7 +2,7 @@
 
 decision.json 由 PipelineAgent（LLM）生成，实测同一次运行里键名就会漂移：
   - node_2 写了 "operators" + "description" + "design_rationale" → 旧解析只认 "ops"，
-    整份算子列表与 rationale 被静默丢弃，日志报"0 个算子"，global memory 只剩 field_flow；
+    整份算子列表与 rationale 会被静默丢弃，下一轮也就失去关键设计上下文；
   - node_3 写了 "ops" 字符串数组 → purpose 恒为空串。
 这里锁住同义键的兼容，避免再次静默丢信息。
 """
@@ -16,29 +16,29 @@ from dataflow_evolver.agents.pipeline_agent import _parse_decision  # noqa: E402
 
 def test_canonical_schema():
     ops, flow, rationale = _parse_decision({
-        "ops": [{"name": "GenOp", "purpose": "生成题目", "params": {"n": 3}}],
-        "field_flow": "Empty → question",
-        "reason": "从零合成",
+        "ops": [{"name": "CleanOp", "purpose": "清洗文本", "params": {}}],
+        "field_flow": "raw_text → clean_text",
+        "reason": "先清洗固定语料",
     })
-    assert ops == [{"name": "GenOp", "custom": True, "purpose": "生成题目", "params": {"n": 3}}]
-    assert flow == "Empty → question"
-    assert rationale == "从零合成"
+    assert ops == [{"name": "CleanOp", "custom": True, "purpose": "清洗文本", "params": {}}]
+    assert flow == "raw_text → clean_text"
+    assert rationale == "先清洗固定语料"
 
 
 def test_node2_style_keys_are_not_dropped():
     """实测 node_2 的写法：operators / description / design_rationale。"""
     ops, flow, rationale = _parse_decision({
         "operators": [
-            {"name": "GSM8KQuestionGenerator", "description": "从零生成应用题"},
-            {"name": "AnswerFormatValidator", "description": "提取并过滤答案"},
+            {"name": "TextCleaner", "description": "清洗输入文本"},
+            {"name": "SchemaFormatter", "description": "转换目标字段"},
         ],
-        "field_flow": "Empty → question → question + answer",
-        "design_rationale": "先合成题目再校验答案格式",
+        "field_flow": "raw → cleaned → instruction + output",
+        "design_rationale": "先清洗固定输入，再转换目标 schema",
     })
-    assert [o["name"] for o in ops] == ["GSM8KQuestionGenerator", "AnswerFormatValidator"]
-    assert ops[0]["purpose"] == "从零生成应用题"        # description → purpose
-    assert rationale == "先合成题目再校验答案格式"
-    assert flow == "Empty → question → question + answer"
+    assert [o["name"] for o in ops] == ["TextCleaner", "SchemaFormatter"]
+    assert ops[0]["purpose"] == "清洗输入文本"        # description → purpose
+    assert rationale == "先清洗固定输入，再转换目标 schema"
+    assert flow == "raw → cleaned → instruction + output"
 
 
 def test_string_list_ops_still_supported():
