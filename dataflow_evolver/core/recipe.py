@@ -39,6 +39,7 @@ def validate_recipe(
     default_target_samples: int = 0,
     data_links_dir: str | Path = "",
     input_corpus_path: str | Path = "",
+    required_mode: str = "",
 ) -> RecipeValidationResult:
     errors: list[str] = []
     warnings: list[str] = []
@@ -52,10 +53,17 @@ def validate_recipe(
 
     mode = str(recipe.get("mode", "")).strip().lower()
     modes = allowed_modes(grounded=grounded, external_data=external_data)
+    required = str(required_mode or "").strip().lower()
+    if required and required not in VALID_MODES:
+        errors.append(f"框架指定的 required_mode={required!r} 无效")
+    elif required and required not in modes:
+        errors.append(f"当前输入与工具条件不允许 required_mode={required!r}；允许值：{sorted(modes)}")
     if mode not in VALID_MODES:
         errors.append("mode 必须是 external、hybrid、synthetic 之一")
     elif mode not in modes:
         errors.append(f"当前输入与工具条件不允许 mode={mode!r}；允许值：{sorted(modes)}")
+    elif required and mode != required:
+        errors.append(f"本轮实验强制 mode={required!r}，recipe 不得选择 mode={mode!r}")
     recipe["mode"] = mode
 
     target = recipe.get("target_samples", default_target_samples)

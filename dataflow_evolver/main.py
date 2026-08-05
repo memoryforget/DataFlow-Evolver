@@ -66,6 +66,20 @@ logger = get_logger("main")
 PENALTY_REWARD = 0.0
 
 
+def _as_bool(value, *, default: bool = False) -> bool:
+    """Parse YAML booleans and environment-expanded boolean strings consistently."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(f"无法解析布尔配置值：{value!r}")
+
+
 def _resolve_pipeline_llm(cfg_llm: Config) -> dict[str, dict]:
     """解析【pipeline 算子运行时】LLM 配置：`pipeline_llm` 段按用途区分多个 serving。
 
@@ -359,6 +373,9 @@ class Orchestrator:
         self.infra_backoff_sec = float(search.get("infra_backoff_sec", 30))
         # 断点续跑（默认关闭）：非空路径则每轮落盘树状态，启动时若存在则载入续跑
         self.checkpoint_path = search.get("checkpoint", "")
+        self.final_selection_enabled = _as_bool(
+            search.get("final_selection", True), default=True
+        )
 
     # ------------------------------------------------------------------
     def run(self, task_description: str) -> PipelineNode | None:
@@ -440,7 +457,9 @@ class Orchestrator:
             it += 1
 
         # 代理分口径：搜索结束后对 top-K 放大重产做真实 SFT+评测选模，并对 final_model 跑一次官方全量终评。
-        if self.strategy.needs_scale_up_selection:
+        if self.strategy.needs_scale_up_selection and getattr(
+            self, "final_selection_enabled", True
+        ):
             self._final_selection(profile)
             # 终选把 tier2_review_result 与 train_result 回写到候选节点，而循环内最后一次落盘
             # 早于此。不在这里补写，这两份数据就只剩 run.log 里的日志行——而它们正是检验

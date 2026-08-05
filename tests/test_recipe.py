@@ -2,6 +2,8 @@ import json
 import sys
 import types
 
+import pytest
+
 import dataflow_evolver.llm.agent_sdk as agent_sdk
 from dataflow_evolver.agents.pipeline_agent import PipelineAgent
 from dataflow_evolver.agents.recipe_agent import RecipeAgent
@@ -79,6 +81,38 @@ def test_mode_is_bounded_by_available_inputs_and_tools():
     result = validate_recipe(recipe, grounded=False, external_data=False)
     assert not result.valid
     assert any("不允许" in error for error in result.errors)
+
+
+def test_required_mode_is_enforced_by_validator_and_prompt():
+    recipe = _synthetic()
+    result = validate_recipe(
+        recipe, grounded=False, external_data=True, required_mode="hybrid"
+    )
+    assert not result.valid
+    assert any("强制 mode='hybrid'" in error for error in result.errors)
+
+    profile = TaskProfile("生成数学题", {"instruction": "str", "output": "str"}, [], "sft")
+    prompt = build_recipe_prompt(
+        profile,
+        InputCorpus(entry_path="empty.jsonl"),
+        "node_0",
+        8,
+        external_data=True,
+        required_mode="hybrid",
+    )
+    assert "允许的 mode：['hybrid']" in prompt
+    assert "实验强制 mode：hybrid" in prompt
+
+
+def test_recipe_agent_rejects_required_mode_without_required_capability(tmp_path):
+    with pytest.raises(ValueError, match="不兼容"):
+        RecipeAgent(
+            Config({"recipe_mode": "hybrid"}),
+            str(tmp_path),
+            InputCorpus(entry_path="empty.jsonl"),
+            4,
+            False,
+        )
 
 
 def test_grounded_recipe_cannot_discard_corpus_for_pure_synthesis():

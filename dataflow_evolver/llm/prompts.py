@@ -470,10 +470,14 @@ def build_recipe_prompt(
     external_data: bool,
     parent_recipe: dict | None = None,
     context: RecipeContext | None = None,
+    required_mode: str = "",
 ) -> str:
     modes = ["external", "hybrid"] if corpus.grounded else (
         ["external", "hybrid", "synthetic"] if external_data else ["synthetic"]
     )
+    required = str(required_mode or "").strip().lower()
+    if required:
+        modes = [required]
     if context is None:
         context = RecipeContext(parent={"recipe": parent_recipe} if parent_recipe else None)
     rendered_context = json.dumps(
@@ -493,6 +497,7 @@ def build_recipe_prompt(
 必需输出 schema：{profile.target_schema}
 输入语料：{corpus.prompt_block()}
 允许的 mode：{modes}
+实验强制 mode：{required or "未指定（由 RecipeAgent 在允许范围内选择）"}
 目标样本数：{target_samples}
 RecipeContext（只据此做数据策略决策；不要把 sibling/global pipeline 作为输入）：
 ```json

@@ -5,7 +5,12 @@ from pathlib import Path
 from typing import Any
 
 from dataflow_evolver.core.input_corpus import InputCorpus
-from dataflow_evolver.core.recipe import load_and_validate_recipe, write_canonical_recipe
+from dataflow_evolver.core.recipe import (
+    VALID_MODES,
+    allowed_modes,
+    load_and_validate_recipe,
+    write_canonical_recipe,
+)
 from dataflow_evolver.core.recipe_context import RecipeContext
 from dataflow_evolver.core.schemas import TaskProfile
 from dataflow_evolver.llm.agent_runtime import AgentRuntime, build_agent_runtime
@@ -36,6 +41,17 @@ class RecipeAgent:
         self.target_samples = target_samples or 1
         self.external_data = external_data
         self.data_links_dir = data_links_dir
+        self.required_mode = str(agent_cfg.get("recipe_mode", "") or "").strip().lower()
+        available = allowed_modes(grounded=corpus.grounded, external_data=external_data)
+        if self.required_mode and self.required_mode not in VALID_MODES:
+            raise ValueError(
+                f"agent_sdk.recipe_mode={self.required_mode!r} 无效；可选：{sorted(VALID_MODES)}"
+            )
+        if self.required_mode and self.required_mode not in available:
+            raise ValueError(
+                f"agent_sdk.recipe_mode={self.required_mode!r} 与当前输入/工具不兼容；"
+                f"允许值：{sorted(available)}"
+            )
         self.max_revisions = int(agent_cfg.get("recipe_max_revisions", 2))
         self.runtime = runtime or build_agent_runtime(agent_cfg)
         self.logger = get_logger(f"agents.{self.name}")
@@ -57,6 +73,7 @@ class RecipeAgent:
             self.target_samples,
             self.external_data,
             context=context,
+            required_mode=self.required_mode,
         )
         for attempt in range(self.max_revisions + 1):
             result = self.runtime.run(
@@ -80,6 +97,7 @@ class RecipeAgent:
                 default_target_samples=self.target_samples,
                 data_links_dir=self.data_links_dir,
                 input_corpus_path=self.corpus.entry_path if self.corpus.grounded else "",
+                required_mode=self.required_mode,
             )
             leaked = self._implementation_artifacts(node_dir)
             errors = list(checked.errors)

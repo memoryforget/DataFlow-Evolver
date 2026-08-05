@@ -2,8 +2,8 @@
 # 支持 ${ENV_VAR} 或 ${ENV_VAR:default} 形式的环境变量展开（见 utils/config.py）
 
 project:
-  workspace_dir: ./workspace
-  agent_root: ./workspace/_agent_root      # Agent SDK 的 cwd；内含 .claude/skills + dataflow 源码副本
+  workspace_dir: ${DF_WORKSPACE_DIR:./workspace}
+  agent_root: ${DF_AGENT_ROOT:./workspace/_agent_root}      # Agent SDK 的 cwd；内含 .claude/skills + dataflow 源码副本
   # 当前 PTB 官方测试配置默认不向 Agent 提供 input/ 语料：from-scratch 合成，避免把外部输入当作
   # benchmark 先验喂给搜索。若要做消融，可显式设置 PTB_INPUT_DIR/PTB_INPUT_ENTRY。
   input_dir: ${PTB_INPUT_DIR:}
@@ -39,9 +39,10 @@ agent_sdk:
   setting_sources: [project]               # 从 cwd/.claude 加载技能；技能由 SDK 自动发现，无需在此枚举
   max_turns: 50                            # 单次 SDK 运行最大轮数（MCP发现+读源码+写pipeline+自测修复，需要更多轮次）
   pipeline_filename: pipeline.py           # 约定：Agent 把流水线写到 <node_id>/pipeline.py
-  recipe_max_revisions: 2                  # recipe.json 被确定性校验器拒绝后的最大修订轮数
+  recipe_mode: ${RECIPE_MODE:}             # 可选：external|hybrid|synthetic；非空时 prompt 与确定性校验器共同强制
+  recipe_max_revisions: ${RECIPE_MAX_REVISIONS:2}  # recipe.json 被确定性校验器拒绝后的最大修订轮数
   # 瞬时错误（429/5xx/连接/超时）鲁棒性：指数退避重试 + 单次运行超时
-  max_retries: 4                           # SDK 瞬时错误的最大尝试次数（含首次）；永久错误(CLI缺失/鉴权)不重试
+  max_retries: ${AGENT_MAX_RETRIES:4}      # SDK 瞬时错误的最大尝试次数（含首次）；永久错误(CLI缺失/鉴权)不重试
   retry_base_delay: 10                     # 首次重试等待秒数，之后指数递增（10/20/40s...）
   run_timeout_sec: 1800                    # 单次 SDK 运行超时(秒)；超时按可重试错误处理，避免挂起时无限阻塞主循环
   resume_on_retry: true                    # 重试时若上次已建立会话则 resume 续跑(不重跑已完成的 turn)；上次没建起会话则全新重跑
@@ -63,7 +64,7 @@ dataset_search:
   endpoint: ${HF_ENDPOINT:https://hf-mirror.com}  # HF_ENDPOINT；默认走 HF-Mirror
   token: ""                       # HF_TOKEN；gated 数据集需要。留空=沿用环境变量/本地登录态
   cache_dir: ""                   # HF_HOME；留空=沿用环境（注意 datasets 的缓存也会占盘）
-  max_download_mb: 8192           # 单份数据集落盘上限；触顶截断（保留 split 头部）并在 meta 标明
+  max_download_mb: ${DATASET_MAX_DOWNLOAD_MB:8192}  # 单份数据集落盘上限；触顶截断（保留 split 头部）并在 meta 标明
   modelscope_endpoint: "https://modelscope.cn"         # MODELSCOPE_ENDPOINT；留空=https://modelscope.cn
   modelscope_token: ""            # MODELSCOPE_API_TOKEN；仅私有/受限数据集需要，公开数据集免登录
   # 下载默认取**整个 split**：取多少、怎么采样、按什么过滤本就是流水线该做的决策，也正是被
@@ -102,7 +103,7 @@ search:
   #   每个通过 ReviewAgent 的 node 都跑 SFT + 官方 evaluate.py --limit N，取真分反馈 MCTS。
   #   review=Tier-1：每节点只产 generation.probe_samples 条交 ReviewAgent 打复合分作 reward
   #   （搜索期不训练/不占 GPU），搜索结束再对 top-K 重产 target_samples 做真实 SFT+评测选模。
-  reward_source: train
+  reward_source: ${PTB_REWARD_SOURCE:train}
   # 以下三项仅 reward_source=review 生效：
   # time_budget_sec:  整轮（搜索+终选+终评）总墙钟预算秒；0=只按 max_iterations 停。
   #                   搜索会预留「终选+终评」时间后停止扩展。
@@ -118,12 +119,13 @@ search:
   memory_issue_maxlen: 120                 # 单条 issue 截断长度（<=0=不截断）
   recipe_memory_top_k: 5                   # RecipeContext 各类全局摘要最多保留条数
   recipe_compliance_threshold: 0.9         # 低于此合规度的下游分不得作为可信 recipe 收益证据
-  self_correction_retries: 5               # 流水线执行崩溃后的自修正重试次数
-  review_self_correction_retries: 5        # Phase-1 评审打回后的自修正重试次数（看中间 step 产物定位、修复、重审）
+  self_correction_retries: ${PTB_SELF_CORRECTION_RETRIES:5}  # 流水线执行崩溃后的自修正重试次数
+  review_self_correction_retries: ${PTB_REVIEW_RETRIES:5}    # Phase-1 评审打回后的自修正重试次数（看中间 step 产物定位、修复、重审）
   # Agent 基础设施失败熔断（区别于流水线质量失败：不惩罚节点、不消耗迭代预算）
   max_consecutive_infra_failures: 5        # 连续基础设施失败达到此数则主动终止（疑似代理/网络不可用）
   infra_backoff_sec: 30                    # 每次基础设施失败后、重试本轮前的退避秒数
-  checkpoint: "./workspace/checkpoint.json"                           # 断点续跑：非空=每轮落盘树状态到该路径，启动时存在则载入续跑；空=关闭
+  final_selection: ${PTB_FINAL_SELECTION:true}  # review 搜索结束后是否执行放大重产+SFT+终评；仅 smoke/debug 建议关闭
+  checkpoint: ${DF_CHECKPOINT_PATH:./workspace/checkpoint.json}        # 断点续跑：非空=每轮落盘树状态到该路径，启动时存在则载入续跑；空=关闭
 
 # Phase-1 快反馈：数据评审
 review:

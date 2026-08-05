@@ -50,6 +50,7 @@ class PipelineAgent:
         self.pipeline_filename = agent_cfg.get("pipeline_filename", "pipeline.py")
         self.llm_block = llm_block
         self.target_samples = target_samples
+        self.required_mode = str(agent_cfg.get("recipe_mode", "") or "").strip().lower()
         # 非空 = 外部数据搜索工具已挂载，prompt 里要告诉 Agent 怎么用、落到哪。
         self.data_links_dir = data_links_dir
         self.runtime = runtime or build_agent_runtime(agent_cfg)
@@ -242,6 +243,7 @@ class PipelineAgent:
             default_target_samples=getattr(self, "target_samples", 0) or 1,
             data_links_dir=getattr(self, "data_links_dir", ""),
             input_corpus_path=corpus.entry_path if corpus.grounded else "",
+            required_mode=getattr(self, "required_mode", ""),
         )
         return (checked.recipe, checked.recipe_hash) if checked.valid else ({}, "")
 
