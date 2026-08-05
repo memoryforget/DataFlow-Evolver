@@ -23,6 +23,7 @@ def test_stale_decision_warns_after_execution_repair(tmp_path, monkeypatch, capl
     agent.agent_root = tmp_path
     agent.pipeline_filename = "pipeline.py"
     agent.agent_cfg = {}
+    agent.runtime = None
     agent.logger = module.get_logger("test.pipeline")
 
     class Result:
@@ -30,7 +31,11 @@ def test_stale_decision_warns_after_execution_repair(tmp_path, monkeypatch, capl
         retryable = False
         error = None
 
-    monkeypatch.setattr(module, "run_pipeline_agent", lambda *args, **kwargs: Result())
+    class Runtime:
+        def run(self, *args, **kwargs):
+            return Result()
+
+    agent.runtime = Runtime()
     with caplog.at_level("WARNING"):
         assert agent._run_and_assemble("prompt", "node", warn_stale_decision=True)
     assert "未更新" in caplog.text

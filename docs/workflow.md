@@ -31,6 +31,23 @@ loop: their structured metrics, failure signals, and issues become the next
 PipelineAgent prompt directly. Runtime crashes may receive the small number of
 code-repair retries configured by `loop.execution_retries`.
 
+## PipelineAgent backends
+
+`agent.backend` selects the autonomous coding runtime:
+
+- `claude` uses `claude-agent-sdk` and remains the default.
+- `opencode` invokes `opencode run --format json` and parses its event stream.
+
+The switch only changes the agent harness. Both implementations receive the same
+pipeline prompt and must write `pipeline.py` plus `decision.json`; execution and review
+remain unchanged. Both expose the same `dataflow-operators` MCP. OpenCode starts it as a
+local stdio MCP subprocess, while Claude loads it in-process.
+
+OpenCode discovers the existing `.claude/skills/dataflow-dev/` directory through its
+Claude-compatible skill discovery, so a duplicated `.opencode/skills/` copy is unnecessary.
+The inline OpenCode permissions allow local code inspection, editing and compile tests but
+deny web search, web fetch, questions and subagents.
+
 ## Launch
 
 The configured `agent_root` must already contain the vendored `dataflow/` source and
@@ -44,7 +61,7 @@ export RAW_DATA_ENTRY=train.jsonl        # optional if the directory has one cle
 export DF_RUN_NAME=review_only_001
 export DF_MAX_ITERATIONS=4
 export DF_API_KEY=...                     # ReviewAgent and pipeline operators
-export ANTHROPIC_API_KEY=...              # PipelineAgent SDK
+export ANTHROPIC_API_KEY=...              # Claude/OpenCode Anthropic provider
 export ANTHROPIC_BASE_URL=http://123.129.219.111:3000/
 
 /vepfs-mlp2/c20250602/500050/lh/xqf/miniconda3/envs/df-agent/bin/python \
@@ -53,6 +70,21 @@ export ANTHROPIC_BASE_URL=http://123.129.219.111:3000/
   --task "Clean and transform the supplied raw data into high-quality SFT records." \
   --log-level INFO
 ```
+
+For OpenCode, add:
+
+```bash
+export AGENT_BACKEND=opencode
+export OPENCODE_BIN=/vepfs-mlp2/c20250602/500050/lh/xqf/.npm-global/bin/opencode
+export OPENCODE_MODEL=anthropic/claude-opus-4-8
+# Optional provider-specific reasoning variant:
+export OPENCODE_VARIANT=max
+```
+
+`OPENCODE_API_KEY_ENV` defaults to `ANTHROPIC_API_KEY`, and `OPENCODE_BASE_URL`
+defaults to `ANTHROPIC_BASE_URL` for the Anthropic provider. Credentials are referenced
+by environment-variable name and are not embedded in inline configuration or command-line
+arguments.
 
 After the loop, inspect `<workspace>/<run_name>_best.json` and manually pass
 `best.dataset_path` to the desired training/evaluation command. Those results are

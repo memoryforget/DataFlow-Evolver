@@ -1,7 +1,7 @@
 """Build and refine DataFlow pipelines from direct ReviewAgent feedback.
 
-它不直接产出文本，而是启动一次无头 Agent SDK 运行，让 SDK 内的 Claude 借助 MCP 算子发现、
-源码阅读、dataflow-dev 技能把完整可运行的 DataFlow 流水线写到节点 workspace 并自测通过，
+它不直接产出文本，而是通过配置的 AgentRuntime 启动无头编码 Agent，让 Agent 借助 MCP 算子发现、
+源码阅读和 dataflow-dev 技能把完整可运行的 DataFlow 流水线写到节点 workspace 并自测通过，
 然后框架读取生成的 pipeline.py + decision.json 组装 PipelineConfig。
 
 注意：PipelineAgent 不继承 AgentABC（那是非-SDK 辅助 Agent 的基类）。
@@ -19,7 +19,8 @@ from dataflow_evolver.core.schemas import (
     ReviewResult,
     TaskProfile,
 )
-from dataflow_evolver.llm.agent_sdk import AgentInfraError, run_pipeline_agent
+from dataflow_evolver.llm.agent_runtime import AgentRuntime, build_agent_runtime
+from dataflow_evolver.llm.agent_sdk import AgentInfraError
 from dataflow_evolver.llm.mcp_operators import _recommend_categories
 from dataflow_evolver.llm.prompts import (
     build_pipeline_prompt,
@@ -39,6 +40,7 @@ class PipelineAgent:
         corpus: InputCorpus,
         llm_block: str = "",
         target_samples: int = 0,
+        runtime: AgentRuntime | None = None,
     ) -> None:
         self.agent_cfg = agent_cfg
         self.agent_root = Path(agent_root).resolve()
@@ -46,6 +48,7 @@ class PipelineAgent:
         self.pipeline_filename = agent_cfg.get("pipeline_filename", "pipeline.py")
         self.llm_block = llm_block
         self.target_samples = target_samples
+        self.runtime = runtime or build_agent_runtime(agent_cfg)
         self.logger = get_logger(f"agents.{self.name}")
 
     # ---- Initial candidate ----
@@ -116,7 +119,7 @@ class PipelineAgent:
     ) -> PipelineConfig | None:
         decision_path = self.agent_root / node_dir_name / "decision.json"
         fp_before = _fingerprint(decision_path) if warn_stale_decision else None
-        result = run_pipeline_agent(
+        result = self.runtime.run(
             prompt,
             cwd=str(self.agent_root),
             agent_cfg=self.agent_cfg,
@@ -126,10 +129,10 @@ class PipelineAgent:
         if not result.success:
             # Infrastructure failure, distinct from an invalid pipeline artifact.
             self.logger.error(
-                "PipelineAgent SDK 运行失败（基础设施级，retryable=%s）：%s",
+                "PipelineAgent runtime 运行失败（基础设施级，retryable=%s）：%s",
                 result.retryable, result.error,
             )
-            raise AgentInfraError(result.error or "Agent SDK 运行失败", retryable=result.retryable)
+            raise AgentInfraError(result.error or "Agent runtime 运行失败", retryable=result.retryable)
 
         node_dir_abs = self.agent_root / node_dir_name
         pipeline_path = node_dir_abs / self.pipeline_filename

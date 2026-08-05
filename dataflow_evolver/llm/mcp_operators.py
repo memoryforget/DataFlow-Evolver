@@ -1,4 +1,4 @@
-"""In-process MCP server for DataFlow operator source-code reference (claude_agent_sdk).
+"""MCP server for DataFlow operator source-code reference.
 
 Exposes existing operators from the live OPERATOR_REGISTRY as coding-style references.
 PipelineAgent uses this OPTIONALLY to study prompt patterns, LLM call conventions, and
@@ -11,7 +11,10 @@ Exposes 4 tools for hierarchical operator browsing:
   - list_operators
   - get_operator_detail
 
-Usage:
+Claude uses the server in-process; OpenCode reaches the same instance through
+``dataflow_evolver.llm.mcp_stdio``.
+
+In-process usage:
     from dataflow_evolver.llm.mcp_operators import operator_mcp_server
 
     options = ClaudeAgentOptions(

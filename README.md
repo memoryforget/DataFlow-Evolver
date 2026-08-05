@@ -8,6 +8,9 @@ fixed raw data -> PipelineAgent -> DataFlow pipeline -> candidate JSONL
                       +------ ReviewResult ---------+
 ```
 
+`PipelineAgent` can run through either Claude Agent SDK (default) or OpenCode. Both
+backends receive the same prompt, operator MCP, skill, and artifact contract.
+
 There is no RecipeAgent, web/external-data MCP, tree search, downstream training, or
 benchmark evaluation in the automated loop. Each iteration starts from the previous pipeline
 and receives the previous ReviewAgent result directly in its prompt. After the configured
@@ -31,6 +34,14 @@ export ANTHROPIC_BASE_URL=http://123.129.219.111:3000/
 python -m dataflow_evolver.main \
   --config configs/default.yaml \
   --task "Transform the supplied raw corpus into high-quality SFT records."
+```
+
+To run PipelineAgent with OpenCode instead:
+
+```bash
+export AGENT_BACKEND=opencode
+export OPENCODE_BIN=/absolute/path/to/opencode
+export OPENCODE_MODEL=anthropic/claude-opus-4-8
 ```
 
 The run writes:

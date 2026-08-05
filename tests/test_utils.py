@@ -12,7 +12,8 @@ def test_config_loads_and_expands():
         Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
     )
     assert int(cfg.loop.max_iterations) == 4
-    assert cfg.agent_sdk.setting_sources == ["project"]
+    assert cfg.agent.backend == "claude"
+    assert cfg.agent.setting_sources == ["project"]
     # env default expansion
     assert cfg.llm.api.model_name == "gpt-5.5"
     assert cfg.loop.get("missing", 42) == 42

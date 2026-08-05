@@ -1,7 +1,7 @@
 """AgentABC：非-SDK 辅助 Agent 的统一基类。
 
 封装“拼 prompt → 调 LLM → 解析（可重试）”的样板。ReviewAgent 继承它；
-PipelineAgent 不继承（它走 Agent SDK）。
+PipelineAgent 不继承（它走自主编码 AgentRuntime）。
 """
 from __future__ import annotations
 

@@ -8,7 +8,7 @@ OpenAI-compatible API 与本地 vLLM 之间切换。
 注意：
 - 本模块与 DataFlow 运行时完全解耦。生成的 pipeline（DataFlow 运行时）用的是
   DataFlow 自带的 `dataflow.serving.APILLMServing_request`，不走这里；
-- PipelineAgent 也不走这里，它走 Claude Agent SDK（见 llm/agent_sdk.py）。
+- PipelineAgent 也不走这里，它使用配置的 AgentRuntime（Claude 或 OpenCode）。
 """
 from __future__ import annotations
 

@@ -261,7 +261,7 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
         null_threshold=float(review_cfg.get("null_threshold", 0.5)),
     )
 
-    agent_cfg = cfg.agent_sdk
+    agent_cfg = cfg.agent
 
     pipeline_llm = _resolve_pipeline_llm(cfg.llm)
     llm_block, extra_env = _pipeline_runtime_contract(pipeline_llm)

@@ -1,0 +1,345 @@
+"""OpenCode headless runtime for PipelineAgent."""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+from dataflow_evolver.llm.agent_sdk import (
+    AgentRunResult,
+    _DEFAULT_SYSTEM_PROMPT_APPEND,
+    _RESUME_NUDGE,
+    _agent_env,
+    _is_retryable,
+    _record_tool_uses,
+    _truncate_arg,
+)
+from dataflow_evolver.utils.config import Config
+from dataflow_evolver.utils.logging import get_logger
+
+logger = get_logger("llm.opencode_runtime")
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_CONFIG_SCHEMA = "https://opencode.ai/config.json"
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Config):
+        return value.to_dict()
+    return dict(value or {})
+
+
+def _opencode_cfg(agent_cfg: Config) -> dict[str, Any]:
+    return _mapping(agent_cfg.get("opencode", {}))
+
+
+def _model(agent_cfg: Config) -> str:
+    cfg = _opencode_cfg(agent_cfg)
+    raw = str(cfg.get("model", "") or agent_cfg.get("model", "") or "").strip()
+    if not raw:
+        raise ValueError("agent.opencode.model（或 agent.model）不能为空")
+    provider = str(cfg.get("provider", "anthropic") or "anthropic").strip()
+    return raw if "/" in raw else f"{provider}/{raw}"
+
+
+def _operator_mcp(cwd: str, timeout_ms: int) -> dict[str, Any]:
+    return {
+        "type": "local",
+        "command": [sys.executable, "-m", "dataflow_evolver.llm.mcp_stdio"],
+        "enabled": True,
+        "timeout": timeout_ms,
+        "environment": {"DF_AGENT_ROOT": cwd},
+    }
+
+
+def _permissions() -> dict[str, Any]:
+    """Allow implementation tools while denying network data acquisition."""
+    return {
+        "*": "deny",
+        "read": "allow",
+        "edit": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": "allow",
+        "lsp": "allow",
+        "todowrite": "allow",
+        "external_directory": "allow",
+        "question": "deny",
+        "task": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "skill": {"*": "deny", "dataflow-dev": "allow"},
+        "dataflow-operators_*": "allow",
+    }
+
+
+def build_opencode_config(
+    agent_cfg: Config,
+    *,
+    cwd: str,
+    system_prompt: str | None = None,
+) -> tuple[dict[str, Any], str, str]:
+    """Build an invocation-local config without serializing credentials."""
+    cfg = _opencode_cfg(agent_cfg)
+    model = _model(agent_cfg)
+    provider = model.split("/", 1)[0]
+    agent_name = "dataflow-pipeline"
+    timeout_ms = int(cfg.get("mcp_timeout_ms", 30000) or 30000)
+
+    key_env = str(cfg.get("api_key_env", "ANTHROPIC_API_KEY") or "").strip()
+    default_base_env = "ANTHROPIC_BASE_URL" if provider == "anthropic" else ""
+    base_url = str(
+        cfg.get("base_url", "")
+        or (os.environ.get(default_base_env, "") if default_base_env else "")
+    ).strip()
+    options: dict[str, Any] = {}
+    if key_env:
+        options["apiKey"] = f"{{env:{key_env}}}"
+    if base_url:
+        options["baseURL"] = base_url
+
+    selected_prompt = str(
+        system_prompt
+        or agent_cfg.get("system_prompt_append", _DEFAULT_SYSTEM_PROMPT_APPEND)
+    )
+    config: dict[str, Any] = {
+        "$schema": _CONFIG_SCHEMA,
+        "agent": {
+            agent_name: {
+                "description": "Write and repair DataFlow pipelines",
+                "mode": "primary",
+                "model": model,
+                "prompt": selected_prompt,
+                "steps": int(cfg.get("max_steps", agent_cfg.get("max_turns", 50)) or 50),
+                "permission": _permissions(),
+            }
+        },
+        "mcp": {"dataflow-operators": _operator_mcp(cwd, timeout_ms)},
+    }
+    if options:
+        config["provider"] = {provider: {"options": options}}
+    return config, agent_name, model
+
+
+def parse_opencode_events(stdout: str | bytes) -> AgentRunResult:
+    """Parse ``opencode run --format json`` NDJSON events."""
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", errors="replace")
+    texts: list[str] = []
+    tool_uses: list[dict[str, Any]] = []
+    errors: list[str] = []
+    session_id: str | None = None
+    turn = 0
+
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        session_id = str(event.get("sessionID") or session_id or "") or None
+        kind = event.get("type")
+        part = event.get("part") or {}
+        if kind == "step_start":
+            turn += 1
+        elif kind == "text":
+            text = str(part.get("text") or "")
+            if text:
+                texts.append(text)
+        elif kind == "tool_use":
+            state = part.get("state") or {}
+            tool_uses.append(
+                {
+                    "turn": max(turn, 1),
+                    "name": str(part.get("tool") or "unknown"),
+                    "input": _truncate_arg(state.get("input")),
+                }
+            )
+        elif kind == "error":
+            payload = event.get("error")
+            if isinstance(payload, dict):
+                data = payload.get("data")
+                message = data.get("message") if isinstance(data, dict) else None
+                errors.append(
+                    str(message or payload.get("message") or payload.get("name") or payload)
+                )
+            elif payload:
+                errors.append(str(payload))
+
+    return AgentRunResult(
+        success=not errors,
+        result_text="\n".join(texts),
+        assistant_texts=texts,
+        error="\n".join(errors) or None,
+        error_type="OpenCodeError" if errors else None,
+        session_id=session_id,
+        tool_uses=tool_uses,
+    )
+
+
+def _run_once(
+    prompt: str,
+    *,
+    cwd: str,
+    agent_cfg: Config,
+    resume: str | None,
+    timeout: float,
+) -> AgentRunResult:
+    cfg = _opencode_cfg(agent_cfg)
+    config, agent_name, model = build_opencode_config(agent_cfg, cwd=cwd)
+    binary = str(cfg.get("binary", "opencode") or "opencode")
+    command = [
+        binary,
+        "run",
+        "--format",
+        "json",
+        "--agent",
+        agent_name,
+        "--model",
+        model,
+        "--dir",
+        cwd,
+    ]
+    variant = str(cfg.get("variant", "") or "").strip()
+    if variant:
+        command.extend(["--variant", variant])
+    if resume:
+        command.extend(["--session", resume])
+
+    env = os.environ.copy()
+    env.update(_agent_env(agent_cfg))
+    pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(_PROJECT_ROOT) + (
+        os.pathsep + pythonpath if pythonpath else ""
+    )
+    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, ensure_ascii=False)
+
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=timeout if timeout > 0 else None,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        return AgentRunResult(False, error=str(exc), error_type="CLINotFoundError")
+    except subprocess.TimeoutExpired as exc:
+        result = parse_opencode_events(exc.stdout or "")
+        result.success = False
+        result.error = f"OpenCode 运行超过 {timeout:.0f}s 超时"
+        result.error_type = "Timeout"
+        return result
+    except OSError as exc:
+        return AgentRunResult(False, error=str(exc), error_type=type(exc).__name__)
+
+    result = parse_opencode_events(completed.stdout)
+    result.exit_code = completed.returncode
+    if completed.returncode != 0:
+        result.success = False
+        result.error = (
+            result.error
+            or completed.stderr.strip()
+            or completed.stdout.strip()
+            or f"OpenCode exited with code {completed.returncode}"
+        )
+        result.error_type = result.error_type or "OpenCodeProcessError"
+    return result
+
+
+def run_opencode_agent(
+    prompt: str,
+    *,
+    cwd: str,
+    agent_cfg: Config,
+    tool_log_dir: str | None = None,
+    phase: str = "",
+) -> AgentRunResult:
+    """Run OpenCode with the Claude adapter's retry and resume semantics."""
+    max_retries = max(1, int(agent_cfg.get("max_retries", 4)))
+    base_delay = float(agent_cfg.get("retry_base_delay", 10))
+    timeout = float(agent_cfg.get("run_timeout_sec", 1800))
+    resume_enabled = bool(agent_cfg.get("resume_on_retry", True))
+    resume_id: str | None = None
+    result = AgentRunResult(False, error="未发起任何 OpenCode 运行", error_type="NoAttempt")
+
+    for attempt in range(1, max_retries + 1):
+        used_resume = bool(resume_enabled and resume_id)
+        current_prompt = _RESUME_NUDGE if used_resume else prompt
+        logger.info(
+            "启动 OpenCode（尝试 %d/%d，%s）：cwd=%s",
+            attempt,
+            max_retries,
+            f"resume={resume_id}" if used_resume else "全新会话",
+            cwd,
+        )
+        result = _run_once(
+            current_prompt,
+            cwd=cwd,
+            agent_cfg=agent_cfg,
+            resume=resume_id if used_resume else None,
+            timeout=timeout,
+        )
+        if tool_log_dir:
+            label = phase if attempt == 1 else f"{phase}#retry{attempt - 1}"
+            _record_tool_uses(tool_log_dir, result.tool_uses, phase=label)
+        if result.session_id:
+            resume_id = result.session_id
+        if result.success:
+            return result
+
+        result.retryable = _is_retryable(result)
+        if used_resume and not result.retryable:
+            logger.warning("OpenCode resume 失败，下一次改用新会话：%s", result.error)
+            resume_id = None
+            result.retryable = True
+        if attempt < max_retries and result.retryable:
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.warning(
+                "OpenCode 第 %d/%d 次失败，%.0fs 后重试：%s",
+                attempt,
+                max_retries,
+                delay,
+                result.error,
+            )
+            time.sleep(delay)
+            continue
+        logger.error(
+            "OpenCode 运行失败 [%s]（retryable=%s）：%s",
+            result.error_type,
+            result.retryable,
+            result.error,
+        )
+        return result
+    return result
+
+
+class OpenCodeAgentRuntime:
+    """AgentRuntime implementation backed by ``opencode run``."""
+
+    def run(
+        self,
+        prompt: str,
+        *,
+        cwd: str,
+        agent_cfg: Config,
+        tool_log_dir: str | None,
+        phase: str,
+    ) -> AgentRunResult:
+        return run_opencode_agent(
+            prompt,
+            cwd=cwd,
+            agent_cfg=agent_cfg,
+            tool_log_dir=tool_log_dir,
+            phase=phase,
+        )

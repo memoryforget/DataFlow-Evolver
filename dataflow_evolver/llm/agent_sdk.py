@@ -1,7 +1,7 @@
-"""Claude Agent SDK wrapper used by the review-only PipelineAgent loop.
+"""Claude Agent SDK backend for PipelineAgent.
 
 PipelineAgent 通过它启动一次无头 Agent 运行，让 SDK 内的 Claude 借助本地技能与文件
-工具把完整 DataFlow 流水线写到节点 workspace。详见 TODO.md §5.9。
+工具把完整 DataFlow 流水线写到节点 workspace。
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ logger = get_logger("llm.agent_sdk")
 
 
 class AgentInfraError(RuntimeError):
-    """Agent SDK 基础设施级失败（429/5xx/连接/超时/进程崩溃等），区别于「跑完但产出不合格」。
+    """Agent runtime 基础设施级失败，区别于“运行完成但产物不合格”。
 
     `retryable`：True=瞬时错误（重试可能恢复，如 429/超时/连接）；False=永久错误
     （如 CLI 缺失、鉴权失败，重试无益）。主循环据此决定「退避重试本轮」还是「终止运行」。
@@ -147,7 +147,7 @@ _DEFAULT_SYSTEM_PROMPT_APPEND = (
 
 @dataclass
 class AgentRunResult:
-    """一次 Agent SDK 运行的结果。"""
+    """Claude 与 OpenCode runtime 共用的单次运行结果。"""
 
     success: bool
     result_text: str = ""                  # ResultMessage.result 的最终文本
@@ -192,13 +192,13 @@ def _record_tool_uses(node_dir: str | Path, uses: list[dict[str, Any]], phase: s
 
 
 def _agent_env(agent_cfg: Config) -> dict[str, str]:
-    """给 SDK 子进程叠加环境变量：把**正式执行流水线所用解释器**的目录前置到 PATH。
+    """给 Agent 子进程叠加环境变量，并统一自检与正式执行所用的 Python。
 
-    Claude 用裸 `python` 跑 `DF_COMPILE_ONLY=1 python <node_dir>/pipeline.py` 自检，
+    编码 Agent 用裸 `python` 跑 `DF_COMPILE_ONLY=1 python <node_dir>/pipeline.py` 自检，
     而 SubprocessExecutionWrapper 正式执行用的是 sys.executable。二者若解析到不同环境，
-    自检会在依赖齐备的那个环境里通过、正式执行却因缺包崩溃（假绿灯，且 Claude 无从察觉）。
+    自检会在依赖齐备的环境里通过、正式执行却因缺包崩溃（假绿灯，且 Agent 无从察觉）。
     这里把两者统一到同一解释器，使自检结论对执行真正有效。
-    SDK 的 options.env 是叠加在 os.environ 之上的，故只需给出 PATH。
+    返回值由具体 runtime 叠加到 ``os.environ``。
     """
     bin_dir = os.path.dirname(sys.executable)
     path = os.environ.get("PATH", "")
@@ -211,7 +211,7 @@ def _agent_env(agent_cfg: Config) -> dict[str, str]:
 
 
 def _build_options(agent_cfg: Config, cwd: str, resume: str | None = None) -> Any:
-    """据 agent_sdk 配置段构造 ClaudeAgentOptions。
+    """据 agent 配置段构造 ClaudeAgentOptions。
 
     - tools：用 claude_code 预设放开**全部内置工具**（不再用 allowed_tools 白名单限制）。
     - system_prompt：保留 claude_code 预设，仅 **append** 我们的 DataFlow 指令（不覆盖系统提示）。
