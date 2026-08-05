@@ -1,4 +1,4 @@
-"""Lightweight raw-data pipeline evolution driven only by ReviewAgent feedback.
+"""Raw-data pipeline evolution driven by direct ReviewAgent feedback.
 
 This entry point intentionally does not import MCTS, RecipeAgent, external-data MCP,
 downstream training, Tier-2 selection, or benchmark evaluation.  One candidate is
@@ -27,7 +27,7 @@ from dataflow_evolver.llm.serving import build_serving
 from dataflow_evolver.utils.config import Config, load_config
 from dataflow_evolver.utils.logging import get_logger, setup_logging
 
-logger = get_logger("lightweight")
+logger = get_logger("main")
 
 
 @dataclass
@@ -220,7 +220,7 @@ def select_best(candidates: list[Candidate]) -> Candidate | None:
 
 
 def build_loop(cfg: Config) -> ReviewOnlyLoop:
-    """Build the lightweight loop from its intentionally small YAML contract."""
+    """Build the pipeline-review loop from the default YAML contract."""
     project = cfg.project
     workspace = Path(project.workspace_dir)
     agent_root = Path(project.agent_root)
@@ -234,7 +234,7 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
     task_cfg = cfg.task
     target_schema = _plain_dict(task_cfg.get("target_schema"))
     if not target_schema:
-        raise ValueError("task.target_schema 不能为空；轻量入口不会自动猜测输出字段")
+        raise ValueError("task.target_schema 不能为空；入口不会自动猜测输出字段")
     profile = TaskProfile(
         task_description="",  # CLI --task is injected in main() after construction.
         target_schema={str(k): str(v) for k, v in target_schema.items()},
@@ -375,7 +375,7 @@ def _pipeline_runtime_contract(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fixed raw data + PipelineAgent + ReviewAgent loop")
-    parser.add_argument("--config", default="configs/lightweight_review.yaml")
+    parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--task", required=True)
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()

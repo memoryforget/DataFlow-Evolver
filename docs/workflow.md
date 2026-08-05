@@ -1,6 +1,6 @@
-# Lightweight Review-Only Loop
+# Pipeline Review Workflow
 
-This branch provides a deliberately small experimental baseline:
+The framework uses the following pipeline evolution workflow:
 
 ```text
 fixed raw data
@@ -11,8 +11,8 @@ fixed raw data
     -> repeat until max_iterations
 ```
 
-It does **not** run RecipeAgent, external-data/data-discovery MCP, MCTS, downstream
-training, Tier-2 selection, or benchmark evaluation. Training and evaluation are
+It does **not** run RecipeAgent, external-data/data-discovery MCP, tree search, downstream
+training, or benchmark evaluation. Training and evaluation are
 manual follow-up steps after the review loop finishes.
 
 ## Inputs and outputs
@@ -48,12 +48,12 @@ export ANTHROPIC_API_KEY=...              # PipelineAgent SDK
 export ANTHROPIC_BASE_URL=http://123.129.219.111:3000/
 
 /vepfs-mlp2/c20250602/500050/lh/xqf/miniconda3/envs/df-agent/bin/python \
-  -m dataflow_evolver.lightweight_main \
-  --config configs/lightweight_review.yaml \
+  -m dataflow_evolver.main \
+  --config configs/default.yaml \
   --task "Clean and transform the supplied raw data into high-quality SFT records." \
   --log-level INFO
 ```
 
 After the loop, inspect `<workspace>/<run_name>_best.json` and manually pass
 `best.dataset_path` to the desired training/evaluation command. Those results are
-intentionally outside this baseline's feedback loop.
+outside the automated feedback loop.

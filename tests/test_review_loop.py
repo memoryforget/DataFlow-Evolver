@@ -5,7 +5,7 @@ import pytest
 
 from dataflow_evolver.core.schemas import PipelineConfig, ReviewResult, TaskProfile
 from dataflow_evolver.engine.execution_wrapper import ExecutionResult
-from dataflow_evolver.lightweight_main import Candidate, ReviewOnlyLoop, select_best
+from dataflow_evolver.main import Candidate, ReviewOnlyLoop, select_best
 
 
 def _config(code: str) -> PipelineConfig:

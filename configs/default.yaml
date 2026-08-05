@@ -1,4 +1,4 @@
-# Lightweight baseline: fixed raw data -> PipelineAgent -> ReviewAgent feedback.
+# Default workflow: fixed raw data -> PipelineAgent -> ReviewAgent feedback.
 # No RecipeAgent, external-data MCP, MCTS, Tier-2, training, or benchmark evaluation.
 
 project:
@@ -12,7 +12,7 @@ project:
   run_name: ${DF_RUN_NAME:review_only}
 
 task:
-  # Fixed contract; the lightweight entry never infers the output schema.
+  # Fixed contract; the entry point never infers the output schema.
   target_schema:
     instruction: str
     output: str
