@@ -103,7 +103,17 @@ if __name__ == "__main__":
 #         self.op_step2 = OperatorB(llm_serving=self.llm_serving)
 #
 #     def forward(self):
+#         # compile() 会调用 forward() 记录 AutoOP，但不会执行算子；此时 step cache 不存在。
+#         # 因此这里只写成员算子调用，不要 storage.read/write、to_json、open 或手工导出最终文件。
 #         self.op_step1.run(storage=self.storage.step(), ...)
 #         self.op_step2.run(storage=self.storage.step(), ...)
 #
+# if __name__ == "__main__":
+#     pipeline = MyPipeline()
+#     pipeline.compile()
+#     if os.environ.get("DF_COMPILE_ONLY"):
+#         sys.exit(0)
+#     pipeline.forward()
+#
+# 最后一个算子的 storage.write(df) 会产生最终 step；ExecutionWrapper 自动发现最大非空 step JSONL。
 # ─────────────────────────────────────────────────────────────────────────────

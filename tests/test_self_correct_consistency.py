@@ -25,6 +25,17 @@ def test_exec_selfcorrect_prompt_asks_to_sync_decision():
     assert "增删了算子" in prompt
 
 
+def test_exec_selfcorrect_prompt_cannot_bypass_compile_or_use_wrong_recipe():
+    prompt = build_selfcorrect_prompt(
+        "node_3",
+        "FileNotFoundError: dataflow_cache_step_step9.jsonl does not exist",
+    )
+    assert "Issue #012" in prompt
+    assert "dataflow/pipeline/Pipeline.py" in prompt
+    assert "不得把 `DF_COMPILE_ONLY` 判断移到" in prompt
+    assert 'Path(__file__).with_name("recipe.json")' in prompt
+
+
 def test_review_selfcorrect_prompt_asks_to_sync_decision():
     prompt = build_review_selfcorrect_prompt("node_3", ["qa 为空"])
     assert "node_3/decision.json" in prompt

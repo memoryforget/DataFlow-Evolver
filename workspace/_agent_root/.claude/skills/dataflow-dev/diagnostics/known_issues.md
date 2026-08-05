@@ -474,6 +474,48 @@ FileStorage.write(df: pd.DataFrame) -> None
 
 ---
 
+## Issue #012 — compile 阶段误读尚未生成的 step cache
+
+**标题**：`pipeline.compile()` 中报 `dataflow_cache_step_stepN.jsonl does not exist`
+
+**症状关键词**：
+- traceback 位于 `pipeline.compile()` 调用期间
+- `FileNotFoundError: ... dataflow_cache_step_stepN.jsonl does not exist`
+- `forward()` 在算子调用后执行了 `storage.read(...)`、`to_json(...)` 或其他手工导出
+
+**根因**：
+
+`PipelineABC.compile()` 会临时把成员算子包装为 `AutoOP`，再调用 `forward()` 记录算子拓扑和参数。
+这个阶段不会执行算子的 `run()` 方法，因此任何 step cache 都还没有生成。若 `forward()` 在算子调用之外
+直接读取最终 storage 或导出文件，compile 阶段必然读到不存在的 cache。
+
+**解决方案**：
+
+PipelineABC 的 `forward()` 只描述算子调用；每个算子在自身 `run()` 中读取上一步并通过
+`storage.write(df)` 写出本步。最后一个算子的 step 即最终结果，DataFlow-Evolver 的
+ExecutionWrapper 会自动发现编号最大的非空 step JSONL。
+
+```python
+class MyPipeline(PipelineABC):
+    def forward(self):
+        self.op_step1.run(storage=self.storage.step(), ...)
+        self.op_step2.run(storage=self.storage.step(), ...)
+        # 不要在这里 storage.read(...) 或手工 to_json(...)
+
+
+if __name__ == "__main__":
+    pipeline = MyPipeline()
+    pipeline.compile()
+    if os.environ.get("DF_COMPILE_ONLY"):
+        sys.exit(0)
+    pipeline.forward()
+```
+
+**禁止的伪修复**：把 `DF_COMPILE_ONLY` 判断移动到 `pipeline.compile()` 之前。那只会跳过 compile，
+命令虽然退出码为 0，却没有验证任何流水线语义。
+
+---
+
 ## 快速匹配表
 
 | 报错关键词 | Issue 编号 |
@@ -490,6 +532,7 @@ FileStorage.write(df: pd.DataFrame) -> None
 | `'APILLMServing_request' object has no attribute 'request'` | #010 |
 | `'APILLMServing_request' object is not callable` | #010 |
 | `FileStorage.write() takes 2 positional arguments but 3 were given` | #011 |
+| `dataflow_cache_step_stepN.jsonl does not exist` 出现在 `pipeline.compile()` | #012 |
 
 ---
 

@@ -114,9 +114,13 @@ if TYPE_CHECKING:
 - [ ] `storage` 在 `__init__` 中声明，而非在 `forward()` 里临时创建
 - [ ] 每个算子调用传 `storage=self.storage.step()`（每次调用自动递增）
 - [ ] 算子成员变量命名带 `_stepN` 后缀（N 为执行顺序）
+- [ ] PipelineABC 的 `compile()` 会调用 `forward()` 记录 AutoOP，但不会执行算子；此时 step cache 尚不存在
+- [ ] PipelineABC.forward() 只包含成员算子的 `.run(storage=self.storage.step(), ...)`，不直接 read/write/to_json/open
+- [ ] 最后一个算子通过 `storage.write(df)` 产生最终 step；无需在 forward() 末尾手工导出结果
 - [ ] LLM Serving 在 `__init__` 中统一声明
 - [ ] `max_workers` 根据 API 能力设置（自建/代理 API 推荐 200+）
 - [ ] 包含 `if __name__ == "__main__":` 入口
+- [ ] main 顺序严格为 `pipeline.compile()` → `DF_COMPILE_ONLY` guard → `pipeline.forward()`，不得提前退出绕过 compile
 - [ ] API key 通过环境变量注入，不硬编码
 
 ---
@@ -153,6 +157,7 @@ if TYPE_CHECKING:
 | `'APILLMServing_request' object has no attribute 'request'` | Issue #010（LLM API 调用方式错误）|
 | `'APILLMServing_request' object is not callable` | Issue #010（LLM API 调用方式错误）|
 | `FileStorage.write() takes 2 positional arguments but 3 were given` | Issue #011（write() 只接受一个参数）|
+| `dataflow_cache_step_stepN.jsonl does not exist` 出现在 `pipeline.compile()` | Issue #012（compile 追踪阶段误读 step cache）|
 
 ---
 
@@ -182,6 +187,8 @@ if TYPE_CHECKING:
 □ storage 在 __init__ 中声明
 □ 所有算子为成员变量（compile() 依赖此机制）
 □ forward() 中每次 op.run() 传 storage.step()
+□ PipelineABC.forward() 只含算子调用，不直接读取/导出 step cache
+□ main 中 compile 在 DF_COMPILE_ONLY guard 之前，未绕过校验
 □ max_workers 值合理（不要用默认的 10）
 □ API key 不硬编码
 □ 有 if __name__ == "__main__": 入口

@@ -161,6 +161,30 @@ def test_pipeline_prompt_freezes_validated_recipe():
     assert "_operation_graph" in prompt
 
 
+def test_pipeline_prompt_explains_compile_trace_contract():
+    """Agent must not read a step cache while PipelineABC.compile() is only tracing forward()."""
+    from dataflow_evolver.core.schemas import TaskProfile
+    from dataflow_evolver.llm.prompts import build_pipeline_prompt
+
+    profile = TaskProfile("QA", {"instruction": "str", "output": "str"}, [], "sft")
+    prompt = build_pipeline_prompt(profile, SCRATCH, "node_1")
+    assert "PipelineABC.forward() 只能包含成员算子" in prompt
+    assert "ExecutionWrapper 会自动选择编号最大的非空 step JSONL" in prompt
+    assert 'Path(__file__).with_name("recipe.json")' in prompt
+    assert "不得把 `DF_COMPILE_ONLY` 判断移到 `pipeline.compile()` 之前" in prompt
+
+
+def test_pipeline_system_prompt_uses_workspace_sources_and_compile_contract():
+    from dataflow_evolver.llm.agent_sdk import _DEFAULT_SYSTEM_PROMPT_APPEND
+
+    prompt = _DEFAULT_SYSTEM_PROMPT_APPEND
+    assert "never expand `.claude` to `/root/.claude`" in prompt
+    assert "./dataflow/pipeline/Pipeline.py" in prompt
+    assert "./.claude/skills/dataflow-dev/templates/pipeline_template.py" in prompt
+    assert "operator bodies do not run and step cache files do not exist yet" in prompt
+    assert "A command that exits before compile is not a passing compile test" in prompt
+
+
 def test_review_selfcorrect_prompt_points_to_intermediate_cache():
     """评审自修正 prompt 应告知 Agent：cache 下有每个算子的中间产物，去 Read 定位坏在哪一步。"""
     from dataflow_evolver.llm.prompts import build_review_selfcorrect_prompt

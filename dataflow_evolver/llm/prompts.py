@@ -85,11 +85,16 @@ Entry file: {entry_path}
 5. 流水线里的 LLM serving 必须用 `APILLMServing_request`，并严格使用下列参数：
 {llm_block}
 6. FileStorage 的 `cache_path` 设为 `{node_dir}/cache`，使产物落在本节点目录内。\
-确保流水线最终会在 `{node_dir}/` 下产出一个 jsonl 结果文件。
+每个算子在自己的 `run()` 内用 `storage.write(df)` 写出对应 step；最后一个算子的 step 就是最终结果，\
+ExecutionWrapper 会自动选择编号最大的非空 step JSONL，不要在 PipelineABC.forward() 里再读取或导出最终文件。\
+PipelineABC.forward() 只能包含成员算子的 `.run(storage=self.storage.step(), ...)` 调用，禁止直接调用\
+`storage.read`、`storage.write`、`to_json`、`open` 等命令式 I/O。若 pipeline 需要读取当前节点的 recipe，\
+固定使用 `Path(__file__).with_name("recipe.json")`，不要使用父目录/cwd 相对路径，也不要复制 recipe。
 7. 写完代码后，**必须执行 compile 校验**：在 `if __name__` 块中按此顺序编写：\
 `pipeline.compile()` → `if os.environ.get('DF_COMPILE_ONLY'): sys.exit(0)` → `pipeline.forward()`。\
 然后运行 `DF_COMPILE_ONLY=1 python {node_dir}/pipeline.py`。如果 compile() 报 KeyError/ImportError/TypeError，\
-修复后重跑，直到 compile 通过。
+修复后重跑，直到 compile 通过。不得把 `DF_COMPILE_ONLY` 判断移到 `pipeline.compile()` 之前；\
+提前退出只是绕过校验，不算 compile 通过。
 {recommendation_block}{size_block}{external_data_block}{init_block}{parent_block}{diagnostic_block}{review_block}{sibling_block}{memory_block}
 约束：这是无头自动化运行，禁止触发任何交互式询问（AskUserQuestion）或 git/gh 子流程。\
 写自定义算子时，可用 MCP get_operator_detail 查看 reasoning 类别的已有算子源码作为编码风格参考。"""
@@ -98,12 +103,13 @@ PIPELINE_SELFCORRECT_PROMPT = """上一次生成的流水线 `{node_dir}/pipelin
 请用 `dataflow-dev` 的 `known_issues.md` 报错速查表匹配下面的错误并修复。
 
 **诊断步骤**：
-1. 先读取 `.claude/skills/dataflow-dev/diagnostics/known_issues.md` 匹配错误关键词
-2. 如果命中 Issue #010（LLM API）或 #011（FileStorage），直接应用 Issue 中的修复示例
+1. 先读取 `./.claude/skills/dataflow-dev/diagnostics/known_issues.md` 匹配错误关键词
+2. 如果命中 Issue #010（LLM API）、Issue #011（FileStorage）或 Issue #012（compile 阶段读取 step cache），直接应用 Issue 中的修复示例
 3. 如果不确定 API 签名，查阅 DataFlow 源码确认：
    - FileStorage API: `dataflow/utils/storage.py`
    - LLM Serving API: `dataflow/serving/api_llm_serving_request.py`
    - OperatorABC: `dataflow/core/operator.py`
+   - PipelineABC compile 语义: `dataflow/pipeline/Pipeline.py` 的 `compile` / `_compiled_forward`
 4. 用 Read 工具查看 `{node_dir}/operators/` 下的自定义算子源码确认问题位置
 
 **常见错误快速修复**：
@@ -113,8 +119,13 @@ PIPELINE_SELFCORRECT_PROMPT = """上一次生成的流水线 `{node_dir}/pipelin
 - `'APILLMServing_request' object has no attribute 'request'`
   → 修复：`self.llm_serving.generate_from_input(user_inputs=..., system_prompt=...)`
 
+- `pipeline.compile()` 中出现 `dataflow_cache_step_stepN.jsonl does not exist`
+  → 根因通常是 PipelineABC.forward() 直接读取了尚未执行的 step；删除该读取/导出，forward() 只保留算子调用
+
 修复后覆盖写回对应文件（pipeline.py 或 operators/ 下的算子文件），然后运行 \
-`DF_COMPILE_ONLY=1 python {node_dir}/pipeline.py` 验证 compile 通过。
+`DF_COMPILE_ONLY=1 python {node_dir}/pipeline.py` 验证 compile 通过。不得把 `DF_COMPILE_ONLY` 判断移到\
+`pipeline.compile()` 之前来绕过校验。pipeline.py 若读取 recipe，只能用\
+`Path(__file__).with_name("recipe.json")` 指向当前节点的冻结 recipe。
 
 {decision_sync_note}
 
