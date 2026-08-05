@@ -6,7 +6,7 @@ evaluation intact.
 
 ## Ownership and execution order
 
-1. **PipelineAgent / planning stage** proposes `node_N/recipe.json`. It may inspect the task,
+1. **RecipeAgent** proposes `node_N/recipe.json`. It may inspect the task,
    available corpus, parent recipe, and (when enabled) external-data options. It may not write
    pipeline code during this stage. This stage has its own system-prompt append; it does not inherit
    the implementation-stage instruction to write operators and compile a pipeline. Transient-error
@@ -14,16 +14,18 @@ evaluation intact.
 2. **Framework `RecipeValidator`** parses and validates the proposal deterministically. It checks
    mode availability, sample budget, coverage buckets, proposal strategies, verification, and
    selection policy. In synthetic mode it rejects fixed-prompt/index variants and requires at least
-   two genuine proposal strategies. Invalid recipes go back to the PipelineAgent with exact errors.
+   two genuine proposal strategies. External artifacts must be non-empty JSONL files under the
+   managed `data_links/` directory with a valid `.meta.json` sidecar. Invalid recipes go back to
+   RecipeAgent with exact errors.
 3. The framework canonicalizes the accepted recipe, writes it back to disk, computes its SHA-256,
    and freezes that contract for the node.
-4. **The same PipelineAgent / implementation stage** receives the validated recipe and generates
+4. **PipelineAgent** receives the validated recipe and generates
    `pipeline.py`, `operators/*.py`, and `decision.json`. It is the implementer, not the approver.
 5. Existing compile/execution checks validate that the pipeline runs. ReviewAgent validates the
    resulting dataset. Training/evaluation remains the final downstream evidence.
 
-In short: the Agent proposes and implements; framework code approves the plan; execution, review,
-and downstream evaluation approve the outcome.
+In short: RecipeAgent proposes, PipelineAgent implements, and framework code approves the plan;
+execution, review, and downstream evaluation approve the outcome.
 
 ## Modes
 
@@ -41,7 +43,11 @@ Every final row carries a unique `_record_id`, `_source_type`, and `_source_id`.
 cross-checks source declarations in three places: recipe validation, a pre-execution static scan of
 pipeline data references, and a post-execution full-dataset audit. Hybrid additionally enforces the
 minimum external/synthetic fractions in `mixing_policy` and requires 100% synthetic-to-seed linkage.
-Unmanaged direct downloads fail external/hybrid preflight; any external reference fails synthetic.
+PipelineAgent may read one or many recipe sources directly, or materialize a normalized derived
+file before the final pipeline runs. Because static source scanning cannot prove a transitive
+`derived file -> recipe sources` relationship, preflight does not require literal path-set equality.
+It still rejects unmanaged direct downloads and invalid managed files; any external reference fails
+synthetic. Strict transitive source lineage requires a future derived-artifact manifest contract.
 
 ## Dataset feedback added by the MVP
 

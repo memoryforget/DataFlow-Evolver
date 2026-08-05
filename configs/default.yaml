@@ -30,8 +30,9 @@ llm:
     hf_model_name_or_path: ${VLLM_MODEL:Qwen/Qwen2.5-7B-Instruct}
     tensor_parallel_size: 1
 
-# PipelineAgent 使用的 Claude Agent SDK
+# RecipeAgent / PipelineAgent 使用的 Agent SDK（当前 runtime=claude）
 agent_sdk:
+  runtime: claude                           # claude；业务层已通过 AgentRuntime 解耦，便于后续 OpenCode 消融
   model: claude-opus-4-8
   effort: max                              # Claude 努力/思考档位 low|medium|high(默认)|xhigh(仅Opus4.7)|max；
   permission_mode: bypassPermissions       # 无头自动化
@@ -115,6 +116,8 @@ search:
   memory_top_k: 5                          # 注入 PipelineAgent prompt 的历史节点条数（按有效质量分降序：有下游真分用真分，否则用 tier1）
   memory_max_issues: 3                     # 每条记忆携带的评审 issues 条数（-1=全部，0=不带）
   memory_issue_maxlen: 120                 # 单条 issue 截断长度（<=0=不截断）
+  recipe_memory_top_k: 5                   # RecipeContext 各类全局摘要最多保留条数
+  recipe_compliance_threshold: 0.9         # 低于此合规度的下游分不得作为可信 recipe 收益证据
   self_correction_retries: 5               # 流水线执行崩溃后的自修正重试次数
   review_self_correction_retries: 5        # Phase-1 评审打回后的自修正重试次数（看中间 step 产物定位、修复、重审）
   # Agent 基础设施失败熔断（区别于流水线质量失败：不惩罚节点、不消耗迭代预算）

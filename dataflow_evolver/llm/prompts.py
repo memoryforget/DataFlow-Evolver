@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 
 from dataflow_evolver.core.input_corpus import InputCorpus
+from dataflow_evolver.core.recipe_context import RecipeContext
 from dataflow_evolver.core.schemas import DiagnosticReport, ReviewResult, TaskProfile, TrainResult
 
 # ---------------------------------------------------------------------------
@@ -285,7 +286,11 @@ def build_pipeline_prompt(
     data_links_dir: str = "",
     validated_recipe: dict | None = None,
     recipe_hash: str = "",
+    implementation_issues: dict | None = None,
 ) -> str:
+    frozen_source_mode = bool(
+        validated_recipe and validated_recipe.get("mode") in {"external", "hybrid"}
+    )
     # 目标产出规模：注入后让 Agent 据此设置算子参数（合成式调 num_samples / 转换式控采样过滤）。
     # 关键：产出条数必须【从环境变量 DF_TARGET_SAMPLES 运行时读取】，不要写死——这样同一份
     # pipeline.py 可被复用两档规模：搜索期小规模探针（便宜、给 Tier-1 打分），终选期大规模重产
@@ -387,7 +392,15 @@ def build_pipeline_prompt(
         target=profile.task_description,
         entry_path=corpus.entry_path,
         input_block=corpus.prompt_block(),
-        paradigm_rule=_paradigm_rule(corpus.grounded, bool(data_links_dir)),
+        paradigm_rule=(
+            "这是【冻结来源实现】任务：数据来源已经由 RecipeAgent 选择并下载。"
+            "若有多个 external JSONL，可以在流水线中分别读取，也可以先规范化/合并为节点内的派生"
+            "中间文件再作为 first_entry；无论采用哪种实现，都必须保留每条真实行的 source_id 和 record_id，"
+            "并在 decision.json 说明派生文件来自哪些 recipe sources。external 只做清洗/映射/过滤/"
+            "有约束改写，hybrid 还需按 mixing_policy 保留真实行并生成可追溯 seed 的合成行。"
+            if frozen_source_mode
+            else _paradigm_rule(corpus.grounded, bool(data_links_dir) and not validated_recipe)
+        ),
         expected_outputs=list(profile.target_schema.keys()),
         node_dir=node_dir,
         target_schema=profile.target_schema,
@@ -395,7 +408,10 @@ def build_pipeline_prompt(
         recommendation_block=recommendation_block,
         size_block=size_block,
         external_data_block=(
-            _external_data_block(data_links_dir) if data_links_dir else NO_EXTERNAL_DATA_RULE
+            "\n【数据源职责边界】本阶段没有数据发现/下载 MCP。只能使用已验证 recipe.sources 中"
+            "的本地 location；不得临时搜索、下载、替换或追加数据源。\n"
+            if frozen_source_mode
+            else (_external_data_block(data_links_dir) if data_links_dir else NO_EXTERNAL_DATA_RULE)
         ),
         init_block=_init_block(init_reference_code, init_instruction) if is_init else "",
         parent_block=parent_block,
@@ -438,6 +454,11 @@ def build_pipeline_prompt(
             "框架会扫描最终 JSONL 的来源比例、source_id、record_id 和 hybrid seed link；仅在 decision.json "
             "里声称遵守不会通过审计。\n"
         )
+    if implementation_issues:
+        prompt += (
+            "\n【父流水线的实现级问题】这些信号用于避免重复实现缺陷，不允许据此修改冻结 recipe：\n"
+            f"```json\n{json.dumps(implementation_issues, ensure_ascii=False, sort_keys=True, indent=2)}\n```\n"
+        )
     return prompt
 
 
@@ -448,11 +469,22 @@ def build_recipe_prompt(
     target_samples: int,
     external_data: bool,
     parent_recipe: dict | None = None,
+    context: RecipeContext | None = None,
 ) -> str:
     modes = ["external", "hybrid"] if corpus.grounded else (
         ["external", "hybrid", "synthetic"] if external_data else ["synthetic"]
     )
-    parent = json.dumps(parent_recipe, ensure_ascii=False, sort_keys=True, indent=2) if parent_recipe else "无"
+    if context is None:
+        context = RecipeContext(parent={"recipe": parent_recipe} if parent_recipe else None)
+    rendered_context = json.dumps(
+        context.to_dict(), ensure_ascii=False, sort_keys=True, indent=2
+    )
+    source_tool_rule = (
+        "- external/hybrid 模式下，由你使用 dataset-search/data-discovery MCP 搜索、检查、预览并下载来源，\n"
+        "  然后把工具返回的绝对本地路径、license 和 train split 写进 sources。PipelineAgent 不具备这些 MCP。"
+        if external_data
+        else "- 本轮未开放外部数据 MCP；external/hybrid 的真实来源只能使用 Input corpus，并在 sources 中记录其入口。"
+    )
     return f"""在编写任何流水线代码之前，先规划数据生成策略。
 本阶段只能写入 `{node_dir}/recipe.json`；禁止创建或修改 `pipeline.py`、`decision.json`
 和 `operators/`。配方将由框架的确定性校验器验证，不由你自行验收。
@@ -462,8 +494,17 @@ def build_recipe_prompt(
 输入语料：{corpus.prompt_block()}
 允许的 mode：{modes}
 目标样本数：{target_samples}
-待改进的父节点 recipe（如有）：
-{parent}
+RecipeContext（只据此做数据策略决策；不要把 sibling/global pipeline 作为输入）：
+```json
+{rendered_context}
+```
+
+决策纪律：
+- parent.compliance 决定 recipe 是否被真实执行；合规不足时，不得把下游分数直接归因给 recipe。
+- parent.quality/downstream 用于调整 bucket、strategy、来源比例和 verification。
+- siblings 是紧凑 outcome，用于避免重复相同 recipe 变异；不要索要其完整 pipeline。
+- global_memory 只包含全树摘要：高质量 recipe、Pareto recipe、失败 pattern 与已观测变更收益。
+{source_tool_rule}
 
 `recipe.json` 必须是符合以下 contract 的 JSON object：
 {{
@@ -505,7 +546,8 @@ def build_recipe_repair_prompt(node_dir: str, errors: list[str]) -> str:
     return f"""框架的确定性校验器拒绝了 `{node_dir}/recipe.json`，错误如下：
 {listed}
 请逐条修复所有错误，并且只修改 `{node_dir}/recipe.json`。禁止编写 pipeline code、
-`decision.json` 或 `operators/`。不要提问，不要使用 git/gh。
+`decision.json` 或 `operators/`；如果上一轮越权创建了这些实现产物，必须先删除它们。
+不要提问，不要使用 git/gh。
 """
 
 

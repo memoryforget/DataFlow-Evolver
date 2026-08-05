@@ -55,8 +55,15 @@ def test_stale_decision_warning_only_when_not_rewritten(tmp_path, monkeypatch, c
         retryable = False
         error = None
 
+    class _Runtime:
+        def __init__(self, fn):
+            self.fn = fn
+
+        def run(self, *args, **kwargs):
+            return self.fn(*args, **kwargs)
+
     # 情形 A：Agent 只改了 pipeline.py
-    monkeypatch.setattr(pa, "run_pipeline_agent", lambda *a, **k: _Ok())
+    agent.runtime = _Runtime(lambda *a, **k: _Ok())
     with caplog.at_level("WARNING"):
         cfg = agent._run_and_assemble("p", "node_1", warn_stale_decision=True)
     assert cfg is not None
@@ -71,7 +78,7 @@ def test_stale_decision_warning_only_when_not_rewritten(tmp_path, monkeypatch, c
         )
         return _Ok()
 
-    monkeypatch.setattr(pa, "run_pipeline_agent", _rewrite)
+    agent.runtime = _Runtime(_rewrite)
     with caplog.at_level("WARNING"):
         cfg = agent._run_and_assemble("p", "node_1", warn_stale_decision=True)
     assert "未更新" not in caplog.text
@@ -97,7 +104,11 @@ def test_first_generation_does_not_warn(tmp_path, monkeypatch, caplog):
         retryable = False
         error = None
 
-    monkeypatch.setattr(pa, "run_pipeline_agent", lambda *a, **k: _Ok())
+    class _Runtime:
+        def run(self, *args, **kwargs):
+            return _Ok()
+
+    agent.runtime = _Runtime()
     with caplog.at_level("WARNING"):
         agent._run_and_assemble("p", "node_1")
     assert "未更新" not in caplog.text

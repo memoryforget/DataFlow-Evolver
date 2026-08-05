@@ -200,16 +200,14 @@ def _build_options(
     cwd: str,
     resume: str | None = None,
     system_prompt_append: str | None = None,
+    tool_profile: str = "pipeline",
 ) -> Any:
     """据 agent_sdk 配置段构造 ClaudeAgentOptions。
 
     - tools：用 claude_code 预设放开**全部内置工具**（不再用 allowed_tools 白名单限制）。
     - system_prompt：保留 claude_code 预设，仅 **append** 我们的 DataFlow 指令（不覆盖系统提示）。
-    - mcp_servers：挂载 dataflow-operators（算子源码参考）；`external_data=true` 时再挂
-      dataset-search（HuggingFace / ModelScope 数据集预览与下载）与 data-discovery（网页/
-      GitHub/论文检索，只找线索不取数，可用 `discovery: false` 单独关掉）。这两台默认不挂——
-      它们会把"去搜真实数据"变成一个随时可走的分支，而是否允许引入外部数据是实验设定的一
-      部分，须显式打开。
+    - mcp_servers 按阶段隔离：recipe 只挂外部数据发现/下载 MCP；pipeline 只挂
+      dataflow-operators。PipelineAgent 无权临时改变数据源，RecipeAgent 也不提前写实现。
     - max_turns：单次 SDK 运行的最大轮数（默认 50）。
     - resume：非空则续跑指定会话（载入其历史对话），用于瞬时失败后接着上次进度跑，
       不 fork（继续同一会话 id，把新 turn 追加进去）。
@@ -223,10 +221,12 @@ def _build_options(
     """
     from claude_agent_sdk import ClaudeAgentOptions
 
-    from dataflow_evolver.llm.mcp_operators import operator_mcp_server
+    mcp_servers: dict[str, Any] = {}
+    if tool_profile == "pipeline":
+        from dataflow_evolver.llm.mcp_operators import operator_mcp_server
 
-    mcp_servers: dict[str, Any] = {"dataflow-operators": operator_mcp_server}
-    if agent_cfg.get("external_data", False):
+        mcp_servers["dataflow-operators"] = operator_mcp_server
+    elif tool_profile == "recipe" and agent_cfg.get("external_data", False):
         from dataflow_evolver.llm.mcp_datasets import dataset_mcp_server
 
         mcp_servers["dataset-search"] = dataset_mcp_server
@@ -234,6 +234,8 @@ def _build_options(
             from dataflow_evolver.llm.mcp_discovery import discovery_mcp_server
 
             mcp_servers["data-discovery"] = discovery_mcp_server
+    elif tool_profile != "recipe":
+        raise ValueError(f"unknown agent tool profile: {tool_profile!r}")
 
     append_text = (
         system_prompt_append
@@ -371,6 +373,7 @@ def run_pipeline_agent(
     tool_log_dir: str | None = None,
     phase: str = "",
     system_prompt_append: str | None = None,
+    tool_profile: str = "pipeline",
 ) -> AgentRunResult:
     """供同步 MCTS 循环调用：在 `cwd` 下跑一次 Agent SDK（带瞬时错误退避重试 + 运行超时 + 续跑）。
 
@@ -401,6 +404,7 @@ def run_pipeline_agent(
             cwd,
             resume=resume_id if used_resume else None,
             system_prompt_append=system_prompt_append,
+            tool_profile=tool_profile,
         )
         if used_resume:
             cur_prompt = _RECIPE_RESUME_NUDGE if phase.startswith(("plan_recipe", "repair_recipe")) else _RESUME_NUDGE

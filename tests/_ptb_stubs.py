@@ -36,6 +36,25 @@ class StubPipelineAgent:
         return None
 
 
+class StubRecipeAgent:
+    def __init__(self):
+        self.plan_calls = 0
+
+    def plan(self, profile, node_dir_name, context):
+        self.plan_calls += 1
+        return ({
+            "version": 1,
+            "mode": "synthetic",
+            "target_samples": 1,
+            "candidate_multiplier": 2.0,
+            "sources": [],
+            "coverage_buckets": [{"name": "default", "skills": ["task"], "quota": 1}],
+            "proposal_strategies": {"program_first": 0.5, "constraint_composition": 0.5},
+            "verification": {"methods": ["recompute"]},
+            "selection": {"normalized_dedup": True, "coverage_aware": True},
+        }, "stub-recipe-hash")
+
+
 class StubExecutor:
     """记录每次 run 的 env_overrides；产出一个真实存在的 jsonl 文件。"""
 
@@ -125,6 +144,7 @@ def bare_orchestrator(tmp_path, reward_source="review", **overrides):
     o.agent_root = Path(tmp_path)
     o.workspace = Path(tmp_path)
     o.pipeline_agent = StubPipelineAgent()
+    o.recipe_agent = StubRecipeAgent()
     o.corpus = input_corpus.discover("", Path(tmp_path) / "empty.jsonl")
     o.init_reference_code = None
     o.init_instruction = ""

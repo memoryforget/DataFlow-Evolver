@@ -109,6 +109,7 @@ def test_event_loop_runs_and_picks_best(tmp_path, monkeypatch):
 
     monkeypatch.setattr(orch.pipeline_agent, "generate", fake_generate)
     monkeypatch.setattr(orch.pipeline_agent, "generate_initial", fake_generate)
+    monkeypatch.setattr(orch.recipe_agent, "plan", lambda *a, **k: ({}, "stub-recipe"))
 
     best = orch.run("生成问答数据集")
     assert best is not None

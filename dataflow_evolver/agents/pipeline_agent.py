@@ -14,24 +14,16 @@ from pathlib import Path
 from typing import Any
 
 from dataflow_evolver.core.input_corpus import InputCorpus
-from dataflow_evolver.core.recipe import load_and_validate_recipe, write_canonical_recipe
+from dataflow_evolver.core.recipe import load_and_validate_recipe
 from dataflow_evolver.core.schemas import (
-    DiagnosticReport,
     PipelineConfig,
-    ReviewResult,
     TaskProfile,
-    TrainResult,
 )
-from dataflow_evolver.llm.agent_sdk import (
-    RECIPE_SYSTEM_PROMPT_APPEND,
-    AgentInfraError,
-    run_pipeline_agent,
-)
+from dataflow_evolver.llm.agent_runtime import AgentRuntime, build_agent_runtime
+from dataflow_evolver.llm.agent_sdk import AgentInfraError
 from dataflow_evolver.llm.mcp_operators import _recommend_categories
 from dataflow_evolver.llm.prompts import (
     build_pipeline_prompt,
-    build_recipe_prompt,
-    build_recipe_repair_prompt,
     build_review_selfcorrect_prompt,
     build_selfcorrect_prompt,
 )
@@ -50,6 +42,7 @@ class PipelineAgent:
         llm_block: str = "",
         target_samples: int = 0,
         data_links_dir: str = "",
+        runtime: AgentRuntime | None = None,
     ) -> None:
         self.agent_cfg = agent_cfg
         self.agent_root = Path(agent_root).resolve()
@@ -57,9 +50,9 @@ class PipelineAgent:
         self.pipeline_filename = agent_cfg.get("pipeline_filename", "pipeline.py")
         self.llm_block = llm_block
         self.target_samples = target_samples
-        self.recipe_max_revisions = int(agent_cfg.get("recipe_max_revisions", 2))
         # 非空 = 外部数据搜索工具已挂载，prompt 里要告诉 Agent 怎么用、落到哪。
         self.data_links_dir = data_links_dir
+        self.runtime = runtime or build_agent_runtime(agent_cfg)
         self.logger = get_logger(f"agents.{self.name}")
 
     # ---- 生成（Init node：整棵树的起点，无父可继承）----
@@ -69,6 +62,8 @@ class PipelineAgent:
         node_dir_name: str,
         reference_code: str | None = None,
         instruction: str | None = None,
+        validated_recipe: dict[str, Any] | None = None,
+        recipe_hash: str = "",
     ) -> PipelineConfig | None:
         """构建 node_0 的初始流水线。
 
@@ -77,10 +72,7 @@ class PipelineAgent:
         """
         node_dir_abs = self.agent_root / node_dir_name
         node_dir_abs.mkdir(parents=True, exist_ok=True)
-        planned = self._plan_recipe(profile, node_dir_name)
-        if planned is None:
-            return None
-        recipe, recipe_hash = planned
+        recipe = validated_recipe or {}
         prompt = build_pipeline_prompt(
             profile=profile,
             corpus=self.corpus,
@@ -88,7 +80,7 @@ class PipelineAgent:
             llm_block=self.llm_block,
             target_samples=self.target_samples,
             recommended_categories=_recommend_categories(profile.task_description),
-            data_links_dir=self.data_links_dir,
+            data_links_dir="",
             is_init=True,
             init_reference_code=reference_code,
             init_instruction=instruction,
@@ -104,14 +96,11 @@ class PipelineAgent:
         self,
         profile: TaskProfile,
         node_dir_name: str,
-        diagnostic: DiagnosticReport | None = None,
-        memory_summary: str | None = None,
         parent_code: str | None = None,
         parent_rationale: str | None = None,
-        parent_review: ReviewResult | None = None,
-        parent_train_result: TrainResult | None = None,
-        siblings: list[str] | None = None,
-        parent_recipe: dict[str, Any] | None = None,
+        implementation_issues: dict[str, Any] | None = None,
+        validated_recipe: dict[str, Any] | None = None,
+        recipe_hash: str = "",
     ) -> PipelineConfig | None:
         """运行一次 Agent SDK 生成流水线；成功则组装 PipelineConfig，否则 None。
 
@@ -123,27 +112,20 @@ class PipelineAgent:
         """
         node_dir_abs = self.agent_root / node_dir_name
         node_dir_abs.mkdir(parents=True, exist_ok=True)
-        planned = self._plan_recipe(profile, node_dir_name, parent_recipe=parent_recipe)
-        if planned is None:
-            return None
-        recipe, recipe_hash = planned
+        recipe = validated_recipe or {}
         # 预调用推荐引擎，把结果直接注入 prompt 强制引导算子选择
         recommended = _recommend_categories(profile.task_description)
         prompt = build_pipeline_prompt(
             profile=profile,
             corpus=self.corpus,
             node_dir=node_dir_name,
-            diagnostic=diagnostic,
-            memory_summary=memory_summary,
             llm_block=self.llm_block,
             parent_code=parent_code,
             target_samples=self.target_samples,
             recommended_categories=recommended,
-            data_links_dir=self.data_links_dir,
+            data_links_dir="",
             parent_rationale=parent_rationale,
-            parent_review=parent_review,
-            parent_train_result=parent_train_result,
-            siblings=siblings,
+            implementation_issues=implementation_issues,
             validated_recipe=recipe,
             recipe_hash=recipe_hash,
         )
@@ -192,12 +174,15 @@ class PipelineAgent:
     ) -> PipelineConfig | None:
         decision_path = self.agent_root / node_dir_name / "decision.json"
         fp_before = _fingerprint(decision_path) if warn_stale_decision else None
-        result = run_pipeline_agent(
+        recipe_path = self.agent_root / node_dir_name / "recipe.json"
+        recipe_fp_before = _fingerprint(recipe_path)
+        result = self.runtime.run(
             prompt,
             cwd=str(self.agent_root),
             agent_cfg=self.agent_cfg,
             tool_log_dir=str(self.agent_root / node_dir_name),
             phase=phase,
+            tool_profile="pipeline",
         )
         if not result.success:
             # SDK/基础设施级失败（429/5xx/连接/超时/进程崩溃）——非流水线质量问题。
@@ -207,6 +192,12 @@ class PipelineAgent:
                 result.retryable, result.error,
             )
             raise AgentInfraError(result.error or "Agent SDK 运行失败", retryable=result.retryable)
+
+        if recipe_fp_before is not None and _fingerprint(recipe_path) != recipe_fp_before:
+            self.logger.error(
+                "PipelineAgent 越权修改了冻结 recipe：%s；拒绝本次实现产物。", recipe_path
+            )
+            return None
 
         node_dir_abs = self.agent_root / node_dir_name
         pipeline_path = node_dir_abs / self.pipeline_filename
@@ -240,49 +231,6 @@ class PipelineAgent:
             recipe_hash=recipe_hash,
         )
 
-    def _plan_recipe(
-        self,
-        profile: TaskProfile,
-        node_dir_name: str,
-        parent_recipe: dict[str, Any] | None = None,
-    ) -> tuple[dict[str, Any], str] | None:
-        """Ask the PipelineAgent to propose; let deterministic framework code approve."""
-        recipe_path = self.agent_root / node_dir_name / "recipe.json"
-        prompt = build_recipe_prompt(
-            profile,
-            self.corpus,
-            node_dir_name,
-            self.target_samples or 1,
-            bool(self.data_links_dir),
-            parent_recipe=parent_recipe,
-        )
-        for attempt in range(self.recipe_max_revisions + 1):
-            result = run_pipeline_agent(
-                prompt,
-                cwd=str(self.agent_root),
-                agent_cfg=self.agent_cfg,
-                tool_log_dir=str(self.agent_root / node_dir_name),
-                phase="plan_recipe" if attempt == 0 else f"repair_recipe_{attempt}",
-                system_prompt_append=RECIPE_SYSTEM_PROMPT_APPEND,
-            )
-            if not result.success:
-                raise AgentInfraError(
-                    result.error or "recipe planning SDK run failed", retryable=result.retryable
-                )
-            checked = load_and_validate_recipe(
-                recipe_path,
-                grounded=self.corpus.grounded,
-                external_data=bool(self.data_links_dir),
-                default_target_samples=self.target_samples or 1,
-            )
-            if checked.valid:
-                write_canonical_recipe(recipe_path, checked)
-                self.logger.info("recipe validated and frozen: %s", checked.recipe_hash)
-                return checked.recipe, checked.recipe_hash
-            self.logger.warning("recipe validation failed: %s", checked.errors)
-            prompt = build_recipe_repair_prompt(node_dir_name, checked.errors)
-        return None
-
     def _load_existing_recipe(self, node_dir_name: str) -> tuple[dict[str, Any], str]:
         corpus = getattr(self, "corpus", None)
         if corpus is None:
@@ -292,6 +240,8 @@ class PipelineAgent:
             grounded=corpus.grounded,
             external_data=bool(getattr(self, "data_links_dir", "")),
             default_target_samples=getattr(self, "target_samples", 0) or 1,
+            data_links_dir=getattr(self, "data_links_dir", ""),
+            input_corpus_path=corpus.entry_path if corpus.grounded else "",
         )
         return (checked.recipe, checked.recipe_hash) if checked.valid else ({}, "")
 

@@ -184,7 +184,10 @@ def test_scan_of_missing_node_dir_is_harmless(tmp_path):
 def test_mode_source_preflight_cross_checks_recipe_and_code():
     from dataflow_evolver.main import _mode_source_preflight_issues
 
-    linked = {"data_links": [{"path": "/data/a.jsonl"}], "unmanaged": False}
+    linked = {
+        "data_links": [{"path": "/data/a.jsonl", "exists": True, "meta": {}}],
+        "unmanaged": False,
+    }
     assert _mode_source_preflight_issues(
         {"mode": "synthetic", "sources": []}, corpus_grounded=False, source_record=linked
     )
@@ -197,14 +200,75 @@ def test_mode_source_preflight_cross_checks_recipe_and_code():
     )
 
     external_recipe = {
-        "mode": "hybrid", "sources": [{"kind": "external_dataset", "source_id": "a"}]
+        "mode": "hybrid",
+        "sources": [{
+            "kind": "external_dataset", "source_id": "a", "location": "/data/a.jsonl",
+        }],
     }
-    assert _mode_source_preflight_issues(
+    assert not _mode_source_preflight_issues(
         external_recipe, corpus_grounded=False, source_record={"data_links": [], "unmanaged": False}
     )
     assert not _mode_source_preflight_issues(
         external_recipe, corpus_grounded=False, source_record=linked
     )
+
+
+def test_mode_source_preflight_allows_derived_multi_source_materialization():
+    from dataflow_evolver.main import _mode_source_preflight_issues
+
+    recipe = {
+        "mode": "hybrid",
+        "sources": [
+            {"kind": "external_dataset", "source_id": "a", "location": "/data/a.jsonl"},
+            {"kind": "external_dataset", "source_id": "b", "location": "/data/b.jsonl"},
+        ],
+    }
+    good = {
+        "data_links": [
+            {"path": "/data/a.jsonl", "exists": True, "meta": {}},
+            {"path": "/data/b.jsonl", "exists": True, "meta": {}},
+        ],
+        "unmanaged": False,
+    }
+    assert not _mode_source_preflight_issues(
+        recipe, corpus_grounded=False, source_record=good
+    )
+
+    derived_or_changed = {
+        "data_links": [
+            {"path": "/data/a.jsonl", "exists": True, "meta": {}},
+            {"path": "/data/old-parent.jsonl", "exists": True, "meta": {}},
+        ],
+        "unmanaged": False,
+    }
+    assert not _mode_source_preflight_issues(
+        recipe, corpus_grounded=False, source_record=derived_or_changed
+    )
+    assert not _mode_source_preflight_issues(
+        recipe,
+        corpus_grounded=False,
+        source_record={"data_links": [], "unmanaged": False},
+    )
+
+
+def test_mode_source_preflight_rejects_missing_file_or_sidecar():
+    from dataflow_evolver.main import _mode_source_preflight_issues
+
+    recipe = {
+        "mode": "external",
+        "sources": [{
+            "kind": "external_dataset", "source_id": "a", "location": "/data/a.jsonl",
+        }],
+    }
+    record = {
+        "data_links": [{"path": "/data/a.jsonl", "exists": False, "meta_missing": True}],
+        "unmanaged": False,
+    }
+    issues = _mode_source_preflight_issues(
+        recipe, corpus_grounded=False, source_record=record
+    )
+    assert any("不存在" in issue for issue in issues)
+    assert any(".meta.json" in issue for issue in issues)
 
 
 # ---- 接线：Agent 的工具调用落到节点目录 ------------------------------------

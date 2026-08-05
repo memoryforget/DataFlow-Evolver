@@ -29,6 +29,7 @@ from pathlib import Path
 
 from dataflow_evolver.agents.diagnostic_agent import DiagnosticAgent
 from dataflow_evolver.agents.pipeline_agent import PipelineAgent
+from dataflow_evolver.agents.recipe_agent import RecipeAgent
 from dataflow_evolver.agents.review_agent import ReviewAgent
 from dataflow_evolver.agents.task_profiler import TaskProfilerAgent
 from dataflow_evolver.core import (
@@ -40,6 +41,11 @@ from dataflow_evolver.core import (
     provenance,
 )
 from dataflow_evolver.core.schemas import ReviewResult
+from dataflow_evolver.core.recipe_context import (
+    RecipeContext,
+    build_recipe_context,
+    implementation_feedback,
+)
 from dataflow_evolver.core.tree_manager import TreeManager
 from dataflow_evolver.core.tree_node import PipelineNode
 from dataflow_evolver.engine.execution_wrapper import SubprocessExecutionWrapper
@@ -48,6 +54,7 @@ from dataflow_evolver.engine.trainer_wrapper import (
     DownstreamTrainerWrapper,
 )
 from dataflow_evolver.llm.agent_sdk import AgentInfraError
+from dataflow_evolver.llm.agent_runtime import build_agent_runtime
 from dataflow_evolver.llm.serving import build_serving
 from dataflow_evolver.utils.config import Config, load_config
 from dataflow_evolver.utils.logging import get_logger, setup_logging
@@ -207,13 +214,27 @@ class Orchestrator:
             )
             mcp_discovery.configure(cfg.get("discovery"))
 
+        # Recipe/Pipeline 共用 runtime 抽象，但每次运行使用不同 tool_profile：前者只见数据 MCP，
+        # 后者只见算子 MCP。以后做 OpenCode 消融时替换 adapter，不改两类 Agent 的业务逻辑。
+        self.agent_runtime = build_agent_runtime(cfg.agent_sdk)
+        prompt_samples = self.strategy.default_prompt_samples(self)
+        self.recipe_agent = RecipeAgent(
+            agent_cfg=cfg.agent_sdk,
+            agent_root=str(self.agent_root),
+            corpus=self.corpus,
+            target_samples=prompt_samples,
+            external_data=bool(self.data_links_dir),
+            data_links_dir=self.data_links_dir,
+            runtime=self.agent_runtime,
+        )
         self.pipeline_agent = PipelineAgent(
             agent_cfg=cfg.agent_sdk,
             agent_root=str(self.agent_root),
             corpus=self.corpus,
             llm_block=llm_block,
-            target_samples=self.strategy.default_prompt_samples(self),
+            target_samples=prompt_samples,
             data_links_dir=self.data_links_dir,
+            runtime=self.agent_runtime,
         )
 
         # Init node 的启动方式（三档，对应 docs/design-decisions.md §5.2 的独立性消融）：
@@ -329,6 +350,10 @@ class Orchestrator:
         )
         self.self_correction_retries = int(search.get("self_correction_retries", 5))
         self.review_self_correction_retries = int(search.get("review_self_correction_retries", 5))
+        self.recipe_memory_top_k = int(search.get("recipe_memory_top_k", 5))
+        self.recipe_compliance_threshold = float(
+            search.get("recipe_compliance_threshold", 0.9)
+        )
         # 基础设施（Agent SDK）失败熔断：连续失败达到阈值则主动终止；每次失败退避后重试本轮
         self.max_consecutive_infra = int(search.get("max_consecutive_infra_failures", 5))
         self.infra_backoff_sec = float(search.get("infra_backoff_sec", 30))
@@ -476,11 +501,18 @@ class Orchestrator:
         root = self.tree.root
         node_dir = root.node_dir_name
         logger.info("==== Init node（%s）====", node_dir)
+        planned = self.recipe_agent.plan(profile, node_dir, RecipeContext())
+        if planned is None:
+            logger.error("Init node 生成失败：RecipeAgent 未产出可通过确定性校验的 recipe。")
+            return False
+        recipe, recipe_hash = planned
         config = self.pipeline_agent.generate_initial(
             profile=profile,
             node_dir_name=node_dir,
             reference_code=self.init_reference_code,
             instruction=self.init_instruction,
+            validated_recipe=recipe,
+            recipe_hash=recipe_hash,
         )
         if config is None:
             logger.error("Init node 生成失败：Agent 跑完但未产出有效流水线。")
@@ -568,25 +600,36 @@ class Orchestrator:
         """
         node_dir = child.node_dir_name
 
-        # 3. 生成。父节点信息分三路注入：已验证代码作变异起点、设计意图避免误改取舍、Tier-1 归因
-        #    指明该攻哪一维；再加同父兄弟的负面清单促使分散探索。
-        #    父节点与已列出的兄弟在 prompt 里都有专属块，故从全局记忆里排除：父是为了避免同一份
-        #    issues 重复注入，兄弟是因为两处角色相反（记忆"参考它" vs 兄弟清单"别跟它一样"）。
-        siblings = _sibling_summaries(parent, exclude=child)
-        memory_summary = self.tree.global_memory.render(
-            exclude_node_ids={parent.id, *(sid for sid, _ in siblings)}
+        # 3a. RecipeAgent 看搜索证据并做数据策略变异；不注入完整 sibling pipeline。
+        sibling_nodes = [
+            node for node in parent.children
+            if node is not child and node.config is not None and node.review_result is not None
+        ]
+        recipe_context = build_recipe_context(
+            parent,
+            sibling_nodes,
+            self.tree.all_nodes(),
+            top_k=getattr(self, "recipe_memory_top_k", 5),
+            compliance_threshold=getattr(self, "recipe_compliance_threshold", 0.9),
         )
+        planned = self.recipe_agent.plan(profile, node_dir, recipe_context)
+        if planned is None:
+            logger.warning("RecipeAgent 未产出可验证 recipe，惩罚该扩展并跳过。")
+            child.dead = True
+            self.tree.backpropagate(child, PENALTY_REWARD)
+            return
+        recipe, recipe_hash = planned
+
+        # 3b. PipelineAgent 只实现冻结 recipe；它只接父代码/意图和实现级问题，不再看到
+        # downstream、siblings 或 global recipe memory，也没有外部数据 MCP。
         config = self.pipeline_agent.generate(
             profile=profile,
             node_dir_name=node_dir,
-            diagnostic=parent.diagnostic_report,
-            memory_summary=memory_summary,
             parent_code=parent.config.code if parent.config else None,
             parent_rationale=parent.config.rationale if parent.config else None,
-            parent_review=parent.review_result,
-            parent_train_result=parent.train_result,
-            siblings=[line for _, line in siblings],
-            parent_recipe=parent.config.recipe if parent.config else None,
+            implementation_issues=implementation_feedback(parent.review_result),
+            validated_recipe=recipe,
+            recipe_hash=recipe_hash,
         )
         if config is None:
             logger.warning("PipelineAgent 生成失败（agent 跑完但未产出有效流水线），惩罚该扩展并跳过。")
@@ -991,23 +1034,30 @@ def _mode_source_preflight_issues(
     corpus_grounded: bool,
     source_record: dict,
 ) -> list[str]:
-    """用代码引用审计交叉验证 recipe.mode，阻止只在输出元数据里伪造来源。"""
+    """审计代码中的直接数据引用，不把合法派生中间文件误判为错源。
+
+    PipelineAgent 可能先把多个 recipe source 规范化/合并成节点内的派生文件 C，最终
+    pipeline.py 只读取 C。没有传递 lineage manifest 时，静态扫描无法证明 C -> [A, B]，
+    因此这里不强制源码字面路径集合与 recipe.sources 相等；真实来源声明仍由 RecipeValidator
+    验证，最终行级比例/source_id/seed link 由 Review 阶段全量审计。
+    """
     mode = recipe.get("mode")
     linked = source_record.get("data_links", [])
     unmanaged = bool(source_record.get("unmanaged"))
-    declared_external = any(
-        isinstance(src, dict) and src.get("kind") == "external_dataset"
-        for src in recipe.get("sources", [])
-    )
     issues: list[str] = []
     if mode == "synthetic" and (linked or unmanaged):
         issues.append("synthetic mode 的 pipeline 引用了真实/外部数据")
     if mode in {"external", "hybrid"} and unmanaged:
         issues.append("external/hybrid mode 检出绕过 External Data MCP 的 unmanaged 数据引用")
-    if mode in {"external", "hybrid"} and declared_external and not linked:
-        issues.append("recipe 声明了 external_dataset，但 pipeline 未引用任何已审计 data_links 文件")
-    if mode in {"external", "hybrid"} and not corpus_grounded and not linked:
-        issues.append("无输入语料的 external/hybrid mode 必须实际引用 External Data MCP 落盘文件")
+    if mode in {"external", "hybrid"}:
+        for entry in linked:
+            if not isinstance(entry, dict):
+                continue
+            path = str(entry.get("path", "") or "")
+            if entry.get("exists") is not True:
+                issues.append(f"pipeline 引用的 external source 不存在：{path}")
+            if entry.get("meta_missing") is True or not isinstance(entry.get("meta"), dict):
+                issues.append(f"pipeline 引用的 external source 缺少有效 .meta.json：{path}")
     return issues
 
 
