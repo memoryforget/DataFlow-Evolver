@@ -177,6 +177,9 @@ class PipelineAgent:
         fp_before = _fingerprint(decision_path) if warn_stale_decision else None
         recipe_path = self.agent_root / node_dir_name / "recipe.json"
         recipe_fp_before = _fingerprint(recipe_path)
+        recipe_hash_before = recipe_hash
+        if recipe_fp_before is not None and not recipe_hash_before:
+            _, recipe_hash_before = self._load_existing_recipe(node_dir_name)
         result = self.runtime.run(
             prompt,
             cwd=str(self.agent_root),
@@ -195,10 +198,19 @@ class PipelineAgent:
             raise AgentInfraError(result.error or "Agent SDK 运行失败", retryable=result.retryable)
 
         if recipe_fp_before is not None and _fingerprint(recipe_path) != recipe_fp_before:
-            self.logger.error(
-                "PipelineAgent 越权修改了冻结 recipe：%s；拒绝本次实现产物。", recipe_path
+            # recipe 的冻结契约是 canonical JSON 的语义哈希，不是空白/缩进等原始字节。
+            # Agent 偶尔会把同一对象 pretty-print 回原路径；只要确定性 Validator 得到的
+            # canonical hash 不变，就没有改变 recipe 语义。真正的字段/数值改动仍会被拒绝。
+            _, recipe_hash_after = self._load_existing_recipe(node_dir_name)
+            if not recipe_hash_before or recipe_hash_after != recipe_hash_before:
+                self.logger.error(
+                    "PipelineAgent 越权修改了冻结 recipe：%s；拒绝本次实现产物。", recipe_path
+                )
+                return None
+            self.logger.warning(
+                "PipelineAgent 重写了 recipe 的序列化格式，但 canonical recipe_hash 未变；"
+                "按冻结语义继续验收实现产物。"
             )
-            return None
 
         node_dir_abs = self.agent_root / node_dir_name
         pipeline_path = node_dir_abs / self.pipeline_filename

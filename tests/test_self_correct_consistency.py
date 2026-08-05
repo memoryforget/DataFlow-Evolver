@@ -18,6 +18,39 @@ from dataflow_evolver.main import _fix_round_summary
 from _ptb_stubs import make_review_result
 
 
+def _valid_synthetic_recipe() -> dict:
+    return {
+        "version": 1,
+        "mode": "synthetic",
+        "target_samples": 2,
+        "candidate_multiplier": 1.5,
+        "sources": [],
+        "coverage_buckets": [
+            {"name": "arithmetic", "skills": ["add"], "quota": 2},
+        ],
+        "proposal_strategies": {"program_first": 0.5, "constraint_composition": 0.5},
+        "verification": {"methods": ["symbolic_check"]},
+        "selection": {"normalized_dedup": True, "coverage_aware": True},
+    }
+
+
+def _recipe_guard_agent(tmp_path, runtime):
+    import dataflow_evolver.agents.pipeline_agent as pa
+    from dataflow_evolver.core.input_corpus import InputCorpus
+
+    agent = pa.PipelineAgent.__new__(pa.PipelineAgent)
+    agent.agent_root = tmp_path
+    agent.pipeline_filename = "pipeline.py"
+    agent.agent_cfg = {}
+    agent.logger = pa.get_logger("test.pipeline_agent.recipe_guard")
+    agent.runtime = runtime
+    agent.corpus = InputCorpus(entry_path=str(tmp_path / "empty.jsonl"))
+    agent.data_links_dir = ""
+    agent.target_samples = 2
+    agent.required_mode = "synthetic"
+    return agent
+
+
 # ---- 隐患三：decision.json 同步提示 ---------------------------------------
 def test_exec_selfcorrect_prompt_asks_to_sync_decision():
     prompt = build_selfcorrect_prompt("node_3", "Traceback: boom")
@@ -123,6 +156,71 @@ def test_first_generation_does_not_warn(tmp_path, monkeypatch, caplog):
     with caplog.at_level("WARNING"):
         agent._run_and_assemble("p", "node_1")
     assert "未更新" not in caplog.text
+
+
+def test_recipe_guard_accepts_format_only_rewrite(tmp_path, caplog):
+    """Frozen recipe identity is canonical JSON semantics, not indentation bytes."""
+    from dataflow_evolver.core.recipe import validate_recipe, write_canonical_recipe
+
+    node_dir = tmp_path / "node_1"
+    node_dir.mkdir()
+    (node_dir / "pipeline.py").write_text("print(1)", encoding="utf-8")
+    (node_dir / "decision.json").write_text("{}", encoding="utf-8")
+    checked = validate_recipe(
+        _valid_synthetic_recipe(), grounded=False, external_data=False,
+        default_target_samples=2, required_mode="synthetic",
+    )
+    recipe_path = node_dir / "recipe.json"
+    write_canonical_recipe(recipe_path, checked)
+
+    class _Ok:
+        success = True
+        retryable = False
+        error = None
+
+    class _Runtime:
+        def run(self, *args, **kwargs):
+            recipe_path.write_text(
+                json.dumps(checked.recipe, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            return _Ok()
+
+    agent = _recipe_guard_agent(tmp_path, _Runtime())
+    with caplog.at_level("WARNING"):
+        cfg = agent._run_and_assemble(
+            "p", "node_1", recipe=checked.recipe, recipe_hash=checked.recipe_hash,
+        )
+    assert cfg is not None
+    assert cfg.recipe_hash == checked.recipe_hash
+    assert "canonical recipe_hash 未变" in caplog.text
+
+
+def test_recipe_guard_rejects_semantic_rewrite(tmp_path, caplog):
+    node_dir = tmp_path / "node_1"
+    node_dir.mkdir()
+    (node_dir / "pipeline.py").write_text("print(1)", encoding="utf-8")
+    (node_dir / "decision.json").write_text("{}", encoding="utf-8")
+    recipe_path = node_dir / "recipe.json"
+    original = _valid_synthetic_recipe()
+    recipe_path.write_text(json.dumps(original), encoding="utf-8")
+
+    class _Ok:
+        success = True
+        retryable = False
+        error = None
+
+    class _Runtime:
+        def run(self, *args, **kwargs):
+            changed = dict(original)
+            changed["target_samples"] = 3
+            recipe_path.write_text(json.dumps(changed), encoding="utf-8")
+            return _Ok()
+
+    agent = _recipe_guard_agent(tmp_path, _Runtime())
+    cfg = agent._run_and_assemble("p", "node_1")
+    assert cfg is None
+    assert "越权修改了冻结 recipe" in caplog.text
 
 
 # ---- 隐患二：修复历史累积 --------------------------------------------------
