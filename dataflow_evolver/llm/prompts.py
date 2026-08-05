@@ -147,7 +147,7 @@ SCRATCH_WITH_EXTERNAL_PARADIGM_RULE = (
 )
 
 GROUNDED_PARADIGM_RULE = (
-    "这是【语料 grounded 合成（corpus-grounded synthesis）】任务："
+    "这是【固定语料加工/增强（corpus-grounded processing）】任务："
     "`first_entry_file_name` 必须指向上面的 Entry file——那是用户提供的真实语料。"
     "流水线要**在这份语料之上**加工：抽取、改写、增强、蒸馏、过滤、配对皆可，"
     "但产出必须能追溯到输入，不要绕开它另起一套凭空生成。"
@@ -241,7 +241,7 @@ def _init_block(reference_code: str | None, instruction: str | None) -> str:
     common = (
         "\n【初始节点（node_0）】这是整棵搜索树的起点，没有父节点可继承。后续所有变异都基于"
         "它演化，所以请设计一条**稳定、可复现、且具备竞争力**的初始流水线。不要为了追求"
-        "最小实现而刻意压低复杂度；如果外部数据、分层采样、过滤、增强或质量控制能带来明确收益，"
+        "最小实现而刻意压低复杂度；如果分层采样、过滤、增强或质量控制能带来明确收益，"
         "可以在 node_0 中直接使用，但每个步骤都要有清晰目的并保持可调、可审计。\n"
     )
     if reference_code:
@@ -552,8 +552,8 @@ def _failure_signals_block() -> str:
     return "\n".join(f"  - {sid}：{desc}" for sid, desc in FAILURE_SIGNALS.items())
 
 
-REVIEW_PROMPT = """你是数据质量评审员。下面是某条流水线生成数据集的抽样，\
-以及目标任务画像。请从五个维度评估这批**合成数据**用于微调目标模型的价值（各维 0.0-1.0）。
+REVIEW_PROMPT = """你是数据质量评审员。下面是某条流水线产出数据集的抽样，\
+以及目标任务画像。请从五个维度评估这批**候选数据**用于微调目标模型的价值（各维 0.0-1.0）。
 
 目标任务：{task_description}
 期望 schema（下游训练读取的必需字段→类型）：{target_schema}
