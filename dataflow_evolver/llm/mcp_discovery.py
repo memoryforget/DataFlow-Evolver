@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Annotated, Any
 from xml.etree import ElementTree
 
@@ -53,6 +54,15 @@ def configure(cfg: Any = None) -> None:
     cfg = cfg if cfg is not None else {}
     _serper_key = str(cfg.get("serper_api_key", "") or "").strip()
     _github_token = str(cfg.get("github_token", "") or "").strip()
+    # OpenCode 的 local MCP 是独立进程，凭据只经继承环境传递，不写入 opencode.json。
+    if _serper_key:
+        os.environ["DF_DISCOVERY_SERPER_API_KEY"] = _serper_key
+    else:
+        os.environ.pop("DF_DISCOVERY_SERPER_API_KEY", None)
+    if _github_token:
+        os.environ["DF_DISCOVERY_GITHUB_TOKEN"] = _github_token
+    else:
+        os.environ.pop("DF_DISCOVERY_GITHUB_TOKEN", None)
     logger.info(
         "发现工具：web=%s，github=%s，papers=可用（arXiv 无需凭据）",
         "可用" if _serper_key else "未配 serper_api_key",

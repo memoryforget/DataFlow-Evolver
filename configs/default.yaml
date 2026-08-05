@@ -30,9 +30,9 @@ llm:
     hf_model_name_or_path: ${VLLM_MODEL:Qwen/Qwen2.5-7B-Instruct}
     tensor_parallel_size: 1
 
-# RecipeAgent / PipelineAgent 使用的 Agent SDK（当前 runtime=claude）
+# RecipeAgent / PipelineAgent 使用的 agent runtime；两种实现共用相同业务层和产物契约。
 agent_sdk:
-  runtime: claude                           # claude；业务层已通过 AgentRuntime 解耦，便于后续 OpenCode 消融
+  runtime: ${AGENT_RUNTIME:claude}          # claude|opencode；用于相同搜索配置下做 harness 消融
   model: claude-opus-4-8
   effort: max                              # Claude 努力/思考档位 low|medium|high(默认)|xhigh(仅Opus4.7)|max；
   permission_mode: bypassPermissions       # 无头自动化
@@ -46,6 +46,17 @@ agent_sdk:
   retry_base_delay: 10                     # 首次重试等待秒数，之后指数递增（10/20/40s...）
   run_timeout_sec: 1800                    # 单次 SDK 运行超时(秒)；超时按可重试错误处理，避免挂起时无限阻塞主循环
   resume_on_retry: true                    # 重试时若上次已建立会话则 resume 续跑(不重跑已完成的 turn)；上次没建起会话则全新重跑
+  # OpenCode 仅在 runtime=opencode 时读取。OpenCode 原生发现 cwd 下现有的
+  # .claude/skills/dataflow-dev，无需复制到 .opencode/skills。
+  opencode:
+    binary: ${OPENCODE_BIN:opencode}        # 可设为绝对路径；CLI 需单独安装
+    model: ${OPENCODE_MODEL:}               # 留空沿用上面的 model，并自动补 provider/ 前缀
+    provider: ${OPENCODE_PROVIDER:anthropic}
+    api_key_env: ${OPENCODE_API_KEY_ENV:ANTHROPIC_API_KEY}  # 只记录变量名，key 不进入配置/命令行
+    base_url: ${OPENCODE_BASE_URL:}         # 留空沿用 ANTHROPIC_BASE_URL
+    variant: ${OPENCODE_VARIANT:}           # 可选 reasoning effort；留空沿用 agent_sdk.effort
+    max_steps: ${OPENCODE_MAX_STEPS:50}
+    mcp_timeout_ms: ${OPENCODE_MCP_TIMEOUT_MS:30000}  # local MCP 首次加载 DataFlow 依赖可能超过默认 5s
   # 外部数据搜索（默认关闭）：开启后挂载 dataset-search MCP，Agent 可在 HuggingFace 上
   # 搜索/预览/下载真实数据集到 project.data_links_dir，并在流水线里读取。
   # 是否允许引入外部数据属于实验设定的一部分，故须显式打开；开启时务必同时配好

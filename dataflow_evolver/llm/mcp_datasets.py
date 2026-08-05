@@ -68,6 +68,10 @@ def configure(data_links_dir: str | Path, cfg: Any = None) -> Path:
     _apply_hub_env(cfg)
     mb = float(cfg.get("max_download_mb", 0) or DEFAULT_MAX_DOWNLOAD_MB)
     _max_download_bytes = int(mb * 1024 * 1024)
+    # OpenCode 通过独立 stdio MCP 进程调用相同工具；把进程内配置同步成环境变量，
+    # 让子进程获得与 Claude in-process MCP 完全相同的落盘目录和大小上限。
+    os.environ["DF_DATA_LINKS_DIR"] = str(_data_links_dir)
+    os.environ["DF_DATASET_MAX_DOWNLOAD_MB"] = str(mb)
     _ms_endpoint = str(
         cfg.get("modelscope_endpoint", "") or DEFAULT_MS_ENDPOINT
     ).rstrip("/")

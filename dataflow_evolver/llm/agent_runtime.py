@@ -1,9 +1,8 @@
 """Stage-agent runtime boundary.
 
 Recipe and pipeline agents depend on this small protocol instead of a concrete
-agent SDK.  Claude is the production implementation today; an OpenCode adapter
-can implement the same one-shot ``run`` contract without leaking server/session
-details into the search or prompt layers.
+agent SDK.  Claude and OpenCode implement the same one-shot ``run`` contract,
+without leaking CLI/session details into the search or prompt layers.
 """
 from __future__ import annotations
 
@@ -58,8 +57,7 @@ def build_agent_runtime(agent_cfg: Config) -> AgentRuntime:
     if runtime == "claude":
         return ClaudeAgentRuntime()
     if runtime == "opencode":
-        raise ValueError(
-            "agent_sdk.runtime=opencode 尚未安装 adapter；业务层已经通过 AgentRuntime 解耦，"
-            "后续只需实现 server/session adapter，无需修改 RecipeAgent 或 PipelineAgent"
-        )
+        from dataflow_evolver.llm.opencode_runtime import OpenCodeAgentRuntime
+
+        return OpenCodeAgentRuntime()
     raise ValueError(f"未知 agent runtime: {runtime!r}")

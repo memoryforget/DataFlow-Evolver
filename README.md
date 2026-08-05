@@ -235,6 +235,11 @@ datasets are benchmark mirrors or derivatives.
 See [`docs/run-flows.md`](./docs/run-flows.md) for the step-by-step PTB official
 default run flow.
 
+RecipeAgent and PipelineAgent can also run through OpenCode without changing the
+search/review/train flow. See [`docs/opencode-runtime.md`](./docs/opencode-runtime.md)
+for installation, phase-specific MCP permissions, skills path compatibility and
+ablation configuration.
+
 ## Result Contract
 
 The PTB bridge writes `<output>/results.json`:

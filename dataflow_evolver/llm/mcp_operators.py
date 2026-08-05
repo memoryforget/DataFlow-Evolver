@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Annotated, Any
@@ -34,7 +35,9 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-AGENT_ROOT = PROJECT_ROOT / "workspace" / "_agent_root"
+AGENT_ROOT = Path(
+    os.environ.get("DF_AGENT_ROOT", "") or PROJECT_ROOT / "workspace" / "_agent_root"
+).expanduser().resolve()
 
 if str(AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(AGENT_ROOT))

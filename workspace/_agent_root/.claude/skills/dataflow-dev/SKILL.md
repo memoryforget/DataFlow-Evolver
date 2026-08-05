@@ -13,9 +13,11 @@ version: 1.1.0
 
 ## 激活时必须执行的步骤
 
-1. **加载知识库**：读取 `${SKILL_DIR}/context/knowledge_base.md`（架构 + API 参考）
-2. **加载开发规范**：读取 `${SKILL_DIR}/context/dev_notes.md`（规范 + 最佳实践）
-3. **加载已知问题**：读取 `${SKILL_DIR}/diagnostics/known_issues.md`（诊断快速匹配表）
+以下路径均相对于本 skill 的基目录；Claude Code 与 OpenCode 都会在加载 skill 时提供该基目录：
+
+1. **加载知识库**：读取 `context/knowledge_base.md`（架构 + API 参考）
+2. **加载开发规范**：读取 `context/dev_notes.md`（规范 + 最佳实践）
+3. **加载已知问题**：读取 `diagnostics/known_issues.md`（诊断快速匹配表）
 4. **探测仓库状态**（在 DataFlow 仓库根目录下执行）：
    ```bash
    git branch --show-current          # 当前分支
