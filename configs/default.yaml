@@ -38,6 +38,9 @@ llm:
 # same pipeline.py + decision.json artifacts.
 agent:
   backend: ${AGENT_BACKEND:claude}  # claude | opencode
+  # Empty means <agent_root parent>/agent_sessions/<run>/<node>/<backend>. If configured,
+  # the run/node relative path is retained below this root for isolated accounting.
+  session_root: ${DF_AGENT_SESSION_ROOT:}
   model: ${DF_AGENT_MODEL:claude-opus-4-8}
   # Claude-specific reasoning effort. OpenCode uses opencode.variant below.
   effort: ${DF_AGENT_EFFORT:max}

@@ -5,11 +5,21 @@ import subprocess
 import sys
 import re
 import time
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from dataflow_evolver.core.schemas import PipelineConfig
+from dataflow_evolver.telemetry.pipeline_usage import (
+    ATTEMPT_ENV,
+    BOOTSTRAP_DIR,
+    EXECUTION_ID_ENV,
+    NODE_ENV,
+    USAGE_PATH_ENV,
+    write_combined_node_usage,
+    write_pipeline_usage_summary,
+)
 from dataflow_evolver.utils.logging import get_logger
 
 logger = get_logger("engine.execution")
@@ -60,12 +70,19 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
         timeout_sec: int = 1800,
         python_exe: str | None = None,
         extra_env: dict[str, str] | None = None,
+        token_usage_root: str | None = None,
     ) -> None:
         self.agent_root = Path(agent_root).resolve()
         self.pipeline_filename = pipeline_filename
         self.timeout_sec = timeout_sec
         self.python_exe = python_exe or sys.executable
         self.extra_env = extra_env or {}
+        self.token_usage_root = (
+            Path(token_usage_root).expanduser().resolve()
+            if token_usage_root
+            else self.agent_root.parent / "agent_sessions"
+        )
+        self._execution_attempts: dict[str, int] = {}
 
     def run(
         self,
@@ -86,10 +103,41 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
         # sys.path，白烧一次 Agent 往返与一次自纠额度。
         prev_pp = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = os.pathsep.join(
-            [str(self.agent_root), *(p for p in prev_pp.split(os.pathsep) if p)]
+            [
+                str(self.agent_root),
+                str(BOOTSTRAP_DIR),
+                *(p for p in prev_pp.split(os.pathsep) if p),
+            ]
         )
         if env_overrides:
             env.update(env_overrides)
+        attempt = self._execution_attempts.get(node_dir, 0) + 1
+        self._execution_attempts[node_dir] = attempt
+        usage_dir = (self.token_usage_root / Path(node_dir) / "pipeline").resolve()
+        events_path = usage_dir / "pipeline_llm_calls.jsonl"
+        summary_path = node_path / "pipeline_llm_token_usage.json"
+        combined_path = node_path / "token_usage.json"
+        env.update(
+            {
+                USAGE_PATH_ENV: str(events_path),
+                EXECUTION_ID_ENV: uuid.uuid4().hex,
+                NODE_ENV: node_dir,
+                ATTEMPT_ENV: str(attempt),
+            }
+        )
+        artifacts = {
+            "pipeline_llm_calls": str(events_path),
+            "pipeline_llm_token_usage": str(summary_path),
+            "token_usage": str(combined_path),
+        }
+
+        def finalize_usage() -> None:
+            try:
+                write_pipeline_usage_summary(events_path, summary_path)
+                write_combined_node_usage(node_path)
+            except (OSError, ValueError) as exc:
+                logger.warning("记录 pipeline LLM token 失败（不影响主流程）：%s", exc)
+
         start = time.time()
         try:
             proc = subprocess.run(
@@ -101,12 +149,14 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
                 env=env,
             )
         except subprocess.TimeoutExpired as exc:
+            finalize_usage()
             logger.error("流水线执行超时（>%ds）：%s", self.timeout_sec, node_dir)
             return ExecutionResult(
                 False, traceback=f"TimeoutExpired: 执行超过 {self.timeout_sec}s",
-                stdout=exc.stdout or "", stderr=exc.stderr or "",
+                stdout=exc.stdout or "", stderr=exc.stderr or "", artifacts=artifacts,
             )
 
+        finalize_usage()
         if proc.returncode != 0:
             logger.error("流水线执行失败（exit=%d）：%s", proc.returncode, node_dir)
             if proc.stderr:
@@ -114,7 +164,7 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
             return ExecutionResult(
                 False,
                 traceback=proc.stderr or f"non-zero exit code {proc.returncode}",
-                stdout=proc.stdout, stderr=proc.stderr,
+                stdout=proc.stdout, stderr=proc.stderr, artifacts=artifacts,
             )
 
         dataset_path = _find_fresh_jsonl(node_path, since=start)
@@ -122,11 +172,12 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
             logger.warning("流水线执行成功但未发现输出 jsonl：%s", node_dir)
             return ExecutionResult(
                 False, traceback="执行成功但未在 node_dir 找到输出 .jsonl 数据集",
-                stdout=proc.stdout, stderr=proc.stderr,
+                stdout=proc.stdout, stderr=proc.stderr, artifacts=artifacts,
             )
         logger.info("流水线产出数据集：%s", dataset_path)
         return ExecutionResult(
             True, dataset_path=str(dataset_path), stdout=proc.stdout, stderr=proc.stderr,
+            artifacts=artifacts,
         )
 
 

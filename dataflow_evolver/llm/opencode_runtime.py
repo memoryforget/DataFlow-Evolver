@@ -18,6 +18,10 @@ from dataflow_evolver.llm.agent_sdk import (
     _record_tool_uses,
     _truncate_arg,
 )
+from dataflow_evolver.llm.session_state import (
+    finalize_agent_session,
+    prepare_agent_session_store,
+)
 from dataflow_evolver.utils.config import Config
 from dataflow_evolver.utils.logging import get_logger
 
@@ -191,6 +195,7 @@ def _run_once(
     agent_cfg: Config,
     resume: str | None,
     timeout: float,
+    session_env: dict[str, str] | None = None,
 ) -> AgentRunResult:
     cfg = _opencode_cfg(agent_cfg)
     config, agent_name, model = build_opencode_config(agent_cfg, cwd=cwd)
@@ -215,6 +220,8 @@ def _run_once(
 
     env = os.environ.copy()
     env.update(_agent_env(agent_cfg))
+    if session_env:
+        env.update(session_env)
     pythonpath = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = str(_PROJECT_ROOT) + (
         os.pathsep + pythonpath if pythonpath else ""
@@ -270,6 +277,13 @@ def run_opencode_agent(
     base_delay = float(agent_cfg.get("retry_base_delay", 10))
     timeout = float(agent_cfg.get("run_timeout_sec", 1800))
     resume_enabled = bool(agent_cfg.get("resume_on_retry", True))
+    session_store = prepare_agent_session_store(
+        agent_cfg,
+        backend="opencode",
+        cwd=cwd,
+        tool_log_dir=tool_log_dir,
+    )
+    session_env = session_store.environment() if session_store is not None else None
     resume_id: str | None = None
     result = AgentRunResult(False, error="未发起任何 OpenCode 运行", error_type="NoAttempt")
 
@@ -289,6 +303,7 @@ def run_opencode_agent(
             agent_cfg=agent_cfg,
             resume=resume_id if used_resume else None,
             timeout=timeout,
+            session_env=session_env,
         )
         if tool_log_dir:
             label = phase if attempt == 1 else f"{phase}#retry{attempt - 1}"
@@ -296,7 +311,9 @@ def run_opencode_agent(
         if result.session_id:
             resume_id = result.session_id
         if result.success:
-            return result
+            return finalize_agent_session(
+                session_store, phase=phase, result=result
+            )
 
         result.retryable = _is_retryable(result)
         if used_resume and not result.retryable:
@@ -320,8 +337,8 @@ def run_opencode_agent(
             result.retryable,
             result.error,
         )
-        return result
-    return result
+        return finalize_agent_session(session_store, phase=phase, result=result)
+    return finalize_agent_session(session_store, phase=phase, result=result)
 
 
 class OpenCodeAgentRuntime:

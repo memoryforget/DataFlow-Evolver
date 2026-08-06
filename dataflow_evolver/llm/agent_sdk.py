@@ -14,6 +14,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from dataflow_evolver.llm.session_state import (
+    finalize_agent_session,
+    prepare_agent_session_store,
+)
 from dataflow_evolver.utils.config import Config
 from dataflow_evolver.utils.logging import get_logger
 
@@ -210,7 +214,12 @@ def _agent_env(agent_cfg: Config) -> dict[str, str]:
     return env
 
 
-def _build_options(agent_cfg: Config, cwd: str, resume: str | None = None) -> Any:
+def _build_options(
+    agent_cfg: Config,
+    cwd: str,
+    resume: str | None = None,
+    session_env: dict[str, str] | None = None,
+) -> Any:
     """据 agent 配置段构造 ClaudeAgentOptions。
 
     - tools：用 claude_code 预设放开**全部内置工具**（不再用 allowed_tools 白名单限制）。
@@ -237,6 +246,9 @@ def _build_options(agent_cfg: Config, cwd: str, resume: str | None = None) -> An
     effort = agent_cfg.get("effort", None) or None  # 空串/None → 不传，走模型默认
     thinking_mode = (agent_cfg.get("thinking", "adaptive") or "adaptive").lower()
     thinking = {"type": "adaptive"} if thinking_mode == "adaptive" else None
+    env = _agent_env(agent_cfg)
+    if session_env:
+        env.update(session_env)
     return ClaudeAgentOptions(
         cwd=cwd,
         model=agent_cfg.get("model", None),
@@ -249,7 +261,7 @@ def _build_options(agent_cfg: Config, cwd: str, resume: str | None = None) -> An
         resume=resume,
         effort=effort,
         thinking=thinking,
-        env=_agent_env(agent_cfg),
+        env=env,
     )
 
 
@@ -378,12 +390,24 @@ def run_pipeline_agent(
     base_delay = float(agent_cfg.get("retry_base_delay", 10))
     timeout = float(agent_cfg.get("run_timeout_sec", 1800))
     resume_enabled = bool(agent_cfg.get("resume_on_retry", True))
+    session_store = prepare_agent_session_store(
+        agent_cfg,
+        backend="claude",
+        cwd=cwd,
+        tool_log_dir=tool_log_dir,
+    )
+    session_env = session_store.environment() if session_store is not None else None
 
     resume_id: str | None = None
     result = AgentRunResult(False, error="未发起任何 SDK 运行", error_type="NoAttempt")
     for attempt in range(1, max_retries + 1):
         used_resume = resume_enabled and resume_id is not None
-        options = _build_options(agent_cfg, cwd, resume=resume_id if used_resume else None)
+        options = _build_options(
+            agent_cfg,
+            cwd,
+            resume=resume_id if used_resume else None,
+            session_env=session_env,
+        )
         cur_prompt = _RESUME_NUDGE if used_resume else prompt
         logger.info(
             "启动 Agent SDK 运行（尝试 %d/%d，%s）：cwd=%s",
@@ -408,7 +432,9 @@ def run_pipeline_agent(
             resume_id = result.session_id
 
         if result.success:
-            return result
+            return finalize_agent_session(
+                session_store, phase=phase, result=result
+            )
 
         result.retryable = _is_retryable(result)
 
@@ -437,5 +463,5 @@ def run_pipeline_agent(
             "Agent SDK 运行失败 [%s]（retryable=%s，已尝试 %d 次）：%s",
             result.error_type, result.retryable, attempt, result.error,
         )
-        return result
-    return result
+        return finalize_agent_session(session_store, phase=phase, result=result)
+    return finalize_agent_session(session_store, phase=phase, result=result)

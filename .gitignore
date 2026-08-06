@@ -20,6 +20,9 @@ data/*
 # 本地模型权重由用户自行准备，不入库
 model/*
 
+# Optional centralized Claude/OpenCode session state
+agent_sessions/
+
 # 忽略 workspace 运行产物
 workspace/*
 

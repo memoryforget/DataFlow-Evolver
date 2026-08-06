@@ -137,6 +137,7 @@ def test_error_event_is_a_failed_result():
 
 def test_headless_run_uses_stdin_inline_config_and_cli_flags(monkeypatch, tmp_path):
     captured = {}
+    node_dir = tmp_path / "run" / "node_0"
 
     def fake_run(command, **kwargs):
         captured["command"] = command
@@ -151,6 +152,7 @@ def test_headless_run_uses_stdin_inline_config_and_cli_flags(monkeypatch, tmp_pa
         "write the pipeline",
         cwd=str(tmp_path),
         agent_cfg=_cfg(),
+        tool_log_dir=str(node_dir),
         phase="generate",
     )
     assert result.success
@@ -159,6 +161,13 @@ def test_headless_run_uses_stdin_inline_config_and_cli_flags(monkeypatch, tmp_pa
     inline = json.loads(captured["env"]["OPENCODE_CONFIG_CONTENT"])
     assert inline["agent"]["dataflow-pipeline"]["model"] == "anthropic/claude-opus-4-8"
     assert set(inline["mcp"]) == {"dataflow-operators"}
+    session_root = tmp_path.parent / "agent_sessions" / "run" / "node_0" / "opencode"
+    assert captured["env"]["HOME"] == str(session_root.resolve())
+    assert captured["env"]["XDG_DATA_HOME"] == str(
+        (session_root / ".local/share").resolve()
+    )
+    assert (node_dir / "agent_sessions.jsonl").is_file()
+    assert (node_dir / "agent_token_usage.json").is_file()
 
 
 def test_retry_resumes_open_session(monkeypatch, tmp_path):

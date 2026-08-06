@@ -18,12 +18,17 @@ def test_tool_trace_appends_by_phase(tmp_path):
 
 
 def test_failed_attempt_tool_trace_is_not_lost(tmp_path, monkeypatch):
+    captured_session_envs = []
     results = [
         AgentRunResult(False, error="429", error_type="ProcessError", tool_uses=[{"name": "Read"}]),
         AgentRunResult(True, tool_uses=[{"name": "Write"}]),
     ]
 
-    monkeypatch.setattr(sdk, "_build_options", lambda *args, **kwargs: object())
+    def fake_build_options(*args, **kwargs):
+        captured_session_envs.append(kwargs.get("session_env"))
+        return object()
+
+    monkeypatch.setattr(sdk, "_build_options", fake_build_options)
 
     async def fake_run(prompt, options, timeout):
         return results.pop(0)
@@ -40,3 +45,8 @@ def test_failed_attempt_tool_trace_is_not_lost(tmp_path, monkeypatch):
     assert result.success
     rows = [json.loads(line) for line in (tmp_path / "agent_tools.jsonl").read_text().splitlines()]
     assert [row["phase"] for row in rows] == ["generate", "generate#retry1"]
+    expected_root = (tmp_path.parent / "agent_sessions/claude").resolve()
+    assert captured_session_envs[0]["HOME"] == str(expected_root)
+    assert captured_session_envs[0]["CLAUDE_CONFIG_DIR"] == str(expected_root / ".claude")
+    assert (tmp_path / "agent_sessions.jsonl").is_file()
+    assert (tmp_path / "agent_token_usage.json").is_file()

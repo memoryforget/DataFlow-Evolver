@@ -134,6 +134,44 @@ DAS is reported separately from the LLM `review_score`. Its MMD value, parent de
 kernel terms, sample counts, and status are returned to the next PipelineAgent without
 exposing proxy examples.
 
+## Agent sessions and token usage
+
+Claude and OpenCode session state is isolated per pipeline node and stored centrally in
+the project workspace:
+
+```text
+workspace/agent_sessions/<run_name>/node_N/claude/.claude/projects/**/*.jsonl
+workspace/agent_sessions/<run_name>/node_N/opencode/.local/share/opencode/opencode.db
+workspace/agent_sessions/<run_name>/node_N/pipeline/pipeline_llm_calls.jsonl
+```
+
+Each completed Agent invocation refreshes:
+
+```text
+<node_dir>/agent_sessions.jsonl
+<node_dir>/agent_token_usage.json
+<node_dir>/pipeline_llm_token_usage.json
+<node_dir>/token_usage.json
+```
+
+Agent usage is read from native Claude/OpenCode sessions. Pipeline usage is captured from
+the raw API `usage` object before DataFlow converts the response to text. Successful retry
+attempts are all counted; responses without usage are reported as `missing_usage` and are
+not silently estimated. `token_usage.json` namespaces both accounts without combining
+incompatible cache semantics into a fabricated grand total.
+
+To use another central root, set:
+
+```bash
+export DF_AGENT_SESSION_ROOT=./agent_sessions
+```
+
+The framework retains the run/node/backend hierarchy below this root, so concurrent
+experiments do not share Claude project logs or an OpenCode database. Session directories
+may contain full prompts and responses and should be treated as private experiment data.
+Pipeline call events contain request metadata and token counters, but no prompt or response
+content; URL query strings are removed before writing.
+
 ## Run
 
 Run from the repository root:
@@ -156,7 +194,8 @@ The default workspace is `workspace_review_only/`:
 - `<run_name>_best.json`: the selected pipeline and candidate dataset;
 - node `pipeline.py` and operator files: generated DataFlow implementation;
 - node `decision.json`: pipeline structure and rationale;
-- node `review.jsonl`: sampled evidence, hard metrics, and optional DAS evidence.
+- node `review.jsonl`: sampled evidence, hard metrics, and optional DAS evidence;
+- node `token_usage.json`: Agent and pipeline-runtime LLM usage.
 
 ## Tests
 

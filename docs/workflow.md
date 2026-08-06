@@ -88,6 +88,22 @@ pipeline prompt and must write `pipeline.py` plus `decision.json`; execution and
 remain unchanged. Both expose the same `dataflow-operators` MCP. OpenCode starts it as a
 local stdio MCP subprocess, while Claude loads it in-process.
 
+Agent state is isolated per node and stored centrally below
+`workspace/agent_sessions/<run_name>/node_N/`. Claude writes JSONL sessions in the
+`claude/.claude/projects/` subtree, while OpenCode writes its SQLite database in the
+`opencode/.local/share/opencode/` subtree. The framework also writes
+`agent_sessions.jsonl` and cumulative `agent_token_usage.json` in the node artifact
+directory. Set `DF_AGENT_SESSION_ROOT` to select another central root; the relative
+run/node path and backend name are retained below it.
+
+Generated-pipeline LLM calls are accounted separately. The execution subprocess installs
+a process-local `requests` response hook and appends metadata plus exact API usage to
+`pipeline/pipeline_llm_calls.jsonl` under the same central node directory. It never records
+prompt or response content. After every execution—including failures and self-correction
+retries—the wrapper refreshes `pipeline_llm_token_usage.json` and the namespaced
+`token_usage.json` in the node artifact directory. Calls whose endpoint omits usage remain
+visible as `missing_usage` but are not added as estimated exact tokens.
+
 OpenCode discovers the existing `.claude/skills/dataflow-dev/` directory through its
 Claude-compatible skill discovery, so a duplicated `.opencode/skills/` copy is unnecessary.
 The inline OpenCode permissions allow local code inspection, editing and compile tests but

@@ -298,6 +298,7 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
         timeout_sec=int(loop_cfg.get("execution_timeout_sec", 1200)),
         python_exe=str(loop_cfg.get("python_exe", "") or "") or None,
         extra_env=extra_env or None,
+        token_usage_root=str(agent_cfg.get("session_root", "") or "") or None,
     )
     init_cfg = cfg.get("init") or Config({})
     reference_path = str(init_cfg.get("reference_pipeline", "") or "")
