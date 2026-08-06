@@ -1,0 +1,267 @@
+import json
+
+import numpy as np
+import pytest
+
+from dataflow_evolver.agents.review_agent import ReviewAgent
+from dataflow_evolver.core.dataset_quality import (
+    DatasetQualityEvaluator,
+    EmbeddingBatch,
+    ProxyDatasetConfig,
+    compute_rbf_mmd,
+)
+from dataflow_evolver.core.schemas import DatasetQualityResult, ReviewResult, TaskProfile
+from dataflow_evolver.llm.prompts import build_pipeline_prompt
+from dataflow_evolver.core.input_corpus import CorpusFile, InputCorpus
+
+
+class FakeEmbedder:
+    model_name = "fake-embedding"
+
+    def __init__(self):
+        self.calls = 0
+
+    def embed(self, conversations):
+        self.calls += 1
+        vectors = []
+        for messages in conversations:
+            text = "\n".join(message["content"] for message in messages)
+            vectors.append(
+                [
+                    float(len(text)),
+                    float(sum(ord(char) for char in text) % 97 + 1),
+                    1.0,
+                ]
+            )
+        return EmbeddingBatch(np.asarray(vectors, dtype=np.float32), 0.0)
+
+
+def _write_jsonl(path, rows):
+    path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_exact_biased_mmd_is_zero_for_identical_embeddings():
+    values = np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    mmd, terms = compute_rbf_mmd(values, values.copy(), sigma=1.0, biased=True)
+    assert mmd == pytest.approx(0.0, abs=1e-12)
+    assert terms["candidate_internal"] == pytest.approx(terms["proxy_internal"])
+    assert terms["cross"] == pytest.approx(terms["candidate_internal"])
+
+
+def test_rbf_mmd_matches_closed_form_for_two_singletons():
+    candidate = np.asarray([[1.0, 0.0]], dtype=np.float64)
+    proxy = np.asarray([[0.0, 1.0]], dtype=np.float64)
+    mmd, terms = compute_rbf_mmd(candidate, proxy, sigma=1.0, biased=True)
+    expected_cross = np.exp(-1.0)  # squared distance is 2 after L2 normalization.
+    assert terms["candidate_internal"] == pytest.approx(1.0)
+    assert terms["proxy_internal"] == pytest.approx(1.0)
+    assert terms["cross"] == pytest.approx(expected_cross)
+    assert mmd == pytest.approx(np.sqrt(2.0 - 2.0 * expected_cross))
+
+
+def test_mmd_clamps_tiny_negative_squared_value():
+    # Identical arrays exercise the floating-point cancellation path; the result must
+    # remain finite and non-negative even if the three means differ by roundoff.
+    values = np.asarray([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]], dtype=np.float64)
+    mmd, _ = compute_rbf_mmd(values, values.copy())
+    assert np.isfinite(mmd)
+    assert mmd >= 0.0
+
+
+def test_dataset_evaluator_uses_configured_sample_size_and_cache(tmp_path):
+    candidate = tmp_path / "candidate.jsonl"
+    proxy = tmp_path / "proxy.jsonl"
+    _write_jsonl(
+        candidate,
+        [
+            {"instruction": f"candidate question {i}", "output": f"answer {i}"}
+            for i in range(8)
+        ],
+    )
+    _write_jsonl(
+        proxy,
+        [
+            {"question": f"proxy question {i}", "response": f"solution {i}"}
+            for i in range(8)
+        ],
+    )
+    embedder = FakeEmbedder()
+    evaluator = DatasetQualityEvaluator(
+        proxy=ProxyDatasetConfig(
+            source="local",
+            path=str(proxy),
+            user_field="question",
+            assistant_field="response",
+            name="math-proxy",
+        ),
+        embedder=embedder,
+        sample_size=5,
+        seed=42,
+        cache_dir=tmp_path / "cache",
+    )
+
+    first = evaluator.evaluate(
+        str(candidate), candidate_user_field="instruction", candidate_assistant_field="output"
+    )
+    second = evaluator.evaluate(
+        str(candidate), candidate_user_field="instruction", candidate_assistant_field="output"
+    )
+
+    assert first.status == "ok"
+    assert first.candidate_total == 8
+    assert first.candidate_sample_size == 5
+    assert first.proxy_sample_size == 5
+    assert first.embedding_dim == 3
+    assert first.das == pytest.approx(-first.mmd)
+    assert set(first.kernel_terms) == {
+        "candidate_internal", "proxy_internal", "cross", "mmd_squared"
+    }
+    assert second.mmd == pytest.approx(first.mmd)
+    assert embedder.calls == 2  # Candidate + proxy only once; second evaluation is cached.
+
+
+def test_dataset_evaluator_reads_local_parquet_snapshot_directory(tmp_path):
+    datasets = pytest.importorskip("datasets")
+    candidate = tmp_path / "candidate.jsonl"
+    proxy_dir = tmp_path / "ODA-Math-460k" / "data"
+    proxy_dir.mkdir(parents=True)
+    _write_jsonl(
+        candidate,
+        [
+            {"instruction": f"candidate question {i}", "output": f"answer {i}"}
+            for i in range(6)
+        ],
+    )
+    proxy_rows = [
+        {"question": f"proxy question {i}", "response": f"solution {i}"}
+        for i in range(6)
+    ]
+    datasets.Dataset.from_list(proxy_rows).to_parquet(proxy_dir / "train-00000.parquet")
+    evaluator = DatasetQualityEvaluator(
+        proxy=ProxyDatasetConfig(
+            source="local",
+            path=str(proxy_dir.parent),
+            user_field="question",
+            assistant_field="response",
+        ),
+        embedder=FakeEmbedder(),
+        sample_size=5,
+        seed=42,
+    )
+
+    result = evaluator.evaluate(
+        str(candidate), candidate_user_field="instruction", candidate_assistant_field="output"
+    )
+
+    assert result.status == "ok"
+    assert result.proxy_sample_size == 5
+    assert result.mmd is not None
+
+
+def test_dataset_evaluator_reports_insufficient_samples_without_embedding(tmp_path):
+    candidate = tmp_path / "candidate.jsonl"
+    proxy = tmp_path / "proxy.jsonl"
+    _write_jsonl(candidate, [{"instruction": "q", "output": "a"}])
+    _write_jsonl(proxy, [{"question": "q", "response": "a"}] * 5)
+    embedder = FakeEmbedder()
+    evaluator = DatasetQualityEvaluator(
+        proxy=ProxyDatasetConfig(
+            source="local",
+            path=str(proxy),
+            user_field="question",
+            assistant_field="response",
+        ),
+        embedder=embedder,
+        sample_size=5,
+        require_full_sample=True,
+    )
+
+    result = evaluator.evaluate(
+        str(candidate), candidate_user_field="instruction", candidate_assistant_field="output"
+    )
+
+    assert result.status == "insufficient_samples"
+    assert result.candidate_sample_size == 1
+    assert "5" in (result.error or "")
+    assert embedder.calls == 0
+
+
+class StubDatasetEvaluator:
+    def evaluate(self, *args, **kwargs):
+        return DatasetQualityResult(
+            enabled=True,
+            status="ok",
+            proxy_name="proxy",
+            candidate_sample_size=5,
+            proxy_sample_size=5,
+            mmd=0.2,
+            das=-0.2,
+        )
+
+
+def test_review_agent_records_parent_mmd_delta():
+    class NeverServing:
+        pass
+
+    reviewer = ReviewAgent.__new__(ReviewAgent)
+    reviewer.dataset_quality_evaluator = StubDatasetEvaluator()
+    reviewer.dataset_quality_fields = ("instruction", "output")
+    parent = ReviewResult(0.9, 0.9, True)
+    parent.dataset_quality = DatasetQualityResult(
+        enabled=True, status="ok", mmd=0.25, das=-0.25
+    )
+    current = ReviewResult(0.9, 0.9, True)
+
+    reviewer.apply_dataset_quality(current, "unused.jsonl", parent)
+
+    assert current.dataset_quality.delta_mmd_vs_parent == pytest.approx(-0.05)
+
+
+def test_pipeline_prompt_exposes_das_without_proxy_examples(tmp_path):
+    entry = tmp_path / "raw.jsonl"
+    entry.write_text('{"raw":"x"}\n', encoding="utf-8")
+    corpus_file = CorpusFile(
+        path=entry,
+        rel="raw.jsonl",
+        size_bytes=entry.stat().st_size,
+        rows=1,
+        fields=("raw",),
+        preview_lines=('{"raw":"x"}',),
+    )
+    corpus = InputCorpus(
+        entry_path=str(entry),
+        root=tmp_path,
+        files=(corpus_file,),
+        entry_file=corpus_file,
+    )
+    review = ReviewResult(0.9, 0.9, True, review_score=0.8)
+    review.dataset_quality = DatasetQualityResult(
+        enabled=True,
+        status="ok",
+        proxy_name="ODA-Math-460k",
+        candidate_sample_size=5000,
+        proxy_sample_size=5000,
+        mmd=0.2,
+        das=-0.2,
+        delta_mmd_vs_parent=-0.03,
+        kernel_terms={
+            "candidate_internal": 0.4,
+            "proxy_internal": 0.3,
+            "cross": 0.35,
+        },
+    )
+
+    prompt = build_pipeline_prompt(
+        TaskProfile("math", {"instruction": "str", "output": "str"}, []),
+        corpus,
+        "run/node_1",
+        parent_review=review,
+    )
+
+    assert "Dataset-level DAS" in prompt
+    assert "ΔMMD -0.030000" in prompt
+    assert "MMD 越低越好" in prompt
+    assert "ODA-Math-460k" in prompt

@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Fixed-corpus DataFlow pipeline evolution with direct ReviewAgent feedback"
 requires-python = ">=3.10"
 dependencies = [
+    "numpy>=1.24",
     "openai>=1.0",
     "pyyaml>=6.0",
     "pydantic>=2.0",
@@ -14,14 +15,18 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
+dataset-quality = [
+    # Loads the locally prepared Parquet proxy snapshot used by DAS.
+    "datasets>=2.19",
+]
 agent = [
     # claude-agent-sdk 依赖 mcp -> pydantic>=2.11，与 llamafactory 冲突
     # 编排层单独装，不要和 SFT / eval 混装
     "claude-agent-sdk>=0.2",
 ]
 agent-runtime = [
-    # --- 运行 vendored DataFlow 流水线所需（装在 df-agent 环境）---
-    # torch 仅为满足导入，df-agent 不做 GPU 计算 —— 装 CPU-only 轮子即可（~200MB 而非 ~2.5GB）：
+    # --- 运行 vendored DataFlow 流水线所需（装在 dfe-review 环境）---
+    # torch 仅为满足导入，编排进程不做 GPU 计算 —— 装 CPU-only 轮子即可（~200MB 而非 ~2.5GB）：
     #   pip install torch --index-url https://download.pytorch.org/whl/cpu
     "torch>=2.5",
     "transformers>=5.6",

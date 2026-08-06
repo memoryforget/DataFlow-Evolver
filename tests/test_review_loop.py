@@ -67,7 +67,9 @@ class FakeReviewer:
             _review(0.6, True, "less diverse"),
         ]
 
-    def review(self, dataset_path, profile, evidence_path=None, phase="search"):
+    def review(
+        self, dataset_path, profile, evidence_path=None, phase="search", parent_review=None
+    ):
         return self.results.pop(0)
 
 

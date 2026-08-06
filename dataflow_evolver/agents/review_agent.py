@@ -1,4 +1,4 @@
-"""Review-only scorer: one sampled LLM review plus deterministic full-file metrics.
+"""Review-only scorer with sample, full-file, and optional dataset-distribution evidence.
 
 The five review dimensions are combined into one comparable score:
 - 五维 LLM-judge（各 0-1）：correctness / relevance / difficulty / diversity / schema。
@@ -11,6 +11,8 @@ The five review dimensions are combined into one comparable score:
   是与 benchmark 测试集的 n-gram 重合率，超阈值直接判 ``passed=False``（见 core/decontamination.py）。
 - 抽样从「取前 N 行」改为**随机蓄水池采样**（一趟遍历、O(k) 内存、全份等概率）。
 - ``passed`` 门槛保留（schema/relevance 阈值），用于剔除垃圾节点。
+- 可选 DatasetQualityEvaluator 固定采样候选集和高质量代理集，计算 DAS=-MMD；该原始值
+  保持独立，不与 0-1 的 LLM 分数做无标定加权，但会随 ReviewResult 回传 PipelineAgent。
 
 Optional decontamination references are used only for n-gram overlap detection and are
 never included in an Agent prompt.
@@ -27,6 +29,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from dataflow_evolver.agents.base import AgentABC
+from dataflow_evolver.core.dataset_quality import DatasetQualityEvaluator
 from dataflow_evolver.core.decontamination import ContaminationIndex
 from dataflow_evolver.core.schemas import ReviewResult, TaskProfile
 from dataflow_evolver.llm.prompts import FAILURE_SIGNALS, build_review_prompt
@@ -56,6 +59,8 @@ class ReviewAgent(AgentABC):
         seed: int | None = None,
         contamination: ContaminationIndex | None = None,
         null_threshold: float = 0.5,
+        dataset_quality_evaluator: DatasetQualityEvaluator | None = None,
+        dataset_quality_fields: tuple[str, str] = ("instruction", "output"),
     ) -> None:
         super().__init__(serving, max_retries=max_retries)
         self.schema_threshold = schema_threshold
@@ -69,6 +74,8 @@ class ReviewAgent(AgentABC):
         self.seed = seed
         # 未配置基准参考集时是一个 disabled 的空索引，扫描恒返回干净——调用点无需分支。
         self.contamination = contamination or ContaminationIndex()
+        self.dataset_quality_evaluator = dataset_quality_evaluator
+        self.dataset_quality_fields = dataset_quality_fields
 
     def build_prompt(self, profile: TaskProfile, samples_text: str) -> str:
         return build_review_prompt(profile, samples_text)
@@ -181,8 +188,9 @@ class ReviewAgent(AgentABC):
         profile: TaskProfile,
         evidence_path: str | None = None,
         phase: str = "search",
+        parent_review: ReviewResult | None = None,
     ) -> ReviewResult:
-        """随机抽样 → LLM 五维打分 → 硬指标惩罚 → ReviewResult。失败时保守返回未通过。
+        """LLM 抽样、全量硬指标和可选 DAS/MMD 共同生成 ReviewResult。
 
         `evidence_path` appends the exact sample, raw response, and parsed result so every
         feedback step can be audited or rescored offline.
@@ -196,11 +204,11 @@ class ReviewAgent(AgentABC):
         raw = self.run_json(prompt)
         if raw is None:
             result = ReviewResult(0.0, 0.0, False, ["评审 LLM 未返回有效 JSON"])
-            self._dump_evidence(evidence_path, phase, dataset_path, samples_text, None, result)
-            return result
-        result = self.parse(raw)
+        else:
+            result = self.parse(raw)
         if self.hard_metrics:
             self.apply_hard_metrics(result, dataset_path, profile)
+        self.apply_dataset_quality(result, dataset_path, parent_review)
         self.logger.info(
             "Review：corr=%.2f rel=%.2f diff=%.2f div=%.2f schema=%.2f "
             "| dup=%.2f null=%.2f parse=%.2f | composite=%.3f review_score=%.3f passed=%s | signals=%s",
@@ -210,7 +218,50 @@ class ReviewAgent(AgentABC):
             result.llm_composite, result.review_score, result.passed,
             ",".join(result.failure_signals) or "-",
         )
+        dq = result.dataset_quality
+        if dq.enabled:
+            self.logger.info(
+                "Dataset quality：status=%s MMD=%s DAS=%s delta_vs_parent=%s "
+                "samples=%d/%d proxy=%s",
+                dq.status,
+                f"{dq.mmd:.6f}" if dq.mmd is not None else "-",
+                f"{dq.das:.6f}" if dq.das is not None else "-",
+                (
+                    f"{dq.delta_mmd_vs_parent:+.6f}"
+                    if dq.delta_mmd_vs_parent is not None
+                    else "-"
+                ),
+                dq.candidate_sample_size,
+                dq.candidate_total,
+                dq.proxy_name,
+            )
         self._dump_evidence(evidence_path, phase, dataset_path, samples_text, raw, result)
+        return result
+
+    def apply_dataset_quality(
+        self,
+        result: ReviewResult,
+        dataset_path: str,
+        parent_review: ReviewResult | None = None,
+    ) -> ReviewResult:
+        """Run deterministic proxy-distribution evaluation without changing review_score."""
+        if self.dataset_quality_evaluator is None:
+            return result
+        user_field, assistant_field = self.dataset_quality_fields
+        result.dataset_quality = self.dataset_quality_evaluator.evaluate(
+            dataset_path,
+            candidate_user_field=user_field,
+            candidate_assistant_field=assistant_field,
+        )
+        parent_quality = parent_review.dataset_quality if parent_review is not None else None
+        if (
+            result.dataset_quality.mmd is not None
+            and parent_quality is not None
+            and parent_quality.mmd is not None
+        ):
+            result.dataset_quality.delta_mmd_vs_parent = (
+                result.dataset_quality.mmd - parent_quality.mmd
+            )
         return result
 
     def _dump_evidence(

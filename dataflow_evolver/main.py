@@ -17,6 +17,11 @@ from typing import Any
 from dataflow_evolver.agents.pipeline_agent import PipelineAgent
 from dataflow_evolver.agents.review_agent import ReviewAgent
 from dataflow_evolver.core import decontamination, input_corpus
+from dataflow_evolver.core.dataset_quality import (
+    DatasetQualityEvaluator,
+    OpenAIChatEmbeddingBackend,
+    ProxyDatasetConfig,
+)
 from dataflow_evolver.core.schemas import PipelineConfig, ReviewResult, TaskProfile
 from dataflow_evolver.engine.execution_wrapper import (
     ExecutionResult,
@@ -178,6 +183,11 @@ class ReviewOnlyLoop:
             self.profile,
             evidence_path=str(evidence_path),
             phase=f"iteration_{iteration}",
+            parent_review=(
+                self.candidates[-1].review
+                if self.candidates and self.candidates[-1].review is not None
+                else None
+            ),
         )
         return Candidate(
             iteration=iteration,
@@ -244,6 +254,10 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
     serving = build_serving(cfg.llm)
     review_cfg = cfg.review
     decon_cfg = review_cfg.get("decontamination") or Config({})
+    dataset_quality_evaluator, dataset_quality_fields = _build_dataset_quality_evaluator(
+        review_cfg.get("dataset_quality") or Config({}),
+        workspace=workspace,
+    )
     reviewer = ReviewAgent(
         serving,
         contamination=decontamination.build(
@@ -259,6 +273,8 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
         hard_metrics=bool(review_cfg.get("hard_metrics", True)),
         seed=review_cfg.get("sample_seed", None),
         null_threshold=float(review_cfg.get("null_threshold", 0.5)),
+        dataset_quality_evaluator=dataset_quality_evaluator,
+        dataset_quality_fields=dataset_quality_fields,
     )
 
     agent_cfg = cfg.agent
@@ -329,6 +345,78 @@ def _plain_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, Config):
         return dict(value.to_dict())
     return dict(value or {}) if isinstance(value, dict) else {}
+
+
+def _build_dataset_quality_evaluator(
+    value: Config,
+    *,
+    workspace: Path,
+) -> tuple[DatasetQualityEvaluator | None, tuple[str, str]]:
+    """Build the optional deterministic DAS evaluator from the review config."""
+    candidate_cfg = value.get("candidate") or Config({})
+    fields = (
+        str(candidate_cfg.get("user_field", "instruction")),
+        str(candidate_cfg.get("assistant_field", "output")),
+    )
+    if not _as_bool(value.get("enabled", False)):
+        return None, fields
+
+    proxy_cfg = value.get("proxy") or Config({})
+    embedding_cfg = value.get("embedding") or Config({})
+    proxy_path = str(proxy_cfg.get("path", "") or "").strip()
+    base_url = str(embedding_cfg.get("base_url", "") or "").strip()
+    model_name = str(embedding_cfg.get("model_name", "") or "").strip()
+    if not proxy_path:
+        raise ValueError("review.dataset_quality.proxy.path 不能为空")
+    if not base_url:
+        raise ValueError("review.dataset_quality.embedding.base_url 不能为空")
+    if not model_name:
+        raise ValueError("review.dataset_quality.embedding.model_name 不能为空")
+
+    cache_value = str(value.get("cache_dir", "") or "").strip()
+    cache_dir = Path(cache_value) if cache_value else workspace / "dataset_quality_cache"
+    proxy = ProxyDatasetConfig(
+        source=str(proxy_cfg.get("source", "huggingface")),
+        path=proxy_path,
+        name=str(proxy_cfg.get("name", "") or ""),
+        split=str(proxy_cfg.get("split", "train")),
+        user_field=str(proxy_cfg.get("user_field", "question")),
+        assistant_field=str(proxy_cfg.get("assistant_field", "response")),
+    )
+    embedder = OpenAIChatEmbeddingBackend(
+        model_name=model_name,
+        base_url=base_url,
+        api_key=str(embedding_cfg.get("api_key", "EMPTY") or "EMPTY"),
+        max_concurrent_requests=int(embedding_cfg.get("max_concurrent_requests", 128)),
+        max_retries=int(embedding_cfg.get("max_retries", 3)),
+        truncate_prompt_tokens=int(embedding_cfg.get("truncate_prompt_tokens", 40960)),
+        truncation_side=str(embedding_cfg.get("truncation_side", "right")),
+    )
+    evaluator = DatasetQualityEvaluator(
+        proxy=proxy,
+        embedder=embedder,
+        sample_size=int(value.get("sample_size", 5000)),
+        seed=int(value.get("sample_seed", 42)),
+        sigma=float(value.get("rbf_sigma", 1.0)),
+        biased=_as_bool(value.get("biased", True)),
+        normalize_embeddings=_as_bool(value.get("normalize_embeddings", True)),
+        max_embedding_fail_rate=float(value.get("max_embedding_fail_rate", 0.02)),
+        cache_dir=cache_dir,
+        require_full_sample=_as_bool(value.get("require_full_sample", True)),
+    )
+    return evaluator, fields
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    return bool(value)
 
 
 def _resolve_pipeline_llm(cfg_llm: Config) -> dict[str, dict[str, Any]]:

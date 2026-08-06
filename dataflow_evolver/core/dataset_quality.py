@@ -1,0 +1,536 @@
+"""Dataset-level quality evaluation with proxy-set MMD/DAS.
+
+The implementation follows Data-Preparation-Bench's DAS definition:
+``DAS = -sqrt(max(0, biased_MMD_squared))`` with an RBF kernel.  Candidate
+records and proxy records are encoded as the same two-turn user/assistant
+conversation so the comparison is not confounded by field names.
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol
+
+import numpy as np
+
+from dataflow_evolver.core.schemas import DatasetQualityResult
+from dataflow_evolver.utils.logging import get_logger
+
+
+Conversation = list[dict[str, str]]
+logger = get_logger("core.dataset_quality")
+
+
+@dataclass(frozen=True)
+class ProxyDatasetConfig:
+    source: str
+    path: str
+    user_field: str
+    assistant_field: str
+    name: str = ""
+    split: str = "train"
+
+
+@dataclass
+class EmbeddingBatch:
+    vectors: np.ndarray
+    fail_rate: float = 0.0
+
+
+class EmbeddingBackend(Protocol):
+    model_name: str
+
+    def embed(self, conversations: list[Conversation]) -> EmbeddingBatch: ...
+
+
+class OpenAIChatEmbeddingBackend:
+    """Qwen/vLLM-compatible chat embedding client with bounded concurrency."""
+
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        base_url: str,
+        api_key: str = "EMPTY",
+        max_concurrent_requests: int = 128,
+        max_retries: int = 3,
+        truncate_prompt_tokens: int = 40960,
+        truncation_side: str = "right",
+    ) -> None:
+        self.model_name = model_name
+        self.base_url = base_url
+        self.api_key = api_key
+        self.max_concurrent_requests = max(1, max_concurrent_requests)
+        self.max_retries = max(1, max_retries)
+        self.truncate_prompt_tokens = truncate_prompt_tokens
+        self.truncation_side = truncation_side
+
+    def embed(self, conversations: list[Conversation]) -> EmbeddingBatch:
+        logger.info(
+            "请求 embedding：model=%s samples=%d concurrency=%d",
+            self.model_name,
+            len(conversations),
+            self.max_concurrent_requests,
+        )
+        return asyncio.run(self._embed_async(conversations))
+
+    async def _embed_async(self, conversations: list[Conversation]) -> EmbeddingBatch:
+        from openai import AsyncOpenAI
+        from openai.types.create_embedding_response import CreateEmbeddingResponse
+
+        client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
+        semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+
+        async def one(messages: Conversation) -> list[float] | None:
+            body: dict[str, Any] = {
+                "messages": messages,
+                "model": self.model_name,
+                "truncate_prompt_tokens": self.truncate_prompt_tokens,
+                "truncation_side": self.truncation_side,
+            }
+            for attempt in range(self.max_retries):
+                async with semaphore:
+                    try:
+                        response: CreateEmbeddingResponse = await client.post(
+                            "/embeddings",
+                            cast_to=CreateEmbeddingResponse,
+                            body=body,
+                        )
+                        return list(response.data[0].embedding)
+                    except Exception:
+                        if attempt + 1 >= self.max_retries:
+                            return None
+                await asyncio.sleep(0.1 * (attempt + 1))
+            return None
+
+        try:
+            results = await asyncio.gather(*(one(messages) for messages in conversations))
+        finally:
+            await client.close()
+
+        successful = [value for value in results if value is not None]
+        fail_rate = 1.0 - (len(successful) / len(conversations)) if conversations else 0.0
+        if not successful:
+            return EmbeddingBatch(np.empty((0, 0), dtype=np.float32), fail_rate)
+        return EmbeddingBatch(np.asarray(successful, dtype=np.float32), fail_rate)
+
+
+class DatasetQualityEvaluator:
+    """Compare a candidate JSONL dataset with a fixed high-quality proxy dataset."""
+
+    def __init__(
+        self,
+        *,
+        proxy: ProxyDatasetConfig,
+        embedder: EmbeddingBackend,
+        sample_size: int = 5000,
+        seed: int = 42,
+        sigma: float = 1.0,
+        biased: bool = True,
+        normalize_embeddings: bool = True,
+        max_embedding_fail_rate: float = 0.02,
+        cache_dir: str | Path | None = None,
+        require_full_sample: bool = True,
+    ) -> None:
+        if sample_size < 1:
+            raise ValueError("dataset_quality.sample_size 必须至少为 1")
+        if sigma <= 0:
+            raise ValueError("dataset_quality.sigma 必须大于 0")
+        self.proxy = proxy
+        self.embedder = embedder
+        self.sample_size = sample_size
+        self.seed = seed
+        self.sigma = sigma
+        self.biased = biased
+        self.normalize_embeddings = normalize_embeddings
+        self.max_embedding_fail_rate = max_embedding_fail_rate
+        self.cache_dir = Path(cache_dir).resolve() if cache_dir else None
+        self.require_full_sample = require_full_sample
+        self._proxy_messages: list[Conversation] | None = None
+
+    @property
+    def proxy_name(self) -> str:
+        if self.proxy.name and self.proxy.name != "default":
+            return f"{self.proxy.path}:{self.proxy.name}"
+        return self.proxy.path
+
+    def evaluate(
+        self,
+        candidate_path: str,
+        *,
+        candidate_user_field: str,
+        candidate_assistant_field: str,
+    ) -> DatasetQualityResult:
+        base = DatasetQualityResult(
+            enabled=True,
+            status="error",
+            proxy_name=self.proxy_name,
+            proxy_sample_size=self.sample_size,
+            embedding_model=self.embedder.model_name,
+            normalized=self.normalize_embeddings,
+            sigma=self.sigma,
+            estimator="biased" if self.biased else "unbiased",
+        )
+        try:
+            candidate_messages, total, valid = _sample_jsonl_conversations(
+                candidate_path,
+                sample_size=self.sample_size,
+                seed=self.seed,
+                user_field=candidate_user_field,
+                assistant_field=candidate_assistant_field,
+            )
+            base.candidate_total = total
+            base.candidate_sample_size = len(candidate_messages)
+            logger.info(
+                "DAS 候选采样：path=%s total=%d valid=%d sampled=%d target=%d",
+                candidate_path,
+                total,
+                valid,
+                len(candidate_messages),
+                self.sample_size,
+            )
+            if self.require_full_sample and valid < self.sample_size:
+                base.status = "insufficient_samples"
+                base.error = (
+                    f"候选数据只有 {valid} 条可编码记录，DAS 配置要求固定采样 "
+                    f"{self.sample_size} 条"
+                )
+                return base
+            if not candidate_messages:
+                base.status = "insufficient_samples"
+                base.error = "候选数据没有可编码记录"
+                return base
+
+            proxy_messages = self._load_proxy_messages()
+            base.proxy_sample_size = len(proxy_messages)
+            if self.require_full_sample and len(proxy_messages) < self.sample_size:
+                base.status = "insufficient_proxy_samples"
+                base.error = (
+                    f"代理数据只有 {len(proxy_messages)} 条可编码记录，配置要求 "
+                    f"{self.sample_size} 条"
+                )
+                return base
+
+            candidate_batch = self._embed_cached(candidate_messages)
+            proxy_batch = self._embed_cached(proxy_messages)
+            base.embedding_fail_rate = max(
+                candidate_batch.fail_rate, proxy_batch.fail_rate
+            )
+            if base.embedding_fail_rate > self.max_embedding_fail_rate:
+                base.error = (
+                    f"embedding 失败率 {base.embedding_fail_rate:.2%} 超过上限 "
+                    f"{self.max_embedding_fail_rate:.2%}"
+                )
+                return base
+
+            mmd, terms = compute_rbf_mmd(
+                candidate_batch.vectors,
+                proxy_batch.vectors,
+                sigma=self.sigma,
+                biased=self.biased,
+                normalize=self.normalize_embeddings,
+            )
+            base.status = "ok"
+            base.embedding_dim = int(candidate_batch.vectors.shape[1])
+            base.mmd = mmd
+            base.das = -mmd
+            base.kernel_terms = terms
+            logger.info(
+                "DAS 完成：proxy=%s candidate=%d proxy_samples=%d MMD=%.6f DAS=%.6f",
+                self.proxy_name,
+                len(candidate_batch.vectors),
+                len(proxy_batch.vectors),
+                mmd,
+                -mmd,
+            )
+            return base
+        except Exception as exc:  # Evidence must survive service/data failures.
+            base.error = f"{type(exc).__name__}: {exc}"
+            logger.exception("DAS 计算失败：%s", base.error)
+            return base
+
+    def _load_proxy_messages(self) -> list[Conversation]:
+        if self._proxy_messages is not None:
+            return self._proxy_messages
+        source = self.proxy.source.strip().lower()
+        if source in {"local", "jsonl", "json"}:
+            messages, _, _ = _sample_local_proxy(
+                self.proxy.path,
+                sample_size=self.sample_size,
+                seed=self.seed,
+                user_field=self.proxy.user_field,
+                assistant_field=self.proxy.assistant_field,
+            )
+        elif source in {"huggingface", "hf", "datasets"}:
+            messages = _sample_huggingface_proxy(self.proxy, self.sample_size, self.seed)
+        else:
+            raise ValueError(f"不支持的代理数据来源：{self.proxy.source}")
+        self._proxy_messages = messages
+        return messages
+
+    def _embed_cached(self, conversations: list[Conversation]) -> EmbeddingBatch:
+        cache_path = self._cache_path(conversations)
+        if cache_path is not None and cache_path.exists():
+            logger.info("命中 dataset embedding 缓存：%s", cache_path)
+            with np.load(cache_path, allow_pickle=False) as payload:
+                return EmbeddingBatch(
+                    np.asarray(payload["embeddings"], dtype=np.float32),
+                    float(payload["fail_rate"]),
+                )
+
+        logger.info("未命中 dataset embedding 缓存，开始编码 %d 条样本", len(conversations))
+        batch = self.embedder.embed(conversations)
+        if batch.vectors.ndim != 2 or batch.vectors.shape[0] == 0:
+            raise RuntimeError("embedding 服务没有返回有效的二维向量")
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = cache_path.with_suffix(".tmp.npz")
+            np.savez_compressed(
+                temp_path,
+                embeddings=np.asarray(batch.vectors, dtype=np.float32),
+                fail_rate=np.asarray(batch.fail_rate, dtype=np.float64),
+            )
+            os.replace(temp_path, cache_path)
+        return batch
+
+    def _cache_path(self, conversations: list[Conversation]) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        digest = hashlib.sha256()
+        digest.update(
+            json.dumps(
+                {
+                    "version": 1,
+                    "model": self.embedder.model_name,
+                    "backend": type(self.embedder).__name__,
+                    "base_url": getattr(self.embedder, "base_url", ""),
+                    "truncate_prompt_tokens": getattr(
+                        self.embedder, "truncate_prompt_tokens", None
+                    ),
+                    "truncation_side": getattr(self.embedder, "truncation_side", None),
+                    "normalized": self.normalize_embeddings,
+                    "conversation_format": "user_assistant_messages",
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+        for messages in conversations:
+            digest.update(json.dumps(messages, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+            digest.update(b"\n")
+        return self.cache_dir / f"{digest.hexdigest()}.npz"
+
+
+def compute_rbf_mmd(
+    candidate: np.ndarray,
+    proxy: np.ndarray,
+    *,
+    sigma: float = 1.0,
+    biased: bool = True,
+    normalize: bool = True,
+) -> tuple[float, dict[str, float]]:
+    """Compute exact RBF MMD using the same estimator as Data-Preparation-Bench."""
+    x = np.asarray(candidate, dtype=np.float64)
+    y = np.asarray(proxy, dtype=np.float64)
+    if x.ndim != 2 or y.ndim != 2 or not len(x) or not len(y):
+        raise ValueError("MMD 输入必须是非空二维 embedding 数组")
+    if x.shape[1] != y.shape[1]:
+        raise ValueError("候选和代理 embedding 维度不一致")
+    if sigma <= 0:
+        raise ValueError("RBF sigma 必须大于 0")
+    if not biased and (len(x) < 2 or len(y) < 2):
+        raise ValueError("unbiased MMD 每组至少需要两条样本")
+    if normalize:
+        x = _l2_normalize(x)
+        y = _l2_normalize(y)
+
+    k_xx = _rbf_kernel(x, x, sigma)
+    k_yy = _rbf_kernel(y, y, sigma)
+    k_xy = _rbf_kernel(x, y, sigma)
+    if biased:
+        xx = float(k_xx.mean())
+        yy = float(k_yy.mean())
+    else:
+        xx = float((k_xx.sum() - np.trace(k_xx)) / (len(x) * (len(x) - 1)))
+        yy = float((k_yy.sum() - np.trace(k_yy)) / (len(y) * (len(y) - 1)))
+    xy = float(k_xy.mean())
+    mmd_squared = xx + yy - 2.0 * xy
+    mmd = float(np.sqrt(max(0.0, mmd_squared)))
+    return mmd, {
+        "candidate_internal": xx,
+        "proxy_internal": yy,
+        "cross": xy,
+        "mmd_squared": mmd_squared,
+    }
+
+
+def _rbf_kernel(x: np.ndarray, y: np.ndarray, sigma: float) -> np.ndarray:
+    distances = (
+        np.sum(x * x, axis=1)[:, None]
+        + np.sum(y * y, axis=1)[None, :]
+        - 2.0 * (x @ y.T)
+    )
+    np.maximum(distances, 0.0, out=distances)
+    distances *= -1.0 / (2.0 * sigma * sigma)
+    np.exp(distances, out=distances)
+    return distances
+
+
+def _l2_normalize(values: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(values, axis=1, keepdims=True)
+    if np.any(norms == 0):
+        raise ValueError("embedding 中包含零向量，无法 L2 归一化")
+    return values / norms
+
+
+def _conversation(record: dict[str, Any], user_field: str, assistant_field: str) -> Conversation | None:
+    user = record.get(user_field)
+    assistant = record.get(assistant_field)
+    if not isinstance(user, str) or not user.strip():
+        return None
+    if not isinstance(assistant, str) or not assistant.strip():
+        return None
+    return [
+        {"role": "user", "content": user},
+        {"role": "assistant", "content": assistant},
+    ]
+
+
+def _sample_jsonl_conversations(
+    path: str,
+    *,
+    sample_size: int,
+    seed: int,
+    user_field: str,
+    assistant_field: str,
+) -> tuple[list[Conversation], int, int]:
+    rng = random.Random(seed)
+    reservoir: list[Conversation] = []
+    total = 0
+    valid = 0
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            if not raw_line.strip():
+                continue
+            total += 1
+            try:
+                record = json.loads(raw_line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            messages = _conversation(record, user_field, assistant_field)
+            if messages is None:
+                continue
+            valid += 1
+            if len(reservoir) < sample_size:
+                reservoir.append(messages)
+            else:
+                index = rng.randint(0, valid - 1)
+                if index < sample_size:
+                    reservoir[index] = messages
+    return reservoir, total, valid
+
+
+def _sample_local_proxy(
+    path: str,
+    *,
+    sample_size: int,
+    seed: int,
+    user_field: str,
+    assistant_field: str,
+) -> tuple[list[Conversation], int, int]:
+    proxy_path = Path(path)
+    if proxy_path.is_dir():
+        parquet_files = sorted(proxy_path.rglob("*.parquet"))
+        if not parquet_files:
+            raise ValueError(f"本地代理目录中没有 Parquet 分片：{proxy_path}")
+        try:
+            from datasets import load_dataset
+        except ImportError as exc:
+            raise RuntimeError(
+                "读取本地 Parquet 代理集需要安装 dataset-quality 可选依赖"
+            ) from exc
+        dataset = load_dataset(
+            "parquet",
+            data_files={"train": [str(file) for file in parquet_files]},
+            split="train",
+        )
+        messages = _sample_dataset_conversations(
+            dataset,
+            sample_size=sample_size,
+            seed=seed,
+            user_field=user_field,
+            assistant_field=assistant_field,
+        )
+        return messages, len(dataset), len(messages)
+    if proxy_path.suffix.lower() in {".jsonl", ".ndjson"}:
+        return _sample_jsonl_conversations(
+            path,
+            sample_size=sample_size,
+            seed=seed,
+            user_field=user_field,
+            assistant_field=assistant_field,
+        )
+    raw = json.loads(proxy_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise ValueError("本地代理 JSON 必须是对象数组；逐行数据请使用 JSONL")
+    messages = [
+        conv
+        for item in raw
+        if isinstance(item, dict)
+        for conv in [_conversation(item, user_field, assistant_field)]
+        if conv is not None
+    ]
+    rng = random.Random(seed)
+    sampled = rng.sample(messages, sample_size) if len(messages) > sample_size else messages
+    return sampled, len(raw), len(messages)
+
+
+def _sample_huggingface_proxy(
+    proxy: ProxyDatasetConfig, sample_size: int, seed: int
+) -> list[Conversation]:
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise RuntimeError(
+            "HuggingFace 代理数据需要安装 datasets；请安装项目 dataset-quality 可选依赖"
+        ) from exc
+    kwargs: dict[str, Any] = {"path": proxy.path, "split": proxy.split}
+    if proxy.name:
+        kwargs["name"] = proxy.name
+    dataset = load_dataset(**kwargs)
+    return _sample_dataset_conversations(
+        dataset,
+        sample_size=sample_size,
+        seed=seed,
+        user_field=proxy.user_field,
+        assistant_field=proxy.assistant_field,
+    )
+
+
+def _sample_dataset_conversations(
+    dataset: Any,
+    *,
+    sample_size: int,
+    seed: int,
+    user_field: str,
+    assistant_field: str,
+) -> list[Conversation]:
+    """Deterministically sample a map-style datasets.Dataset without network access."""
+    indices = list(range(len(dataset)))
+    rng = random.Random(seed)
+    if len(indices) > sample_size:
+        indices = rng.sample(indices, sample_size)
+    messages: list[Conversation] = []
+    for index in indices:
+        record = dataset[index]
+        if isinstance(record, dict):
+            conversation = _conversation(record, user_field, assistant_field)
+            if conversation is not None:
+                messages.append(conversation)
+    return messages

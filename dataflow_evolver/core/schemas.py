@@ -21,6 +21,34 @@ class PipelineConfig:
 
 
 @dataclass
+class DatasetQualityResult:
+    """Deterministic dataset-distribution evidence produced by DAS/MMD."""
+
+    enabled: bool = False
+    status: str = "disabled"
+    metric: str = "DAS"
+    proxy_name: str = ""
+
+    candidate_total: int = 0
+    candidate_sample_size: int = 0
+    proxy_sample_size: int = 0
+
+    embedding_model: str = ""
+    embedding_dim: int = 0
+    normalized: bool = True
+    kernel: str = "RBF"
+    sigma: float = 1.0
+    estimator: str = "biased"
+
+    mmd: float | None = None
+    das: float | None = None
+    delta_mmd_vs_parent: float | None = None
+    embedding_fail_rate: float = 0.0
+    kernel_terms: dict[str, float] = field(default_factory=dict)
+    error: str | None = None
+
+
+@dataclass
 class ReviewResult:
     """LLM quality dimensions plus deterministic full-dataset metrics."""
 
@@ -41,3 +69,4 @@ class ReviewResult:
     llm_composite: float = 0.0
     review_score: float = 0.0
     failure_signals: list[str] = field(default_factory=list)
+    dataset_quality: DatasetQualityResult = field(default_factory=DatasetQualityResult)

@@ -7,6 +7,9 @@ fixed raw data
     -> PipelineAgent writes pipeline.py
     -> execute pipeline
     -> ReviewAgent scores output data
+         - sample-level: sampled LLM judge
+         - full-file: schema/duplicate/null/contamination metrics
+         - dataset-level (optional): proxy-set DAS/MMD
     -> inject the complete structured ReviewResult into the next PipelineAgent prompt
     -> repeat until max_iterations
 ```
@@ -31,6 +34,48 @@ loop: their structured metrics, failure signals, and issues become the next
 PipelineAgent prompt directly. Runtime crashes may receive the small number of
 code-repair retries configured by `loop.execution_retries`.
 
+## Dataset-level DAS/MMD review
+
+`review.dataset_quality` enables a deterministic distribution-level evaluator modeled on
+Data-Preparation-Bench. It maps both candidate and proxy rows to the same two-turn
+`user`/`assistant` conversation, embeds a fixed-size sample, and computes biased RBF-MMD:
+
+```text
+DAS(candidate) = -MMD(candidate_embeddings, proxy_embeddings)
+```
+
+The default math proxy contract is ODA-Math-460k (`question` / `response`) and the
+candidate contract is `instruction` / `output`. The sample size is configurable and
+defaults to 5000 with seed 42. `require_full_sample: true` deliberately reports
+`insufficient_samples` instead of comparing nodes at different sample sizes.
+
+Embeddings are L2-normalized before MMD, and embedding batches are cached by their full
+conversation content plus model/runtime identity. In particular, the fixed proxy is not
+re-embedded on every iteration. Proxy records themselves are never included in the
+PipelineAgent prompt: the next iteration receives only MMD/DAS, delta versus its parent,
+kernel terms, counts, and error status.
+
+Raw DAS is not added to `review_score`, because DAS is non-positive and its scale depends
+on the embedding/kernel setup whereas the sampled LLM score is in `[0, 1]`. It is a
+separate feedback signal; `review_score` and its existing selection semantics remain
+backward compatible.
+
+Start a Qwen3-Embedding-8B OpenAI-compatible chat embedding endpoint, then enable DAS:
+
+```bash
+export DF_DAS_ENABLED=true
+export DF_DAS_SAMPLE_SIZE=5000
+export DF_DAS_PROXY_SOURCE=local
+export DF_DAS_PROXY_PATH=$PWD/data/ODA-Math-460k
+export DF_DAS_PROXY_NAME=
+export DF_DAS_EMBEDDING_MODEL=$PWD/model/Qwen3-Embedding-8B
+export DF_DAS_EMBEDDING_URL=http://127.0.0.1:8000/v1
+export DF_DAS_EMBEDDING_CONCURRENCY=128
+```
+
+For a pre-downloaded JSONL proxy, set `DF_DAS_PROXY_SOURCE=local` and point
+`DF_DAS_PROXY_PATH` to the file. The configured proxy field names still apply.
+
 ## PipelineAgent backends
 
 `agent.backend` selects the autonomous coding runtime:
@@ -54,17 +99,18 @@ The configured `agent_root` must already contain the vendored `dataflow/` source
 `.claude/skills/dataflow-dev/`, as in the project's prepared `workspace/_agent_root`.
 
 ```bash
-cd /vepfs-mlp2/c20250602/500050/lh/xqf/DataFlow-Evolver
+cd /path/to/DataFlow-Evolver
 
 export RAW_DATA_DIR=/absolute/path/to/raw_data
 export RAW_DATA_ENTRY=train.jsonl        # optional if the directory has one clear entry
 export DF_RUN_NAME=review_only_001
 export DF_MAX_ITERATIONS=4
+export DF_API_URL=https://your-api-endpoint/v1
 export DF_API_KEY=...                     # ReviewAgent and pipeline operators
 export ANTHROPIC_API_KEY=...              # Claude/OpenCode Anthropic provider
-export ANTHROPIC_BASE_URL=http://123.129.219.111:3000/
+export ANTHROPIC_BASE_URL=https://your-anthropic-compatible-endpoint/
 
-/vepfs-mlp2/c20250602/500050/lh/xqf/miniconda3/envs/df-agent/bin/python \
+python \
   -m dataflow_evolver.main \
   --config configs/default.yaml \
   --task "Clean and transform the supplied raw data into high-quality SFT records." \
@@ -75,8 +121,8 @@ For OpenCode, add:
 
 ```bash
 export AGENT_BACKEND=opencode
-export OPENCODE_BIN=/vepfs-mlp2/c20250602/500050/lh/xqf/.npm-global/bin/opencode
-export OPENCODE_MODEL=anthropic/claude-opus-4-8
+export OPENCODE_BIN=opencode
+export OPENCODE_MODEL=anthropic/<model-name>
 # Optional provider-specific reasoning variant:
 export OPENCODE_VARIANT=max
 ```

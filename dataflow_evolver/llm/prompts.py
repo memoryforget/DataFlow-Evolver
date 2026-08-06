@@ -196,6 +196,38 @@ def _parent_quality_block(review: ReviewResult) -> str:
         f"全量硬指标：重复率 {review.dup_rate:.2f} | 空值率 {review.null_rate:.2f} | "
         f"可解析率 {review.parse_valid_rate:.2f} | 污染率 {review.contamination_rate:.2f}",
     ]
+    dataset_quality = review.dataset_quality
+    if dataset_quality.enabled:
+        if dataset_quality.status == "ok" and dataset_quality.mmd is not None:
+            delta = (
+                f" | 相比父节点 ΔMMD {dataset_quality.delta_mmd_vs_parent:+.6f}"
+                if dataset_quality.delta_mmd_vs_parent is not None
+                else ""
+            )
+            lines.append(
+                f"Dataset-level DAS：MMD {dataset_quality.mmd:.6f} | "
+                f"DAS {dataset_quality.das:.6f}{delta} | "
+                f"候选采样 {dataset_quality.candidate_sample_size} | "
+                f"代理集 {dataset_quality.proxy_name}"
+            )
+            terms = dataset_quality.kernel_terms
+            if terms:
+                lines.append(
+                    "MMD 核项：候选内部相似度 "
+                    f"{terms.get('candidate_internal', 0.0):.6f} | "
+                    f"代理内部相似度 {terms.get('proxy_internal', 0.0):.6f} | "
+                    f"候选-代理交叉相似度 {terms.get('cross', 0.0):.6f}"
+                )
+            lines.append(
+                "DAS=-MMD，MMD 越低越好；负的 ΔMMD 表示本轮分布更接近高质量代理集。"
+                "只把它作为分布反馈，不能以牺牲答案正确性、schema 或去重质量为代价。"
+            )
+        else:
+            lines.append(
+                f"Dataset-level DAS：状态 {dataset_quality.status}；"
+                f"原因：{dataset_quality.error or '未知'}。"
+                "请优先保证输出至少含足够数量且字段可编码的有效记录。"
+            )
     if review.failure_signals:
         lines.append("失败信号：")
         lines.extend(
