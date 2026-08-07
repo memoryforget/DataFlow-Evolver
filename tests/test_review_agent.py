@@ -1,4 +1,4 @@
-"""Review ReviewAgent 升级单测：五维复合分、硬指标惩罚、随机蓄水池采样。"""
+"""ReviewAgent 单测：四维样本复合分、硬指标惩罚、随机蓄水池采样。"""
 import json
 import sys
 from pathlib import Path
@@ -14,7 +14,7 @@ from dataflow_evolver.agents.review_agent import (
     _sample_jsonl,
     _scan_hard_metrics,
 )
-from dataflow_evolver.core.schemas import TaskProfile
+from dataflow_evolver.core.schemas import TaskSpec
 from dataflow_evolver.llm.prompts import FAILURE_SIGNALS, build_review_prompt
 from dataflow_evolver.llm.serving import LLMServingABC
 
@@ -42,7 +42,6 @@ def test_composite_uses_fixed_default_weights():
         "correctness_score": 1.0,
         "relevance_score": 1.0,
         "difficulty_score": 1.0,
-        "diversity_score": 1.0,
         "schema_score": 1.0,
     }
     r = agent.parse(raw)
@@ -50,22 +49,22 @@ def test_composite_uses_fixed_default_weights():
     assert r.llm_composite == pytest.approx(1.0)
     # 单独验证加权
     raw2 = {"correctness_score": 1.0, "relevance_score": 0, "difficulty_score": 0,
-            "diversity_score": 0, "schema_score": 0}
+            "schema_score": 0}
     assert agent.parse(raw2).llm_composite == pytest.approx(DEFAULT_REVIEW_WEIGHTS["correctness"])
 
 
 def test_composite_custom_weights():
     agent = _agent(weights={"correctness": 0.5, "relevance": 0.5, "difficulty": 0.0,
-                            "diversity": 0.0, "schema": 0.0})
+                            "schema": 0.0})
     raw = {"correctness_score": 1.0, "relevance_score": 0.0, "difficulty_score": 1.0,
-           "diversity_score": 1.0, "schema_score": 1.0}
+           "schema_score": 1.0}
     assert agent.parse(raw).llm_composite == pytest.approx(0.5)
 
 
 def test_clip_out_of_range_scores():
     agent = _agent()
     r = agent.parse({"correctness_score": 5, "relevance_score": -3, "difficulty_score": 0.5,
-                     "diversity_score": 0.5, "schema_score": 0.5})
+                     "schema_score": 0.5})
     assert r.correctness_score == 1.0 and r.relevance_score == 0.0
 
 
@@ -158,11 +157,11 @@ def test_apply_hard_metrics_review_score(tmp_path):
         '{"instruction":"q1","answer":"a1"}\n'
         '{"instruction":"q2","answer":"a2"}\n', encoding="utf-8",
     )
-    profile = TaskProfile("t", {"instruction": "str", "answer": "str"}, [])
+    task = TaskSpec("t", {"instruction": "str", "answer": "str"}, [])
     agent = _agent()
     r = agent.parse({"correctness_score": 0.8, "relevance_score": 0.8, "difficulty_score": 0.8,
-                     "diversity_score": 0.8, "schema_score": 0.8})
-    agent.apply_hard_metrics(r, str(ds), profile)
+                     "schema_score": 0.8})
+    agent.apply_hard_metrics(r, str(ds), task)
     assert r.dup_rate == 0.0 and r.null_rate == 0.0 and r.parse_valid_rate == 1.0
     assert r.review_score == pytest.approx(r.llm_composite)
     assert r.review_score == pytest.approx(0.8)
@@ -175,11 +174,11 @@ def test_review_score_penalized_by_dup_and_null(tmp_path):
         '{"instruction":"a","answer":"x"}\n'   # 重复
         '{"instruction":"b","answer":""}\n', encoding="utf-8",
     )
-    profile = TaskProfile("t", {"instruction": "str", "answer": "str"}, [])
+    task = TaskSpec("t", {"instruction": "str", "answer": "str"}, [])
     agent = _agent()
     r = agent.parse({"correctness_score": 1.0, "relevance_score": 1.0, "difficulty_score": 1.0,
-                     "diversity_score": 1.0, "schema_score": 1.0})
-    agent.apply_hard_metrics(r, str(ds), profile)
+                     "schema_score": 1.0})
+    agent.apply_hard_metrics(r, str(ds), task)
     expected = r.llm_composite * (1 - r.dup_rate) * (1 - r.null_rate) * r.parse_valid_rate
     assert r.review_score == pytest.approx(expected)
     assert r.review_score < r.llm_composite   # 有惩罚
@@ -188,11 +187,11 @@ def test_review_score_penalized_by_dup_and_null(tmp_path):
 def test_empty_dataset_review_score_zero(tmp_path):
     ds = tmp_path / "empty.jsonl"
     ds.write_text("", encoding="utf-8")
-    profile = TaskProfile("t", {"instruction": "str"}, [])
+    task = TaskSpec("t", {"instruction": "str"}, [])
     agent = _agent()
     r = agent.parse({"correctness_score": 1.0, "relevance_score": 1.0, "difficulty_score": 1.0,
-                     "diversity_score": 1.0, "schema_score": 1.0})
-    agent.apply_hard_metrics(r, str(ds), profile)
+                     "schema_score": 1.0})
+    agent.apply_hard_metrics(r, str(ds), task)
     assert r.review_score == 0.0
 
 
@@ -231,11 +230,11 @@ def test_reservoir_not_prefix_biased(tmp_path):
 def test_review_end_to_end_review_score_exposed(tmp_path):
     ds = tmp_path / "d.jsonl"
     ds.write_text('{"instruction":"q","answer":"a"}\n', encoding="utf-8")
-    profile = TaskProfile("t", {"instruction": "str", "answer": "str"}, [])
+    task = TaskSpec("t", {"instruction": "str", "answer": "str"}, [])
     resp = ('{"correctness_score":0.9,"relevance_score":0.8,"difficulty_score":0.7,'
-            '"diversity_score":0.6,"schema_score":1.0,"issues":[]}')
+            '"schema_score":1.0,"issues":[]}')
     agent = ReviewAgent(StubServing([resp]), seed=0)
-    r = agent.review(str(ds), profile)
+    r = agent.review(str(ds), task)
     assert r.passed is True
     assert 0.0 < r.review_score <= 1.0
     assert r.review_score == pytest.approx(r.llm_composite)   # 单行、无重复、字段齐 → 无惩罚
@@ -258,7 +257,7 @@ def test_parse_keeps_signals_separate_from_issues():
     agent = _agent()
     r = agent.parse({
         "correctness_score": 0.8, "relevance_score": 0.8, "difficulty_score": 0.8,
-        "diversity_score": 0.8, "schema_score": 0.8,
+        "schema_score": 0.8,
         "failure_signals": ["F3", "f5", "bogus"],
         "issues": ["答案与推理不一致"],
     })
@@ -266,7 +265,7 @@ def test_parse_keeps_signals_separate_from_issues():
     assert r.issues == ["答案与推理不一致"]                  # 未被信号污染
     assert not any(s.startswith("[F") for s in r.issues)
     assert FAILURE_SIGNALS["F3"] not in "".join(r.issues)
-    # 打分不受影响（仍是五维加权）
+    # 打分不受影响（仍是四维加权）
     assert r.llm_composite == pytest.approx(0.8)
 
 
@@ -274,15 +273,17 @@ def test_parse_no_signals_leaves_issues_untouched():
     agent = _agent()
     r = agent.parse({
         "correctness_score": 1.0, "relevance_score": 1.0, "difficulty_score": 1.0,
-        "diversity_score": 1.0, "schema_score": 1.0, "issues": [],
+        "schema_score": 1.0, "issues": [],
     })
     assert r.failure_signals == []
     assert r.issues == []
 
 
 def test_review_prompt_lists_all_signals():
-    profile = TaskProfile("t", {"instruction": "str"}, ["q1"])
-    prompt = build_review_prompt(profile, '{"instruction":"x"}')
+    task = TaskSpec("t", {"instruction": "str"}, ["q1"])
+    prompt = build_review_prompt(task, '{"instruction":"x"}')
     for sid in FAILURE_SIGNALS:
         assert sid in prompt
     assert "failure_signals" in prompt
+    assert "diversity_score" not in prompt
+    assert "dataset embedding" in prompt

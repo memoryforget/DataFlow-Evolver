@@ -1,8 +1,8 @@
 """Build and refine DataFlow pipelines from direct ReviewAgent feedback.
 
 它不直接产出文本，而是通过配置的 AgentRuntime 启动无头编码 Agent，让 Agent 借助 MCP 算子发现、
-源码阅读和 dataflow-dev 技能把完整可运行的 DataFlow 流水线写到节点 workspace 并自测通过，
-然后框架读取生成的 pipeline.py + decision.json 组装 PipelineConfig。
+源码阅读和 dataflow-dev 技能把完整可运行的 DataFlow 流水线写到 iteration workspace；
+然后框架读取 pipeline.py + decision.json，并负责确定性的 artifact、compile 与执行检查。
 
 注意：PipelineAgent 不继承 AgentABC（那是非-SDK 辅助 Agent 的基类）。
 """
@@ -17,7 +17,7 @@ from dataflow_evolver.core.input_corpus import InputCorpus
 from dataflow_evolver.core.schemas import (
     PipelineConfig,
     ReviewResult,
-    TaskProfile,
+    TaskSpec,
 )
 from dataflow_evolver.llm.agent_runtime import AgentRuntime, build_agent_runtime
 from dataflow_evolver.llm.agent_sdk import AgentInfraError
@@ -36,94 +36,104 @@ class PipelineAgent:
     def __init__(
         self,
         agent_cfg: Config,
-        agent_root: str,
+        workspace_dir: str,
         corpus: InputCorpus,
         llm_block: str = "",
-        target_samples: int = 0,
         runtime: AgentRuntime | None = None,
     ) -> None:
         self.agent_cfg = agent_cfg
-        self.agent_root = Path(agent_root).resolve()
+        self.workspace_dir = Path(workspace_dir).resolve()
         self.corpus = corpus
         self.pipeline_filename = agent_cfg.get("pipeline_filename", "pipeline.py")
         self.llm_block = llm_block
-        self.target_samples = target_samples
         self.runtime = runtime or build_agent_runtime(agent_cfg)
         self.logger = get_logger(f"agents.{self.name}")
 
     # ---- Initial candidate ----
     def generate_initial(
         self,
-        profile: TaskProfile,
-        node_dir_name: str,
-        reference_code: str | None = None,
-        instruction: str | None = None,
+        task: TaskSpec,
+        iteration_dir: Path,
     ) -> PipelineConfig | None:
         """Build the first pipeline over the fixed raw corpus."""
-        node_dir_abs = self.agent_root / node_dir_name
-        node_dir_abs.mkdir(parents=True, exist_ok=True)
+        iteration_dir = iteration_dir.resolve()
+        iteration_dir.mkdir(parents=True, exist_ok=True)
         prompt = build_pipeline_prompt(
-            profile=profile,
+            task=task,
             corpus=self.corpus,
-            node_dir=node_dir_name,
+            iteration_dir=str(iteration_dir),
             llm_block=self.llm_block,
-            target_samples=self.target_samples,
-            recommended_categories=_recommend_categories(profile.task_description),
+            recommended_categories=_recommend_categories(task.task_description),
             is_init=True,
-            init_reference_code=reference_code,
-            init_instruction=instruction,
         )
-        return self._run_and_assemble(prompt, node_dir_name, phase="generate_init")
+        return self._run_and_assemble(prompt, iteration_dir, phase="generate_initial")
 
     # ---- Next review-guided candidate ----
     def generate(
         self,
-        profile: TaskProfile,
-        node_dir_name: str,
+        task: TaskSpec,
+        iteration_dir: Path,
         parent_code: str | None = None,
         parent_rationale: str | None = None,
         parent_review: ReviewResult | None = None,
+        evolution_history: list[dict[str, Any]] | None = None,
     ) -> PipelineConfig | None:
-        """Build the next pipeline from previous code and its ReviewResult."""
-        node_dir_abs = self.agent_root / node_dir_name
-        node_dir_abs.mkdir(parents=True, exist_ok=True)
+        """Challenge the incumbent using its review and compact attempt history."""
+        iteration_dir = iteration_dir.resolve()
+        iteration_dir.mkdir(parents=True, exist_ok=True)
         # 预调用推荐引擎，把结果直接注入 prompt 强制引导算子选择
-        recommended = _recommend_categories(profile.task_description)
+        recommended = _recommend_categories(task.task_description)
         prompt = build_pipeline_prompt(
-            profile=profile,
+            task=task,
             corpus=self.corpus,
-            node_dir=node_dir_name,
+            iteration_dir=str(iteration_dir),
             llm_block=self.llm_block,
             parent_code=parent_code,
-            target_samples=self.target_samples,
             recommended_categories=recommended,
             parent_rationale=parent_rationale,
             parent_review=parent_review,
+            evolution_history=evolution_history,
         )
-        return self._run_and_assemble(prompt, node_dir_name)
+        return self._run_and_assemble(prompt, iteration_dir)
 
     # ---- 自修正（执行崩溃后重试）----
-    def self_correct(self, node_dir_name: str, traceback: str) -> PipelineConfig | None:
-        prompt = build_selfcorrect_prompt(node_dir_name, traceback)
+    def self_correct(
+        self,
+        iteration_dir: Path,
+        traceback: str,
+        diagnostics: str = "",
+        failure_stage: str = "execution",
+    ) -> PipelineConfig | None:
+        iteration_dir = iteration_dir.resolve()
+        prompt = build_selfcorrect_prompt(
+            str(iteration_dir),
+            traceback,
+            diagnostics,
+            failure_stage=failure_stage,
+        )
         return self._run_and_assemble(
-            prompt, node_dir_name, warn_stale_decision=True, phase="self_correct_exec"
+            prompt,
+            iteration_dir,
+            warn_stale_decision=True,
+            phase=f"repair_{failure_stage}",
         )
 
     # ---- 内部：跑 SDK + 读产物 ----
     def _run_and_assemble(
         self,
         prompt: str,
-        node_dir_name: str,
+        iteration_dir: Path,
         warn_stale_decision: bool = False,
         phase: str = "generate",
     ) -> PipelineConfig | None:
-        decision_path = self.agent_root / node_dir_name / "decision.json"
+        iteration_dir = iteration_dir.resolve()
+        decision_path = iteration_dir / "decision.json"
         fp_before = _fingerprint(decision_path) if warn_stale_decision else None
         result = self.runtime.run(
             prompt,
-            cwd=str(self.agent_root),
+            cwd=str(self.workspace_dir),
             agent_cfg=self.agent_cfg,
-            tool_log_dir=str(self.agent_root / node_dir_name),
+            tool_log_dir=str(iteration_dir),
             phase=phase,
         )
         if not result.success:
@@ -134,8 +144,7 @@ class PipelineAgent:
             )
             raise AgentInfraError(result.error or "Agent runtime 运行失败", retryable=result.retryable)
 
-        node_dir_abs = self.agent_root / node_dir_name
-        pipeline_path = node_dir_abs / self.pipeline_filename
+        pipeline_path = iteration_dir / self.pipeline_filename
         if not pipeline_path.exists():
             self.logger.error("未在 %s 找到生成的流水线文件，视为扩展失败。", pipeline_path)
             return None

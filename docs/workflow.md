@@ -1,153 +1,97 @@
-# Pipeline Review Workflow
+# Pipeline review workflow
 
-The framework uses the following pipeline evolution workflow:
+The framework performs an observable best-so-far optimization loop:
 
 ```text
 fixed raw data
-    -> PipelineAgent writes pipeline.py
-    -> execute pipeline
-    -> ReviewAgent scores output data
-         - sample-level: sampled LLM judge
-         - full-file: schema/duplicate/null/contamination metrics
-         - dataset-level (optional): proxy-set DAS/MMD
-    -> inject the complete structured ReviewResult into the next PipelineAgent prompt
-    -> repeat until max_iterations
+  -> Pipeline Agent challenges the current incumbent
+  -> deterministic artifact validation
+  -> framework-owned compile preflight
+  -> formal execution
+  -> Review Agent evaluates the candidate dataset
+  -> accept only if passed/review_score rank improves
+  -> compact decision outcome enters history; accepted pipeline becomes incumbent
+  -> repeat
 ```
 
-It does **not** run RecipeAgent, external-data/data-discovery MCP, tree search, downstream
-training, or benchmark evaluation. Training and evaluation are
-manual follow-up steps after the review loop finishes.
+## Iterations and selection
 
-## Inputs and outputs
+- `loop.max_iterations` is the total number of generated pipeline iterations.
+- Each iteration lives at `workspace/runs/<run_name>/iteration_XXX/`.
+- Every challenger is generated from the best-so-far incumbent, never from a rejected
+  pipeline. Rejected decision summaries and issues remain visible so the Agent avoids
+  repeating failed strategies without receiving old pipeline code.
+- Acceptance first prefers candidates that pass review thresholds, then compares
+  `review_score`. The final dataset is the last accepted incumbent, not necessarily the
+  final iteration's dataset.
+- `manifest.json` and `iterations.jsonl` live beside the iteration directories.
 
-- `project.input_dir` is required and must contain raw `jsonl/json/csv/parquet` data.
-- `task.target_schema` is required and is never inferred at runtime.
-- `loop.max_iterations` is the total number of candidates, including `node_0`.
-- Every run needs a fresh `project.run_name`; a non-empty existing run directory is
-  rejected to prevent stale files from contaminating the result.
-- `<workspace>/<run_name>_iterations.jsonl` records every iteration.
-- `<workspace>/<run_name>_best.json` points to the selected pipeline and dataset.
+## Execution repair
 
-Selection prefers candidates that pass ReviewAgent's thresholds, then chooses the
-highest `review_score`. Review failures do not trigger an opaque inner optimization
-loop: their structured metrics, failure signals, and issues become the next
-PipelineAgent prompt directly. Runtime crashes may receive the small number of
-code-repair retries configured by `loop.execution_retries`.
+Every generated or repaired pipeline is checked in a fixed order:
 
-## Dataset-level DAS/MMD review
+1. Parse `pipeline.py` and require `compile -> DF_COMPILE_ONLY guard -> forward`.
+2. Run `DF_COMPILE_ONLY=1 pipeline.py` with `loop.compile_timeout_sec`.
+3. Only after compile succeeds, run the full pipeline with `loop.execution_timeout_sec`.
+4. Validate that the final DataFlow JSONL exists and is non-empty.
 
-`review.dataset_quality` enables a deterministic distribution-level evaluator modeled on
-Data-Preparation-Bench. It maps both candidate and proxy rows to the same two-turn
-`user`/`assistant` conversation, embeds a fixed-size sample, and computes biased RBF-MMD:
+The Agent writes or repairs artifacts but never runs the generated pipeline itself. A failed
+check is classified as `artifact_validation`, `compile`, `execution`, or `output_validation`.
+One generated pipeline attempt is followed by at most
+`loop.execution_repairs` additional repair calls. Each repair prompt receives:
+
+- the failure stage;
+- the execution traceback;
+- every fresh JSONL artifact's size and non-empty row count;
+- the first valid row's field names;
+- JSON parse errors.
+
+The framework reruns the complete fixed check sequence after each repair. If the highest
+DataFlow step is empty, execution fails; the framework never substitutes a non-empty
+intermediate step as the final dataset.
+
+## Review signals
+
+Review combines three layers:
+
+1. A sampled LLM assessment of per-sample correctness, relevance, difficulty, and schema.
+2. Full-file deterministic metrics for parsing, required fields, nulls, duplicates, and
+   optional decontamination.
+3. Optional dataset-level embedding evidence: DAS/MMD against a fixed local proxy,
+   cosine Vendi Score, and a nearest-neighbour cosine profile.
+
+DAS embeds deterministic samples from the candidate and proxy with the same two-turn
+conversation format, then computes biased RBF-MMD. The candidate embeddings are reused
+for threshold-free, codebook-free semantic diversity: cosine Vendi Score estimates the
+effective number of distinct samples, while nearest-neighbour cosine quantiles expose
+local concentration without selecting a SemDeDup cutoff. The sample size and seed are
+configurable; `require_full_sample: true` reports insufficient data instead of comparing
+different sample sizes. Embeddings are cached in `workspace/cache/das/`.
+
+For selection, the bounded RBF-MMD is mapped to `clip(1-MMD/sqrt(2))`, normalized Vendi is
+already in `[0,1]`, and NN-cosine p95 is mapped to `clip((1-p95)/2)`. Their configurable
+weighted mean contributes 25% of `review_score` by default; the four sampled LLM dimensions
+contribute 75%, after which full-file penalties are applied. Raw metrics remain in review
+evidence for audit.
+
+The next Pipeline Agent receives only the four sampled dimensions, duplicate/null/parse/
+contamination rates, delta MMD, normalized Vendi and its delta, NN-cosine p95 and its delta,
+and concrete issues. It does not receive MMD kernel terms or the remaining cosine telemetry.
+
+## Agent backends and state
+
+Both Claude Agent SDK and OpenCode receive the same prompt and must produce the same
+artifact contract. `workspace/` is their single project root: tracked `.claude/` and
+`dataflow/` directories provide static resources, while runtime state lives under the
+current run and iteration:
 
 ```text
-DAS(candidate) = -MMD(candidate_embeddings, proxy_embeddings)
+iteration_XXX/sessions/claude/
+iteration_XXX/sessions/opencode/
+iteration_XXX/sessions/pipeline/
 ```
 
-The default math proxy contract is ODA-Math-460k (`question` / `response`) and the
-candidate contract is `instruction` / `output`. The sample size is configurable and
-defaults to 5000 with seed 42. `require_full_sample: true` deliberately reports
-`insufficient_samples` instead of comparing nodes at different sample sizes.
-
-Embeddings are L2-normalized before MMD, and embedding batches are cached by their full
-conversation content plus model/runtime identity. In particular, the fixed proxy is not
-re-embedded on every iteration. Proxy records themselves are never included in the
-PipelineAgent prompt: the next iteration receives only MMD/DAS, delta versus its parent,
-kernel terms, counts, and error status.
-
-Raw DAS is not added to `review_score`, because DAS is non-positive and its scale depends
-on the embedding/kernel setup whereas the sampled LLM score is in `[0, 1]`. It is a
-separate feedback signal; `review_score` and its existing selection semantics remain
-backward compatible.
-
-Start a Qwen3-Embedding-8B OpenAI-compatible chat embedding endpoint, then enable DAS:
-
-```bash
-export DF_DAS_ENABLED=true
-export DF_DAS_SAMPLE_SIZE=5000
-export DF_DAS_PROXY_SOURCE=local
-export DF_DAS_PROXY_PATH=$PWD/data/ODA-Math-460k
-export DF_DAS_PROXY_NAME=
-export DF_DAS_EMBEDDING_MODEL=$PWD/model/Qwen3-Embedding-8B
-export DF_DAS_EMBEDDING_URL=http://127.0.0.1:8000/v1
-export DF_DAS_EMBEDDING_CONCURRENCY=128
-```
-
-For a pre-downloaded JSONL proxy, set `DF_DAS_PROXY_SOURCE=local` and point
-`DF_DAS_PROXY_PATH` to the file. The configured proxy field names still apply.
-
-## PipelineAgent backends
-
-`agent.backend` selects the autonomous coding runtime:
-
-- `claude` uses `claude-agent-sdk` and remains the default.
-- `opencode` invokes `opencode run --format json` and parses its event stream.
-
-The switch only changes the agent harness. Both implementations receive the same
-pipeline prompt and must write `pipeline.py` plus `decision.json`; execution and review
-remain unchanged. Both expose the same `dataflow-operators` MCP. OpenCode starts it as a
-local stdio MCP subprocess, while Claude loads it in-process.
-
-Agent state is isolated per node and stored centrally below
-`workspace/agent_sessions/<run_name>/node_N/`. Claude writes JSONL sessions in the
-`claude/.claude/projects/` subtree, while OpenCode writes its SQLite database in the
-`opencode/.local/share/opencode/` subtree. The framework also writes
-`agent_sessions.jsonl` and cumulative `agent_token_usage.json` in the node artifact
-directory. Set `DF_AGENT_SESSION_ROOT` to select another central root; the relative
-run/node path and backend name are retained below it.
-
-Generated-pipeline LLM calls are accounted separately. The execution subprocess installs
-a process-local `requests` response hook and appends metadata plus exact API usage to
-`pipeline/pipeline_llm_calls.jsonl` under the same central node directory. It never records
-prompt or response content. After every execution—including failures and self-correction
-retries—the wrapper refreshes `pipeline_llm_token_usage.json` and the namespaced
-`token_usage.json` in the node artifact directory. Calls whose endpoint omits usage remain
-visible as `missing_usage` but are not added as estimated exact tokens.
-
-OpenCode discovers the existing `.claude/skills/dataflow-dev/` directory through its
-Claude-compatible skill discovery, so a duplicated `.opencode/skills/` copy is unnecessary.
-The inline OpenCode permissions allow local code inspection, editing and compile tests but
-deny web search, web fetch, questions and subagents.
-
-## Launch
-
-The configured `agent_root` must already contain the vendored `dataflow/` source and
-`.claude/skills/dataflow-dev/`, as in the project's prepared `workspace/_agent_root`.
-
-```bash
-cd /path/to/DataFlow-Evolver
-
-export RAW_DATA_DIR=/absolute/path/to/raw_data
-export RAW_DATA_ENTRY=train.jsonl        # optional if the directory has one clear entry
-export DF_RUN_NAME=review_only_001
-export DF_MAX_ITERATIONS=4
-export DF_API_URL=https://your-api-endpoint/v1
-export DF_API_KEY=...                     # ReviewAgent and pipeline operators
-export ANTHROPIC_API_KEY=...              # Claude/OpenCode Anthropic provider
-export ANTHROPIC_BASE_URL=https://your-anthropic-compatible-endpoint/
-
-python \
-  -m dataflow_evolver.main \
-  --config configs/default.yaml \
-  --task "Clean and transform the supplied raw data into high-quality SFT records." \
-  --log-level INFO
-```
-
-For OpenCode, add:
-
-```bash
-export AGENT_BACKEND=opencode
-export OPENCODE_BIN=opencode
-export OPENCODE_MODEL=anthropic/<model-name>
-# Optional provider-specific reasoning variant:
-export OPENCODE_VARIANT=max
-```
-
-`OPENCODE_API_KEY_ENV` defaults to `ANTHROPIC_API_KEY`, and `OPENCODE_BASE_URL`
-defaults to `ANTHROPIC_BASE_URL` for the Anthropic provider. Credentials are referenced
-by environment-variable name and are not embedded in inline configuration or command-line
-arguments.
-
-After the loop, inspect `<workspace>/<run_name>_best.json` and manually pass
-`best.dataset_path` to the desired training/evaluation command. Those results are
-outside the automated feedback loop.
+Claude uses the iteration-local directory directly as `CLAUDE_CONFIG_DIR`. OpenCode uses
+iteration-local XDG config, cache, and data directories. Native session records are used
+for Agent token accounting. Generated-pipeline API usage is captured independently and
+stored without prompt/response bodies.

@@ -45,8 +45,8 @@ def test_failed_attempt_tool_trace_is_not_lost(tmp_path, monkeypatch):
     assert result.success
     rows = [json.loads(line) for line in (tmp_path / "agent_tools.jsonl").read_text().splitlines()]
     assert [row["phase"] for row in rows] == ["generate", "generate#retry1"]
-    expected_root = (tmp_path.parent / "agent_sessions/claude").resolve()
-    assert captured_session_envs[0]["HOME"] == str(expected_root)
-    assert captured_session_envs[0]["CLAUDE_CONFIG_DIR"] == str(expected_root / ".claude")
+    expected_root = (tmp_path / "sessions/claude").resolve()
+    assert captured_session_envs[0]["HOME"] == str(expected_root / "home")
+    assert captured_session_envs[0]["CLAUDE_CONFIG_DIR"] == str(expected_root)
     assert (tmp_path / "agent_sessions.jsonl").is_file()
     assert (tmp_path / "agent_token_usage.json").is_file()

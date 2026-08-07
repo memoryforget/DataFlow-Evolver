@@ -4,10 +4,10 @@ from pathlib import Path
 import pytest
 
 from dataflow_evolver.core import input_corpus
-from dataflow_evolver.core.schemas import TaskProfile
+from dataflow_evolver.core.schemas import TaskSpec
 from dataflow_evolver.llm.prompts import build_pipeline_prompt
 
-PROFILE = TaskProfile("task", {"instruction": "str", "output": "str"}, [])
+TASK = TaskSpec("task", {"instruction": "str", "output": "str"}, [])
 
 
 def _write_jsonl(path: Path, rows) -> Path:
@@ -108,7 +108,7 @@ def test_row_count_cap(tmp_path, monkeypatch):
 def test_pipeline_prompt_uses_fixed_corpus_and_forbids_external_data(tmp_path):
     source = _write_jsonl(tmp_path / "raw" / "data.jsonl", [{"text": "photosynthesis"}])
     corpus = input_corpus.discover(source.parent)
-    prompt = build_pipeline_prompt(PROFILE, corpus, "run/node_0")
+    prompt = build_pipeline_prompt(TASK, corpus, str(tmp_path / "iteration_001"))
     assert str(source) in prompt
     assert "fixed raw" in prompt or "固定语料" in prompt
     assert "不允许联网拉取外部数据" in prompt

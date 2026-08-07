@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -64,7 +65,7 @@ def test_normalize_usage_supports_openai_and_anthropic_fields():
 
 def test_missing_usage_is_recorded_without_estimation(monkeypatch):
     monkeypatch.setenv("DF_PIPELINE_LLM_EXECUTION_ID", "exec-1")
-    monkeypatch.setenv("DF_PIPELINE_LLM_NODE", "run/node_0")
+    monkeypatch.setenv("DF_PIPELINE_LLM_ITERATION", "iteration_001")
     monkeypatch.setenv("DF_PIPELINE_LLM_ATTEMPT", "2")
     event = build_usage_event(
         _request(
@@ -128,8 +129,8 @@ def test_aggregate_counts_successful_retries_and_missing_usage(tmp_path):
     assert report["execution_ids"] == ["exec-1", "exec-2"]
 
 
-def _write_http_pipeline(node: Path) -> None:
-    node.mkdir(parents=True, exist_ok=True)
+def _write_http_pipeline(iteration_dir: Path) -> None:
+    iteration_dir.mkdir(parents=True, exist_ok=True)
     code = r'''
 import json
 import pathlib
@@ -181,33 +182,46 @@ server.server_close()
 output = pathlib.Path(__file__).parent / "result_step1.jsonl"
 output.write_text('{"instruction":"q","output":"a"}\n', encoding="utf-8")
 '''
-    (node / "pipeline.py").write_text(code, encoding="utf-8")
+    wrapped = (
+        "import os\n"
+        "class Pipeline:\n"
+        "    def compile(self):\n"
+        "        return None\n"
+        "    def forward(self):\n"
+        f"{textwrap.indent(code, '        ')}\n"
+        "pipeline = Pipeline()\n"
+        "pipeline.compile()\n"
+        "if os.environ.get('DF_COMPILE_ONLY'):\n"
+        "    raise SystemExit(0)\n"
+        "pipeline.forward()\n"
+    )
+    (iteration_dir / "pipeline.py").write_text(wrapped, encoding="utf-8")
 
 
 def test_execution_wrapper_collects_real_requests_usage_and_accumulates(tmp_path):
-    agent_root = tmp_path / "workspace" / "_agent_root"
-    node = agent_root / "run_a" / "node_0"
-    _write_http_pipeline(node)
-    executor = SubprocessExecutionWrapper(str(agent_root), timeout_sec=30)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    iteration = workspace / "runs/run_a/iteration_001"
+    _write_http_pipeline(iteration)
+    executor = SubprocessExecutionWrapper(str(workspace), timeout_sec=30)
 
-    first = executor.run(CFG, "run_a/node_0")
-    second = executor.run(CFG, "run_a/node_0")
+    first = executor.run(CFG, iteration)
+    second = executor.run(CFG, iteration)
 
     assert first.success, first.traceback
     assert second.success, second.traceback
     events_path = (
-        tmp_path
-        / "workspace/agent_sessions/run_a/node_0/pipeline/pipeline_llm_calls.jsonl"
+        iteration / "sessions/pipeline/pipeline_llm_calls.jsonl"
     )
     events = [json.loads(line) for line in events_path.read_text().splitlines()]
     assert [event["attempt"] for event in events] == [1, 2]
     assert all(event["usage_status"] == "exact" for event in events)
     assert all("private" not in json.dumps(event) for event in events)
 
-    report = json.loads((node / "pipeline_llm_token_usage.json").read_text())
+    report = json.loads((iteration / "pipeline_llm_token_usage.json").read_text())
     assert report["request_count"] == 2
     assert report["tokens"]["input_tokens"] == 240
     assert report["tokens"]["output_tokens"] == 60
     assert report["tokens"]["total_tokens"] == 300
-    combined = json.loads((node / "token_usage.json").read_text())
+    combined = json.loads((iteration / "token_usage.json").read_text())
     assert combined["pipeline_llm"]["tokens"]["total_tokens"] == 300

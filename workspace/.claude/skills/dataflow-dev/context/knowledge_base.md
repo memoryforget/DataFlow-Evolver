@@ -347,7 +347,6 @@ serving = APILLMServing_request(
     key_name_of_api_key="DF_API_KEY",   # 环境变量名
     model_name="gpt-4o",
     temperature=0.0,
-    max_workers=200,      # 推荐：自建/代理 API 用 200+；官方 API 用 50-100
     max_retries=5,
     connect_timeout=10.0,
     read_timeout=120.0,
@@ -359,16 +358,6 @@ responses = serving.generate_from_input(
     json_schema=None   # 可选，结构化输出
 )
 ```
-
-**max_workers 选择指南**：
-
-| API 情况 | 推荐 max_workers |
-|---|---|
-| 官方 OpenAI / DeepSeek（有限速） | 50–100 |
-| 自建/代理 API（200-400 并发支持） | 200–300 |
-| 本地 vLLM（单机） | 50–100 |
-
-默认值 10 极大低估了 API 能力，务必根据实际情况调高。
 
 ### 6.3 Serving 生命周期
 

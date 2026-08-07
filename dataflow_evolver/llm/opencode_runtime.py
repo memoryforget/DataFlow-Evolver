@@ -56,7 +56,7 @@ def _operator_mcp(cwd: str, timeout_ms: int) -> dict[str, Any]:
         "command": [sys.executable, "-m", "dataflow_evolver.llm.mcp_stdio"],
         "enabled": True,
         "timeout": timeout_ms,
-        "environment": {"DF_AGENT_ROOT": cwd},
+        "environment": {"DF_WORKSPACE": cwd},
     }
 
 

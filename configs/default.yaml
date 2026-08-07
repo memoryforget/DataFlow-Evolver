@@ -1,15 +1,11 @@
 # Default workflow: fixed raw data -> PipelineAgent -> ReviewAgent feedback.
-# No RecipeAgent, external-data MCP, MCTS, Tier-2, training, or benchmark evaluation.
-
 project:
-  workspace_dir: ${DF_WORKSPACE:./workspace_review_only}
-  # Reuse the prepared DataFlow source and dataflow-dev skill in this directory.
-  agent_root: ${DF_AGENT_ROOT:./workspace/_agent_root}
+  workspace_dir: ${DF_WORKSPACE:./workspace}
   # Required. The loop refuses to fall back to from-scratch synthesis.
   input_dir: ${RAW_DATA_DIR:}
   input_entry: ${RAW_DATA_ENTRY:}
   # Use a fresh name for every run; existing non-empty run directories are rejected.
-  run_name: ${DF_RUN_NAME:review_only}
+  run_name: ${DF_RUN_NAME:run}
 
 task:
   # Fixed contract; the entry point never infers the output schema.
@@ -27,7 +23,9 @@ llm:
     api_url: ${DF_API_URL:}
     model_name: ${DF_REVIEW_MODEL:gpt-5.5}
     api_key: ${DF_API_KEY:}
-    max_workers: 100
+    # Shared default for generated-pipeline API operators; keep configurable to match
+    # the upstream service's rate limit.
+    max_workers: ${DF_API_MAX_WORKERS:10}
   pipeline_llm:
     generation:
       model_name: ${DF_PIPELINE_MODEL:gpt-4o}
@@ -38,9 +36,6 @@ llm:
 # same pipeline.py + decision.json artifacts.
 agent:
   backend: ${AGENT_BACKEND:claude}  # claude | opencode
-  # Empty means <agent_root parent>/agent_sessions/<run>/<node>/<backend>. If configured,
-  # the run/node relative path is retained below this root for isolated accounting.
-  session_root: ${DF_AGENT_SESSION_ROOT:}
   model: ${DF_AGENT_MODEL:claude-opus-4-8}
   # Claude-specific reasoning effort. OpenCode uses opencode.variant below.
   effort: ${DF_AGENT_EFFORT:max}
@@ -64,17 +59,14 @@ agent:
     max_steps: ${OPENCODE_MAX_STEPS:50}
     mcp_timeout_ms: ${OPENCODE_MCP_TIMEOUT_MS:30000}
 
-generation:
-  # 0 means: process the fixed raw corpus without imposing a synthetic sample target.
-  target_samples: ${DF_TARGET_SAMPLES:0}
-
 loop:
-  # Total number of candidates, including node_0.
+  # Total number of linear Pipeline -> Review iterations.
   max_iterations: ${DF_MAX_ITERATIONS:4}
+  # Deterministic framework-owned preflight; the Agent never executes pipeline.py itself.
+  compile_timeout_sec: ${DF_COMPILE_TIMEOUT_SEC:120}
   execution_timeout_sec: ${DF_EXECUTION_TIMEOUT_SEC:1200}
-  # Only runtime crashes get an immediate code-repair retry. Review feedback always
-  # advances to the next iteration, so the feedback loop remains directly observable.
-  execution_retries: 1
+  # Additional Agent repair calls after one generated pipeline fails to execute.
+  execution_repairs: ${DF_EXECUTION_REPAIRS:1}
   python_exe: ${DF_AGENT_PYTHON:}
 
 review:
@@ -85,21 +77,28 @@ review:
   null_threshold: 0.5
   hard_metrics: true
   weights:
-    correctness: 0.35
-    relevance: 0.20
+    correctness: 0.40
+    relevance: 0.25
     difficulty: 0.15
-    diversity: 0.15
-    schema: 0.15
+    schema: 0.20
   decontamination:
     reference_files: []
     ngram: 8
     max_rate: 0.01
   # Optional deterministic dataset-level review. It compares a fixed-size sample of
-  # each candidate with a high-quality proxy set using DAS = -RBF-MMD. DAS remains
-  # separate from the 0-1 LLM review_score; its structured evidence is fed directly
-  # to the next PipelineAgent prompt.
+  # each candidate with a high-quality proxy set using DAS = -RBF-MMD. Candidate
+  # embeddings are reused for threshold-free Vendi and nearest-neighbour cosine
+  # diversity metrics. All embedding evidence remains separate from the 0-1 LLM
+  # review_score and is fed directly to the next PipelineAgent prompt.
   dataset_quality:
-    enabled: ${DF_DAS_ENABLED:false}
+    enabled: ${DF_EMBEDDING_REVIEW_ENABLED:false}
+    # When enabled, review_score blends sample-level LLM quality with embedding quality,
+    # then applies full-file duplicate/null/parse/contamination penalties.
+    score_weight: ${DF_DATASET_QUALITY_SCORE_WEIGHT:0.25}
+    score_weights:
+      das: 0.40
+      vendi: 0.30
+      nearest_neighbor: 0.30
     sample_size: ${DF_DAS_SAMPLE_SIZE:5000}
     sample_seed: ${DF_DAS_SAMPLE_SEED:42}
     require_full_sample: true
@@ -127,7 +126,3 @@ review:
       max_retries: 3
       truncate_prompt_tokens: 40960
       truncation_side: right
-
-init:
-  reference_pipeline: ""
-  instruction: ""

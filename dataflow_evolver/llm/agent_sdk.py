@@ -70,7 +70,7 @@ _DEFAULT_SYSTEM_PROMPT_APPEND = (
     "- LLM operators: accept llm_serving in __init__, store as self.llm_serving\n"
     "- Add get_desc(lang='zh') staticmethod (zh/en)\n"
     "- Do NOT use @OPERATOR_REGISTRY.register() — custom ops skip registry\n"
-    "- Each operator in its own file under operators/ in the node workspace\n\n"
+    "- Each operator in its own file under operators/ in the iteration directory\n\n"
 
     "## Critical API Examples (Copy from operator_api_reference.md):\n"
     "```python\n"
@@ -107,17 +107,17 @@ _DEFAULT_SYSTEM_PROMPT_APPEND = (
     "- `from dataflow.pipeline import PipelineABC`\n"
     "- Operator instances as member vars (self.op_stepN) for compile() detection\n"
     "- forward(): self.op_stepN.run(storage=self.storage.step(), ...)\n"
-    "- Write pipeline.py + decision.json to the node directory\n"
+    "- Write pipeline.py + decision.json to the iteration directory\n"
     "- Self-contained with `if __name__ == '__main__':` entry\n\n"
 
-    "## Step 3: Compile-Test (MANDATORY)\n"
-    "After writing all files, verify via compile():\n"
+    "## Step 3: Framework Compile Contract (MANDATORY)\n"
+    "Write the main entry in this exact order:\n"
     "    pipeline = MyPipeline(...)\n"
     "    pipeline.compile()\n"
     "    if os.environ.get('DF_COMPILE_ONLY'): sys.exit(0)\n"
     "    pipeline.forward()\n"
-    "Run: DF_COMPILE_ONLY=1 python <node_dir>/pipeline.py\n"
-    "Fix any KeyError/ImportError/TypeError and re-run until compile passes.\n\n"
+    "Do NOT execute pipeline.py, compile-only checks, or smoke tests yourself. "
+    "The framework validates the artifact and runs compile preflight and formal execution after you return.\n\n"
 
     "## MCP Reference (Use for Implementation Patterns)\n"
     "The dataflow-operators MCP exposes existing reasoning/math operators with FULL SOURCE CODE.\n"
@@ -175,10 +175,10 @@ def _truncate_arg(value: Any, maxlen: int = 600) -> Any:
     return value
 
 
-def _record_tool_uses(node_dir: str | Path, uses: list[dict[str, Any]], phase: str) -> None:
+def _record_tool_uses(iteration_dir: str | Path, uses: list[dict[str, Any]], phase: str) -> None:
     if not uses:
         return
-    path = Path(node_dir) / "agent_tools.jsonl"
+    path = Path(iteration_dir) / "agent_tools.jsonl"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
@@ -196,12 +196,10 @@ def _record_tool_uses(node_dir: str | Path, uses: list[dict[str, Any]], phase: s
 
 
 def _agent_env(agent_cfg: Config) -> dict[str, str]:
-    """给 Agent 子进程叠加环境变量，并统一自检与正式执行所用的 Python。
+    """给 Agent 子进程叠加环境变量，并与框架执行器使用同一 Python 环境。
 
-    编码 Agent 用裸 `python` 跑 `DF_COMPILE_ONLY=1 python <node_dir>/pipeline.py` 自检，
-    而 SubprocessExecutionWrapper 正式执行用的是 sys.executable。二者若解析到不同环境，
-    自检会在依赖齐备的环境里通过、正式执行却因缺包崩溃（假绿灯，且 Agent 无从察觉）。
-    这里把两者统一到同一解释器，使自检结论对执行真正有效。
+    Agent 只写产物、不自行执行流水线；统一 PATH 仍保证其读取依赖元数据或运行普通开发工具时
+    看到的环境与框架随后执行 artifact/compile/full-run 检查时一致。
     返回值由具体 runtime 叠加到 ``os.environ``。
     """
     bin_dir = os.path.dirname(sys.executable)
@@ -233,7 +231,7 @@ def _build_options(
       不接受老式 thinking.enabled（budget）。这里显式指定 {"type":"adaptive"}，从协议层复刻实测
       可用的请求格式，从而不受环境里 CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1（会退化成 thinking.enabled
       → Bedrock 400）影响；即项目自带正确配置，不依赖全局/外部 env。配置 thinking: none 可关闭该显式指定。
-    - env：叠加 PATH，令 agent 自检用的裸 `python` 与正式执行的 sys.executable 一致（见 _agent_env）。
+    - env：叠加 PATH，使 Agent 开发环境与框架执行器使用的 sys.executable 一致（见 _agent_env）。
     SDK 鉴权（ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL）经环境变量传入，子进程默认继承 os.environ。
     """
     from claude_agent_sdk import ClaudeAgentOptions
@@ -256,6 +254,7 @@ def _build_options(
         system_prompt={"type": "preset", "preset": "claude_code", "append": append_text},
         permission_mode=agent_cfg.get("permission_mode", "bypassPermissions"),
         setting_sources=list(agent_cfg.get("setting_sources", ["project"])),
+        skills="all",
         max_turns=agent_cfg.get("max_turns", 50),
         mcp_servers=mcp_servers,
         resume=resume,
@@ -360,8 +359,8 @@ async def _run_with_timeout(prompt: str, options: Any, timeout: float) -> AgentR
 _RESUME_NUDGE = (
     "The previous run was interrupted by a transient API error. "
     "Continue from where you left off and finish the task: write a working "
-    "pipeline.py and decision.json into the target node directory, then self-test "
-    "with DF_COMPILE_ONLY=1 until it compiles."
+    "pipeline.py and decision.json into the target iteration directory. Do not execute "
+    "the pipeline; the framework owns artifact validation, compile preflight, and execution."
 )
 
 

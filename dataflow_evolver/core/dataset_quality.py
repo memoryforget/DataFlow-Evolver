@@ -1,9 +1,12 @@
-"""Dataset-level quality evaluation with proxy-set MMD/DAS.
+"""Dataset-level embedding evaluation with proxy-set MMD/DAS and diversity.
 
 The implementation follows Data-Preparation-Bench's DAS definition:
 ``DAS = -sqrt(max(0, biased_MMD_squared))`` with an RBF kernel.  Candidate
 records and proxy records are encoded as the same two-turn user/assistant
 conversation so the comparison is not confounded by field names.
+
+The candidate embeddings are also reused for two threshold-free, codebook-free
+diversity views: cosine-kernel Vendi Score and nearest-neighbour cosine statistics.
 """
 from __future__ import annotations
 
@@ -240,13 +243,19 @@ class DatasetQualityEvaluator:
             base.mmd = mmd
             base.das = -mmd
             base.kernel_terms = terms
+            base.embedding_diversity = compute_embedding_diversity(
+                candidate_batch.vectors
+            )
             logger.info(
-                "DAS 完成：proxy=%s candidate=%d proxy_samples=%d MMD=%.6f DAS=%.6f",
+                "Dataset embedding 完成：proxy=%s candidate=%d proxy_samples=%d "
+                "MMD=%.6f DAS=%.6f Vendi=%.3f NN-cos-mean=%.4f",
                 self.proxy_name,
                 len(candidate_batch.vectors),
                 len(proxy_batch.vectors),
                 mmd,
                 -mmd,
+                base.embedding_diversity.get("cosine_vendi_score", 0.0),
+                base.embedding_diversity.get("nearest_neighbor_cosine_mean", 0.0),
             )
             return base
         except Exception as exc:  # Evidence must survive service/data failures.
@@ -366,6 +375,56 @@ def compute_rbf_mmd(
         "cross": xy,
         "mmd_squared": mmd_squared,
     }
+
+
+def compute_embedding_diversity(embeddings: np.ndarray) -> dict[str, float]:
+    """Compute threshold-free semantic-diversity evidence from one embedding batch.
+
+    Vendi Score is the exponential entropy of the eigenvalues of the normalized
+    cosine Gram matrix.  It is an effective number of distinct samples: identical
+    vectors score 1, while orthogonal vectors score ``n``.  The nearest-neighbour
+    profile exposes concentration without choosing a SemDeDup cutoff in advance.
+    """
+    values = np.asarray(embeddings, dtype=np.float64)
+    if values.ndim != 2 or not len(values):
+        raise ValueError("多样性指标输入必须是非空二维 embedding 数组")
+    normalized = _l2_normalize(values)
+    cosine = normalized @ normalized.T
+    cosine = np.clip((cosine + cosine.T) * 0.5, -1.0, 1.0)
+
+    eigenvalues = np.linalg.eigvalsh(cosine)
+    eigenvalues = np.clip(eigenvalues, 0.0, None)
+    total = float(eigenvalues.sum())
+    if total <= 0.0:
+        raise ValueError("cosine Gram matrix 没有正特征值")
+    probabilities = eigenvalues / total
+    positive = probabilities[probabilities > np.finfo(np.float64).eps]
+    vendi = float(np.exp(-np.sum(positive * np.log(positive))))
+    sample_count = len(normalized)
+    vendi = min(max(vendi, 1.0), float(sample_count))
+
+    metrics = {
+        "cosine_vendi_score": vendi,
+        "cosine_vendi_ratio": vendi / sample_count,
+    }
+    if sample_count == 1:
+        return metrics
+
+    off_diagonal = cosine[~np.eye(sample_count, dtype=bool)]
+    nearest = cosine.copy()
+    np.fill_diagonal(nearest, -np.inf)
+    nearest = nearest.max(axis=1)
+    metrics.update(
+        {
+            "mean_pairwise_cosine": float(off_diagonal.mean()),
+            "nearest_neighbor_cosine_mean": float(nearest.mean()),
+            "nearest_neighbor_cosine_p50": float(np.quantile(nearest, 0.50)),
+            "nearest_neighbor_cosine_p90": float(np.quantile(nearest, 0.90)),
+            "nearest_neighbor_cosine_p95": float(np.quantile(nearest, 0.95)),
+            "nearest_neighbor_cosine_p99": float(np.quantile(nearest, 0.99)),
+        }
+    )
+    return metrics
 
 
 def _rbf_kernel(x: np.ndarray, y: np.ndarray, sigma: float) -> np.ndarray:

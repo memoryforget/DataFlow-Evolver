@@ -6,7 +6,7 @@ from typing import Any
 
 
 @dataclass
-class TaskProfile:
+class TaskSpec:
     task_description: str
     target_schema: dict[str, str]
     quality_criteria: list[str]
@@ -22,7 +22,7 @@ class PipelineConfig:
 
 @dataclass
 class DatasetQualityResult:
-    """Deterministic dataset-distribution evidence produced by DAS/MMD."""
+    """Deterministic embedding evidence for distribution fit and diversity."""
 
     enabled: bool = False
     status: str = "disabled"
@@ -45,12 +45,16 @@ class DatasetQualityResult:
     delta_mmd_vs_parent: float | None = None
     embedding_fail_rate: float = 0.0
     kernel_terms: dict[str, float] = field(default_factory=dict)
+    embedding_diversity: dict[str, float] = field(default_factory=dict)
+    delta_embedding_diversity_vs_parent: dict[str, float] = field(default_factory=dict)
+    embedding_quality_components: dict[str, float] = field(default_factory=dict)
+    embedding_quality_score: float | None = None
     error: str | None = None
 
 
 @dataclass
 class ReviewResult:
-    """LLM quality dimensions plus deterministic full-dataset metrics."""
+    """Sample-level LLM quality plus deterministic full-dataset evidence."""
 
     schema_score: float
     relevance_score: float
@@ -59,7 +63,6 @@ class ReviewResult:
 
     correctness_score: float = 0.0
     difficulty_score: float = 0.0
-    diversity_score: float = 0.0
 
     dup_rate: float = 0.0
     null_rate: float = 0.0
@@ -68,5 +71,6 @@ class ReviewResult:
 
     llm_composite: float = 0.0
     review_score: float = 0.0
+    score_components: dict[str, float] = field(default_factory=dict)
     failure_signals: list[str] = field(default_factory=list)
     dataset_quality: DatasetQualityResult = field(default_factory=DatasetQualityResult)

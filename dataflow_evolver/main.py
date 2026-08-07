@@ -1,10 +1,7 @@
-"""Raw-data pipeline evolution driven by direct ReviewAgent feedback.
+"""Incumbent-challenger raw-data pipeline improvement driven by review feedback.
 
-This entry point intentionally does not import MCTS, RecipeAgent, external-data MCP,
-downstream training, Tier-2 selection, or benchmark evaluation.  One candidate is
-produced per iteration and the previous candidate's structured ReviewResult is fed
-directly into the next PipelineAgent prompt.  Training/evaluation remains an explicit
-manual step after the loop has finished.
+One challenger is produced per iteration. Only a better candidate replaces the
+best-so-far incumbent; compact attempt history discourages repeated failed strategies.
 """
 from __future__ import annotations
 
@@ -22,7 +19,7 @@ from dataflow_evolver.core.dataset_quality import (
     OpenAIChatEmbeddingBackend,
     ProxyDatasetConfig,
 )
-from dataflow_evolver.core.schemas import PipelineConfig, ReviewResult, TaskProfile
+from dataflow_evolver.core.schemas import PipelineConfig, ReviewResult, TaskSpec
 from dataflow_evolver.engine.execution_wrapper import (
     ExecutionResult,
     ExecutionWrapperABC,
@@ -37,14 +34,17 @@ logger = get_logger("main")
 
 @dataclass
 class Candidate:
-    """One pipeline/data/review observation in the linear feedback loop."""
+    """One pipeline/data/review observation in the incumbent feedback loop."""
 
     iteration: int
-    node_dir_name: str
+    iteration_dir: Path
     config: PipelineConfig
     dataset_path: str | None = None
     review: ReviewResult | None = None
     execution_error: str | None = None
+    failure_stage: str | None = None
+    parent_iteration: int | None = None
+    accepted_as_incumbent: bool = False
 
     @property
     def score(self) -> float:
@@ -52,7 +52,7 @@ class Candidate:
 
 
 class ReviewOnlyLoop:
-    """A linear ``Pipeline -> Data -> Review -> next prompt`` loop."""
+    """A best-so-far incumbent challenged by one generated pipeline per iteration."""
 
     def __init__(
         self,
@@ -60,161 +60,206 @@ class ReviewOnlyLoop:
         pipeline_agent: PipelineAgent,
         executor: ExecutionWrapperABC,
         reviewer: ReviewAgent,
-        profile: TaskProfile,
+        task: TaskSpec,
         workspace: Path,
-        agent_root: Path,
         run_name: str,
         max_iterations: int,
-        execution_retries: int = 1,
-        target_samples: int = 0,
-        init_reference_code: str | None = None,
-        init_instruction: str = "",
+        execution_repairs: int = 1,
     ) -> None:
         if max_iterations < 1:
             raise ValueError("loop.max_iterations 必须至少为 1（包含初始流水线）")
         self.pipeline_agent = pipeline_agent
         self.executor = executor
         self.reviewer = reviewer
-        self.profile = profile
+        self.task = task
         self.workspace = workspace.resolve()
-        self.agent_root = agent_root.resolve()
         self.run_name = _safe_run_name(run_name)
         self.max_iterations = max_iterations
-        self.execution_retries = max(0, execution_retries)
-        self.target_samples = max(0, target_samples)
-        self.init_reference_code = init_reference_code
-        self.init_instruction = init_instruction
+        self.execution_repairs = max(0, execution_repairs)
         self.candidates: list[Candidate] = []
 
     @property
     def run_dir(self) -> Path:
-        return self.agent_root / self.run_name
+        return self.workspace / "runs" / self.run_name
 
     def run(self) -> Candidate | None:
-        """Run exactly ``max_iterations`` candidates unless generation/execution stops."""
+        """Run up to ``max_iterations`` candidates while retaining the best incumbent."""
         self.workspace.mkdir(parents=True, exist_ok=True)
         if self.run_dir.exists() and any(self.run_dir.iterdir()):
             raise FileExistsError(
                 f"运行目录已存在且非空：{self.run_dir}。请设置新的 project.run_name，"
-                "避免旧节点产物污染本次评审。"
+                "避免旧 iteration 产物污染本次评审。"
             )
+        self.run_dir.mkdir(parents=True, exist_ok=True)
 
         config = self.pipeline_agent.generate_initial(
-            profile=self.profile,
-            node_dir_name=self._node_name(0),
-            reference_code=self.init_reference_code,
-            instruction=self.init_instruction,
+            task=self.task,
+            iteration_dir=self._iteration_dir(0),
         )
         if config is None:
             logger.error("初始 PipelineAgent 未产出有效流水线。")
             return None
 
+        incumbent: Candidate | None = None
         for iteration in range(self.max_iterations):
-            node_name = self._node_name(iteration)
+            iteration_dir = self._iteration_dir(iteration)
             logger.info("==== Review-only 迭代 %d/%d ====", iteration + 1, self.max_iterations)
-            candidate = self._execute_and_review(iteration, node_name, config)
+            parent_incumbent = incumbent
+            candidate = self._execute_and_review(
+                iteration,
+                iteration_dir,
+                config,
+                parent_review=(
+                    parent_incumbent.review if parent_incumbent is not None else None
+                ),
+            )
+            candidate.parent_iteration = (
+                parent_incumbent.iteration if parent_incumbent is not None else None
+            )
+            if _is_better(candidate, incumbent):
+                candidate.accepted_as_incumbent = True
+                incumbent = candidate
+                logger.info(
+                    "接受 challenger 为 incumbent：%s score=%.4f",
+                    candidate.iteration_dir.name,
+                    candidate.score,
+                )
+            else:
+                logger.info(
+                    "拒绝 challenger，保留 incumbent=%s",
+                    incumbent.iteration_dir.name if incumbent is not None else "none",
+                )
             self.candidates.append(candidate)
             self._append_trace(candidate)
 
             if iteration + 1 >= self.max_iterations:
                 break
-            if candidate.review is None:
-                logger.error("本轮没有可回传的 ReviewResult，终止线性反馈链。")
+            if incumbent is None or incumbent.review is None:
+                logger.error("尚无可用 incumbent，无法继续生成 challenger。")
                 break
 
-            # The feedback loop is deliberately direct: no RecipeContext, global memory,
-            # sibling summary, diagnostics, train result, or hidden reward shaping.
+            # Always branch from best-so-far. Rejected attempts enter only a compact
+            # decision history, never as inherited pipeline code.
             config = self.pipeline_agent.generate(
-                profile=self.profile,
-                node_dir_name=self._node_name(iteration + 1),
-                parent_code=candidate.config.code,
-                parent_rationale=candidate.config.rationale,
-                parent_review=candidate.review,
+                task=self.task,
+                iteration_dir=self._iteration_dir(iteration + 1),
+                parent_code=incumbent.config.code,
+                parent_rationale=incumbent.config.rationale,
+                parent_review=incumbent.review,
+                evolution_history=self._evolution_history(),
             )
             if config is None:
                 logger.error("第 %d 轮 PipelineAgent 未产出有效流水线。", iteration + 2)
                 break
 
-        best = select_best(self.candidates)
+        best = incumbent or select_best(self.candidates)
         if best is not None:
             self._write_manifest(best)
             logger.info(
                 "Review-only 最优候选：%s review_score=%.4f passed=%s",
-                best.node_dir_name,
+                best.iteration_dir.name,
                 best.score,
                 best.review.passed if best.review else False,
             )
         return best
 
-    def _node_name(self, iteration: int) -> str:
-        return f"{self.run_name}/node_{iteration}"
+    def _iteration_dir(self, iteration: int) -> Path:
+        return self.run_dir / f"iteration_{iteration + 1:03d}"
 
     def _execute_and_review(
-        self, iteration: int, node_name: str, config: PipelineConfig
+        self,
+        iteration: int,
+        iteration_dir: Path,
+        config: PipelineConfig,
+        parent_review: ReviewResult | None = None,
     ) -> Candidate:
-        env = (
-            {"DF_TARGET_SAMPLES": str(self.target_samples)}
-            if self.target_samples > 0
-            else None
-        )
-        result: ExecutionResult = self.executor.run(config, node_name, env_overrides=env)
+        result: ExecutionResult = self.executor.run(config, iteration_dir)
         retries = 0
-        while not result.success and retries < self.execution_retries:
+        while not result.success and retries < self.execution_repairs:
             retries += 1
-            logger.info("流水线执行失败，进行第 %d/%d 次代码修复。", retries, self.execution_retries)
-            fixed = self.pipeline_agent.self_correct(node_name, result.traceback or "")
+            logger.info("流水线执行失败，进行第 %d/%d 次代码修复。", retries, self.execution_repairs)
+            fixed = self.pipeline_agent.self_correct(
+                iteration_dir,
+                result.traceback or "",
+                result.diagnostics,
+                failure_stage=result.failure_stage or "execution",
+            )
             if fixed is None:
                 break
             config = fixed
-            result = self.executor.run(config, node_name, env_overrides=env)
+            result = self.executor.run(config, iteration_dir)
 
         if not result.success or not result.dataset_path:
             logger.error("流水线执行最终失败：%s", result.traceback)
             return Candidate(
                 iteration=iteration,
-                node_dir_name=node_name,
+                iteration_dir=iteration_dir,
                 config=config,
                 execution_error=result.traceback or "unknown execution failure",
+                failure_stage=result.failure_stage,
             )
 
-        evidence_path = self.agent_root / node_name / "review.jsonl"
+        evidence_path = iteration_dir / "review.jsonl"
         review = self.reviewer.review(
             result.dataset_path,
-            self.profile,
+            self.task,
             evidence_path=str(evidence_path),
             phase=f"iteration_{iteration}",
-            parent_review=(
-                self.candidates[-1].review
-                if self.candidates and self.candidates[-1].review is not None
-                else None
-            ),
+            parent_review=parent_review,
         )
         return Candidate(
             iteration=iteration,
-            node_dir_name=node_name,
+            iteration_dir=iteration_dir,
             config=config,
             dataset_path=result.dataset_path,
             review=review,
         )
 
     def _append_trace(self, candidate: Candidate) -> None:
-        record = _candidate_record(candidate, self.agent_root)
-        path = self.workspace / f"{self.run_name}_iterations.jsonl"
+        record = _candidate_record(candidate)
+        path = self.run_dir / "iterations.jsonl"
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
+    def _evolution_history(self) -> list[dict[str, Any]]:
+        """Return compact decisions, not prior pipeline code or full reviews."""
+        history: list[dict[str, Any]] = []
+        for candidate in self.candidates:
+            history.append(
+                {
+                    "iteration": candidate.iteration + 1,
+                    "outcome": (
+                        "accepted" if candidate.accepted_as_incumbent else "rejected"
+                    ),
+                    "review_score": candidate.score if candidate.review is not None else None,
+                    "passed": candidate.review.passed if candidate.review is not None else False,
+                    "operators": [
+                        str(operator.get("name", "?"))
+                        for operator in candidate.config.operators[:8]
+                    ],
+                    "decision": _compact_text(candidate.config.rationale, 240),
+                    "issues": (
+                        [_compact_text(issue, 160) for issue in candidate.review.issues[:2]]
+                        if candidate.review is not None
+                        else [_compact_text(candidate.execution_error or "execution failed", 160)]
+                    ),
+                }
+            )
+        return history
+
     def _write_manifest(self, best: Candidate) -> None:
         manifest = {
-            "mode": "review_only",
+            "mode": "pipeline_review",
             "run_name": self.run_name,
             "max_iterations": self.max_iterations,
             "completed_iterations": len(self.candidates),
-            "selection_rule": "passed first, then highest review_score",
-            "best": _candidate_record(best, self.agent_root),
-            "all_candidates": [_candidate_record(c, self.agent_root) for c in self.candidates],
+            "selection_rule": "best-so-far incumbent: passed first, then highest review_score",
+            "best": _candidate_record(best),
+            "evolution_history": self._evolution_history(),
+            "all_candidates": [_candidate_record(c) for c in self.candidates],
             "manual_next_step": "Use best.dataset_path for downstream training/evaluation outside this loop.",
         }
-        path = self.workspace / f"{self.run_name}_best.json"
+        path = self.run_dir / "manifest.json"
         path.write_text(
             json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2, default=str),
             encoding="utf-8",
@@ -229,12 +274,24 @@ def select_best(candidates: list[Candidate]) -> Candidate | None:
     return max(reviewed, key=lambda c: (bool(c.review and c.review.passed), c.score))
 
 
+def _is_better(challenger: Candidate, incumbent: Candidate | None) -> bool:
+    if challenger.review is None:
+        return False
+    if incumbent is None or incumbent.review is None:
+        return True
+    challenger_rank = (challenger.review.passed, challenger.score)
+    incumbent_rank = (incumbent.review.passed, incumbent.score)
+    return challenger_rank > incumbent_rank
+
+
 def build_loop(cfg: Config) -> ReviewOnlyLoop:
     """Build the pipeline-review loop from the default YAML contract."""
     project = cfg.project
-    workspace = Path(project.workspace_dir)
-    agent_root = Path(project.agent_root)
-    agent_root.mkdir(parents=True, exist_ok=True)
+    workspace = Path(project.workspace_dir).resolve()
+    if not (workspace / "dataflow").is_dir():
+        raise FileNotFoundError(f"project.workspace_dir 缺少 vendored dataflow：{workspace}")
+    if not (workspace / ".claude/skills/dataflow-dev/SKILL.md").is_file():
+        raise FileNotFoundError(f"project.workspace_dir 缺少 dataflow-dev skill：{workspace}")
 
     corpus = input_corpus.discover(
         project.get("input_dir", "") or "",
@@ -245,7 +302,7 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
     target_schema = _plain_dict(task_cfg.get("target_schema"))
     if not target_schema:
         raise ValueError("task.target_schema 不能为空；入口不会自动猜测输出字段")
-    profile = TaskProfile(
+    task = TaskSpec(
         task_description="",  # CLI --task is injected in main() after construction.
         target_schema={str(k): str(v) for k, v in target_schema.items()},
         quality_criteria=list(task_cfg.get("quality_criteria", []) or []),
@@ -254,8 +311,9 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
     serving = build_serving(cfg.llm)
     review_cfg = cfg.review
     decon_cfg = review_cfg.get("decontamination") or Config({})
+    dataset_quality_cfg = review_cfg.get("dataset_quality") or Config({})
     dataset_quality_evaluator, dataset_quality_fields = _build_dataset_quality_evaluator(
-        review_cfg.get("dataset_quality") or Config({}),
+        dataset_quality_cfg,
         workspace=workspace,
     )
     reviewer = ReviewAgent(
@@ -275,60 +333,55 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
         null_threshold=float(review_cfg.get("null_threshold", 0.5)),
         dataset_quality_evaluator=dataset_quality_evaluator,
         dataset_quality_fields=dataset_quality_fields,
+        dataset_quality_weight=float(dataset_quality_cfg.get("score_weight", 0.25)),
+        dataset_quality_score_weights=_plain_dict(
+            dataset_quality_cfg.get("score_weights")
+        ) or None,
     )
 
     agent_cfg = cfg.agent
 
     pipeline_llm = _resolve_pipeline_llm(cfg.llm)
     llm_block, extra_env = _pipeline_runtime_contract(pipeline_llm)
-    generation_cfg = cfg.get("generation") or Config({})
-    target_samples = int(generation_cfg.get("target_samples", 0) or 0)
     pipeline_agent = PipelineAgent(
         agent_cfg=agent_cfg,
-        agent_root=str(agent_root),
+        workspace_dir=str(workspace),
         corpus=corpus,
         llm_block=llm_block,
-        target_samples=target_samples,
     )
 
     loop_cfg = cfg.loop
     executor = SubprocessExecutionWrapper(
-        agent_root=str(agent_root),
+        workspace_dir=str(workspace),
         pipeline_filename=str(agent_cfg.get("pipeline_filename", "pipeline.py")),
+        compile_timeout_sec=int(loop_cfg.get("compile_timeout_sec", 120)),
         timeout_sec=int(loop_cfg.get("execution_timeout_sec", 1200)),
         python_exe=str(loop_cfg.get("python_exe", "") or "") or None,
         extra_env=extra_env or None,
-        token_usage_root=str(agent_cfg.get("session_root", "") or "") or None,
     )
-    init_cfg = cfg.get("init") or Config({})
-    reference_path = str(init_cfg.get("reference_pipeline", "") or "")
-    reference_code = Path(reference_path).read_text(encoding="utf-8") if reference_path else None
     return ReviewOnlyLoop(
         pipeline_agent=pipeline_agent,
         executor=executor,
         reviewer=reviewer,
-        profile=profile,
+        task=task,
         workspace=workspace,
-        agent_root=agent_root,
-        run_name=str(project.get("run_name", "review_only") or "review_only"),
+        run_name=str(project.get("run_name", "run") or "run"),
         max_iterations=int(loop_cfg.get("max_iterations", 4)),
-        execution_retries=int(loop_cfg.get("execution_retries", 1)),
-        target_samples=target_samples,
-        init_reference_code=reference_code,
-        init_instruction=str(init_cfg.get("instruction", "") or ""),
+        execution_repairs=int(loop_cfg.get("execution_repairs", 1)),
     )
 
 
-def _candidate_record(candidate: Candidate, agent_root: Path | None = None) -> dict[str, Any]:
-    pipeline_path = Path(candidate.node_dir_name) / "pipeline.py"
-    if agent_root is not None:
-        pipeline_path = agent_root / pipeline_path
+def _candidate_record(candidate: Candidate) -> dict[str, Any]:
+    pipeline_path = candidate.iteration_dir / "pipeline.py"
     return {
         "iteration": candidate.iteration,
-        "node_dir": candidate.node_dir_name,
+        "iteration_dir": str(candidate.iteration_dir),
         "pipeline_path": str(pipeline_path),
         "dataset_path": candidate.dataset_path,
         "execution_error": candidate.execution_error,
+        "failure_stage": candidate.failure_stage,
+        "parent_iteration": candidate.parent_iteration,
+        "accepted_as_incumbent": candidate.accepted_as_incumbent,
         "field_flow": candidate.config.field_flow,
         "operators": candidate.config.operators,
         "review": asdict(candidate.review) if candidate.review is not None else None,
@@ -337,9 +390,14 @@ def _candidate_record(candidate: Candidate, agent_root: Path | None = None) -> d
 
 def _safe_run_name(value: str) -> str:
     path = Path(value)
-    if not value or path.is_absolute() or ".." in path.parts:
-        raise ValueError("project.run_name 必须是 agent_root 下的非空相对路径，且不能包含 '..'")
-    return path.as_posix().strip("/")
+    if not value or path.is_absolute() or len(path.parts) != 1 or path.name in {".", ".."}:
+        raise ValueError("project.run_name 必须是不含路径分隔符的非空名称")
+    return path.name
+
+
+def _compact_text(value: str, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def _plain_dict(value: Any) -> dict[str, Any]:
@@ -375,7 +433,7 @@ def _build_dataset_quality_evaluator(
         raise ValueError("review.dataset_quality.embedding.model_name 不能为空")
 
     cache_value = str(value.get("cache_dir", "") or "").strip()
-    cache_dir = Path(cache_value) if cache_value else workspace / "dataset_quality_cache"
+    cache_dir = Path(cache_value) if cache_value else workspace / "cache" / "das"
     proxy = ProxyDatasetConfig(
         source=str(proxy_cfg.get("source", "huggingface")),
         path=proxy_path,
@@ -430,10 +488,10 @@ def _resolve_pipeline_llm(cfg_llm: Config) -> dict[str, dict[str, Any]]:
             return api.get(key, default) if value is None else value
 
         return {
-            "api_url": pick("api_url"),
+            "api_url": _normalize_pipeline_api_url(pick("api_url")),
             "model_name": pick("model_name"),
             "api_key": pick("api_key", ""),
-            "max_workers": pick("max_workers", 100),
+            "max_workers": pick("max_workers", 10),
         }
 
     if sections is None:
@@ -443,6 +501,18 @@ def _resolve_pipeline_llm(cfg_llm: Config) -> dict[str, dict[str, Any]]:
         str(name): resolve(Config(value) if isinstance(value, dict) else None)
         for name, value in raw.items()
     }
+
+
+def _normalize_pipeline_api_url(value: Any) -> Any:
+    """Accept an OpenAI base URL while emitting the endpoint DataFlow posts to."""
+    if not isinstance(value, str) or not value.strip():
+        return value
+    url = value.strip().rstrip("/")
+    if url.endswith("/chat/completions"):
+        return url
+    if url.endswith("/v1"):
+        return url + "/chat/completions"
+    return url
 
 
 def _pipeline_runtime_contract(
@@ -475,15 +545,15 @@ def main() -> None:
     cfg = load_config(args.config)
     setup_logging(args.log_level, Path(cfg.project.workspace_dir) / "run.log")
     loop = build_loop(cfg)
-    loop.profile.task_description = args.task
+    loop.task.task_description = args.task
     best = loop.run()
     if best is None:
         print("\n没有得到可评审的数据集。")
         return
-    print(f"\n最优流水线：{loop.agent_root / best.node_dir_name / 'pipeline.py'}")
+    print(f"\n最优流水线：{best.iteration_dir / 'pipeline.py'}")
     print(f"最优数据：{best.dataset_path}")
     print(f"Review score：{best.score:.4f}（passed={best.review.passed}）")
-    print(f"运行清单：{loop.workspace / f'{loop.run_name}_best.json'}")
+    print(f"运行清单：{loop.run_dir / 'manifest.json'}")
     print("训练和下游评测未执行；请根据清单中的 best.dataset_path 人工启动。")
 
 

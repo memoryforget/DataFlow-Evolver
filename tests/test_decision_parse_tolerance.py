@@ -1,9 +1,9 @@
 """decision.json 键名漂移的宽容解析。
 
 decision.json 由 PipelineAgent（LLM）生成，实测同一次运行里键名就会漂移：
-  - node_2 写了 "operators" + "description" + "design_rationale" → 旧解析只认 "ops"，
+  - 一次历史迭代写了 "operators" + "description" + "design_rationale" → 旧解析只认 "ops"，
     整份算子列表与 rationale 会被静默丢弃，下一轮也就失去关键设计上下文；
-  - node_3 写了 "ops" 字符串数组 → purpose 恒为空串。
+  - 另一次历史迭代写了 "ops" 字符串数组 → purpose 恒为空串。
 这里锁住同义键的兼容，避免再次静默丢信息。
 """
 import sys
@@ -26,7 +26,7 @@ def test_canonical_schema():
 
 
 def test_node2_style_keys_are_not_dropped():
-    """实测 node_2 的写法：operators / description / design_rationale。"""
+    """历史产物写法：operators / description / design_rationale。"""
     ops, flow, rationale = _parse_decision({
         "operators": [
             {"name": "TextCleaner", "description": "清洗输入文本"},

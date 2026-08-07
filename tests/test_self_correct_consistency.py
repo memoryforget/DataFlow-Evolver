@@ -5,22 +5,28 @@ from dataflow_evolver.llm.prompts import build_selfcorrect_prompt
 
 
 def test_exec_repair_prompt_syncs_decision():
-    prompt = build_selfcorrect_prompt("run/node_3", "Traceback: boom")
-    assert "run/node_3/decision.json" in prompt
+    prompt = build_selfcorrect_prompt(
+        "/workspace/runs/run/iteration_004",
+        "Traceback: boom",
+        failure_stage="compile",
+    )
+    assert "/workspace/runs/run/iteration_004/decision.json" in prompt
     assert "ops` / `field_flow` / `reason" in prompt
+    assert "失败阶段：`compile`" in prompt
+    assert "不要自行执行" in prompt
 
 
 def test_stale_decision_warns_after_execution_repair(tmp_path, monkeypatch, caplog):
     import dataflow_evolver.agents.pipeline_agent as module
 
-    node = tmp_path / "node"
-    node.mkdir()
-    (node / "pipeline.py").write_text("print(1)", encoding="utf-8")
-    decision = node / "decision.json"
+    iteration = tmp_path / "iteration_001"
+    iteration.mkdir()
+    (iteration / "pipeline.py").write_text("print(1)", encoding="utf-8")
+    decision = iteration / "decision.json"
     decision.write_text(json.dumps({"ops": [], "field_flow": "f"}), encoding="utf-8")
 
     agent = module.PipelineAgent.__new__(module.PipelineAgent)
-    agent.agent_root = tmp_path
+    agent.workspace_dir = tmp_path
     agent.pipeline_filename = "pipeline.py"
     agent.agent_cfg = {}
     agent.runtime = None
@@ -37,7 +43,7 @@ def test_stale_decision_warns_after_execution_repair(tmp_path, monkeypatch, capl
 
     agent.runtime = Runtime()
     with caplog.at_level("WARNING"):
-        assert agent._run_and_assemble("prompt", "node", warn_stale_decision=True)
+        assert agent._run_and_assemble("prompt", iteration, warn_stale_decision=True)
     assert "未更新" in caplog.text
 
 

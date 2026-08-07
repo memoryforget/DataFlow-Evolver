@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataflow_evolver.core.input_corpus import InputCorpus
-from dataflow_evolver.core.schemas import ReviewResult, TaskProfile
+from dataflow_evolver.core.schemas import ReviewResult, TaskSpec
 
 
 PIPELINE_PROMPT = """为下述目标编写一条完整、可直接运行的 DataFlow 流水线（含自定义算子）。
@@ -20,43 +20,57 @@ Entry file: {entry_path}
    FileStorage 的 `hf:` / `ms:` 远程入口。调用配置好的 LLM serving API 不受此限。
 3. 目标 schema：{target_schema}。最终 JSONL 至少包含这些字段且非空；可以保留额外的中间字段
    和溯源信息。
-4. 每个处理步骤放在 `{node_dir}/operators/` 下的独立自定义算子文件中。算子继承
-   `OperatorABC`，实现 `run()`；主文件写到 `{node_dir}/pipeline.py`。
-5. 同步写 `{node_dir}/decision.json`，schema 必须为：
+4. 每个处理步骤放在 `{iteration_dir}/operators/` 下的独立自定义算子文件中。算子继承
+   `OperatorABC`，实现 `run()`；主文件写到 `{iteration_dir}/pipeline.py`。
+5. 同步写 `{iteration_dir}/decision.json`，schema 必须为：
    {{"ops": [{{"name": "算子类名", "purpose": "作用", "params": {{}}}}, ...],
      "field_flow": "raw fields -> ... -> target fields", "reason": "设计理由"}}
 6. LLM 算子使用 `APILLMServing_request`，配置如下：
 {llm_block}
-7. FileStorage 的 `cache_path` 设为 `{node_dir}/cache`，最终在 `{node_dir}/` 下产出 JSONL。
-8. 写完后执行 compile 校验：`pipeline.compile()` →
-   `if os.environ.get('DF_COMPILE_ONLY'): sys.exit(0)` → `pipeline.forward()`；然后运行
-   `DF_COMPILE_ONLY=1 python {node_dir}/pipeline.py`，修复到 compile 通过。
+7. FileStorage 的 `cache_path` 设为 `{iteration_dir}/cache`，最终在 `{iteration_dir}/` 下产出 JSONL。
+8. 主入口必须严格按 `pipeline.compile()` →
+   `if os.environ.get('DF_COMPILE_ONLY'): sys.exit(0)` → `pipeline.forward()` 排列。只写入所需产物，
+   不要自行执行 `pipeline.py`（包括 compile-only 或 smoke test）；框架会在 Agent 返回后依次执行
+   确定性的 artifact 校验、compile 预检和正式运行。
 
-{recommendation_block}{size_block}{init_block}{parent_block}{review_block}
+{recommendation_block}{init_block}{parent_block}{review_block}{history_block}
 约束：无头自动化运行，禁止 AskUserQuestion 与 git/gh 子流程。MCP 仅用于查看 DataFlow 算子源码，
 不能用于获取新数据。"""
 
 
 DECISION_SYNC_NOTE = """如果修复改变了算子、字段流或设计取舍，请同步覆盖
-`{node_dir}/decision.json`（键名仍为 `ops` / `field_flow` / `reason`）。"""
+`{iteration_dir}/decision.json`（键名仍为 `ops` / `field_flow` / `reason`）。"""
 
 
-PIPELINE_SELFCORRECT_PROMPT = """流水线 `{node_dir}/pipeline.py` 执行失败。请先读取
+PIPELINE_SELFCORRECT_PROMPT = """流水线 `{iteration_dir}/pipeline.py` 未通过框架检查。
+失败阶段：`{failure_stage}`。
+
+请先读取
 `.claude/skills/dataflow-dev/diagnostics/known_issues.md`，再对照 DataFlow 源码定位并修复。
 
 可查阅：
 - `dataflow/utils/storage.py`
 - `dataflow/serving/api_llm_serving_request.py`
 - `dataflow/core/operator.py`
-- `{node_dir}/operators/`
+- `{iteration_dir}/operators/`
 
-修复后运行 `DF_COMPILE_ONLY=1 python {node_dir}/pipeline.py`，直到 compile 通过。
+只修改 `pipeline.py`、`operators/` 和必要的 `decision.json`，不要自行执行 `pipeline.py`、
+compile-only 或 smoke test。Agent 返回后，框架会重新执行 artifact 校验、compile 预检与正式运行。
 {decision_sync_note}
 
 错误栈：
 ```
 {traceback}
 ```
+
+逐步产物诊断：
+```
+{diagnostics}
+```
+
+按失败阶段定位：`artifact_validation` 优先修正语法及 compile/guard/forward 主入口契约；
+`compile` 优先检查 import、算子初始化、参数和字段流；`execution` / `output_validation` 则先找
+第一个行数变为 0、字段丢失或 JSONL 异常的步骤，修复产生问题的上游算子，不要只在下游吞掉异常。
 
 只修复执行问题，不改变任务目标，不联网取数，不进行交互或 git/gh 操作。"""
 
@@ -75,13 +89,13 @@ _DIM_LABELS: tuple[tuple[str, str], ...] = (
     ("correctness_score", "正确性"),
     ("relevance_score", "相关性"),
     ("difficulty_score", "难度"),
-    ("diversity_score", "多样性"),
     ("schema_score", "schema 符合度"),
 )
 
 
-REVIEW_PROMPT = """你是数据质量评审员。请评估流水线从固定 raw data 处理得到的候选数据，
-判断其用于微调目标模型的价值。每个维度取 0.0-1.0。
+REVIEW_PROMPT = """你是数据质量评审员。下面只是候选数据集的随机抽样。请评估单条样本用于微调
+目标模型的质量，每个维度取 0.0-1.0。不要从该抽样推断或评分整个数据集的多样性；
+框架会用同一批 dataset embedding 单独计算多样性指标。
 
 目标任务：{task_description}
 期望 schema：{target_schema}
@@ -94,7 +108,6 @@ REVIEW_PROMPT = """你是数据质量评审员。请评估流水线从固定 raw
 - correctness_score：标签/解答正确，推理与答案自洽。
 - relevance_score：与目标任务和领域相关。
 - difficulty_score：具有非平凡但可学习的难度。
-- diversity_score：内容与结构多样，不是近重复或模板变体。
 - schema_score：必需字段齐全、非空且类型正确；额外元数据不扣分。
 
 失败信号：
@@ -105,7 +118,6 @@ REVIEW_PROMPT = """你是数据质量评审员。请评估流水线从固定 raw
   "correctness_score": 0.0,
   "relevance_score": 0.0,
   "difficulty_score": 0.0,
-  "diversity_score": 0.0,
   "schema_score": 0.0,
   "failure_signals": ["F3"],
   "issues": ["具体问题及样本证据"]
@@ -114,55 +126,60 @@ REVIEW_PROMPT = """你是数据质量评审员。请评估流水线从固定 raw
 
 
 def build_pipeline_prompt(
-    profile: TaskProfile,
+    task: TaskSpec,
     corpus: InputCorpus,
-    node_dir: str,
+    iteration_dir: str,
     llm_block: str = "",
     parent_code: str | None = None,
-    target_samples: int = 0,
     recommended_categories: dict | None = None,
     parent_rationale: str | None = None,
     parent_review: ReviewResult | None = None,
+    evolution_history: list[dict] | None = None,
     is_init: bool = False,
-    init_reference_code: str | None = None,
-    init_instruction: str | None = None,
 ) -> str:
     if not corpus.grounded:
         raise ValueError("轻量 Pipeline prompt 要求固定 raw corpus")
     return PIPELINE_PROMPT.format(
-        target=profile.task_description,
-        expected_outputs=list(profile.target_schema),
+        target=task.task_description,
+        expected_outputs=list(task.target_schema),
         entry_path=corpus.entry_path,
         input_block=corpus.prompt_block(),
-        target_schema=profile.target_schema,
-        node_dir=node_dir,
+        target_schema=task.target_schema,
+        iteration_dir=iteration_dir,
         llm_block=llm_block or "   使用项目已有的默认 serving 配置。",
         recommendation_block=_recommendation_block(recommended_categories),
-        size_block=_size_block(target_samples),
         init_block=(
-            _init_block(init_reference_code, init_instruction) if is_init else ""
+            "【初始流水线】从固定 raw data 出发，设计稳定、可解释的处理基线。\n"
+            if is_init else ""
         ),
         parent_block=_parent_block(parent_code, parent_rationale),
         review_block=(
             _parent_quality_block(parent_review) if parent_review is not None else ""
         ),
+        history_block=_history_block(evolution_history),
     )
 
-
-def build_selfcorrect_prompt(node_dir: str, traceback: str) -> str:
+def build_selfcorrect_prompt(
+    iteration_dir: str,
+    traceback: str,
+    diagnostics: str = "not available",
+    failure_stage: str = "execution",
+) -> str:
     return PIPELINE_SELFCORRECT_PROMPT.format(
-        node_dir=node_dir,
+        iteration_dir=iteration_dir,
+        failure_stage=failure_stage,
         traceback=traceback,
-        decision_sync_note=DECISION_SYNC_NOTE.format(node_dir=node_dir),
+        diagnostics=diagnostics,
+        decision_sync_note=DECISION_SYNC_NOTE.format(iteration_dir=iteration_dir),
     )
 
 
-def build_review_prompt(profile: TaskProfile, samples_text: str) -> str:
+def build_review_prompt(task: TaskSpec, samples_text: str) -> str:
     signals = "\n".join(f"- {key}: {value}" for key, value in FAILURE_SIGNALS.items())
     return REVIEW_PROMPT.format(
-        task_description=profile.task_description,
-        target_schema=profile.target_schema,
-        quality_criteria=profile.quality_criteria,
+        task_description=task.task_description,
+        target_schema=task.target_schema,
+        quality_criteria=task.quality_criteria,
         samples=samples_text,
         failure_signal_block=signals,
     )
@@ -187,58 +204,76 @@ def _parent_quality_block(review: ReviewResult) -> str:
         (label, float(getattr(review, attr, 0.0) or 0.0))
         for attr, label in _DIM_LABELS
     ]
-    weakest = "、".join(f"{label}({score:.2f})" for label, score in sorted(dims, key=lambda x: x[1])[:2])
     lines = [
         "【上一轮 ReviewAgent 反馈——本轮必须直接回应】",
         f"Review：{review.review_score:.3f}；评审{'通过' if review.passed else '未通过'}",
-        "五维：" + " | ".join(f"{label} {score:.2f}" for label, score in dims),
-        f"优先改进：{weakest}",
+        "抽样四维：" + " | ".join(f"{label} {score:.2f}" for label, score in dims),
         f"全量硬指标：重复率 {review.dup_rate:.2f} | 空值率 {review.null_rate:.2f} | "
         f"可解析率 {review.parse_valid_rate:.2f} | 污染率 {review.contamination_rate:.2f}",
     ]
     dataset_quality = review.dataset_quality
     if dataset_quality.enabled:
         if dataset_quality.status == "ok" and dataset_quality.mmd is not None:
-            delta = (
-                f" | 相比父节点 ΔMMD {dataset_quality.delta_mmd_vs_parent:+.6f}"
+            delta_mmd = (
+                f"{dataset_quality.delta_mmd_vs_parent:+.6f}"
                 if dataset_quality.delta_mmd_vs_parent is not None
-                else ""
+                else "baseline"
             )
-            lines.append(
-                f"Dataset-level DAS：MMD {dataset_quality.mmd:.6f} | "
-                f"DAS {dataset_quality.das:.6f}{delta} | "
-                f"候选采样 {dataset_quality.candidate_sample_size} | "
-                f"代理集 {dataset_quality.proxy_name}"
-            )
-            terms = dataset_quality.kernel_terms
-            if terms:
-                lines.append(
-                    "MMD 核项：候选内部相似度 "
-                    f"{terms.get('candidate_internal', 0.0):.6f} | "
-                    f"代理内部相似度 {terms.get('proxy_internal', 0.0):.6f} | "
-                    f"候选-代理交叉相似度 {terms.get('cross', 0.0):.6f}"
+            diversity = dataset_quality.embedding_diversity
+            if diversity:
+                delta_diversity = dataset_quality.delta_embedding_diversity_vs_parent
+                delta_vendi = (
+                    f"{delta_diversity['cosine_vendi_ratio']:+.6f}"
+                    if "cosine_vendi_ratio" in delta_diversity
+                    else "baseline"
                 )
-            lines.append(
-                "DAS=-MMD，MMD 越低越好；负的 ΔMMD 表示本轮分布更接近高质量代理集。"
-                "只把它作为分布反馈，不能以牺牲答案正确性、schema 或去重质量为代价。"
-            )
+                delta_p95 = (
+                    f"{delta_diversity['nearest_neighbor_cosine_p95']:+.6f}"
+                    if "nearest_neighbor_cosine_p95" in delta_diversity
+                    else "baseline"
+                )
+                lines.append(
+                    f"Dataset embedding：ΔMMD {delta_mmd} | "
+                    f"normalized Vendi {diversity.get('cosine_vendi_ratio', 0.0):.6f} "
+                    f"(Δ {delta_vendi}) | "
+                    f"NN cosine p95 {diversity.get('nearest_neighbor_cosine_p95', 0.0):.6f} "
+                    f"(Δ {delta_p95})"
+                )
+                lines.append(
+                    "ΔMMD 越负越好；normalized Vendi 越高越好；NN cosine p95 越低越好。"
+                )
         else:
             lines.append(
                 f"Dataset-level DAS：状态 {dataset_quality.status}；"
                 f"原因：{dataset_quality.error or '未知'}。"
                 "请优先保证输出至少含足够数量且字段可编码的有效记录。"
             )
-    if review.failure_signals:
-        lines.append("失败信号：")
-        lines.extend(
-            f"- {signal}: {FAILURE_SIGNALS[signal]}"
-            for signal in review.failure_signals
-            if signal in FAILURE_SIGNALS
-        )
     if review.issues:
         lines.append("具体问题：")
         lines.extend(f"- {issue}" for issue in review.issues)
     lines.append("只修改能够解释上述反馈的步骤，并在 decision.json 的 reason 中说明本轮改动。")
+    return "\n".join(lines) + "\n"
+
+
+def _history_block(history: list[dict] | None) -> str:
+    if not history:
+        return ""
+    visible = history[-12:]
+    lines = [
+        "【简要进化历史——不要重复 rejected 尝试的同类策略】",
+        "这里只记录 decision 摘要，不代表要继承 rejected pipeline。",
+    ]
+    if len(history) > len(visible):
+        lines.append(f"- 更早的 {len(history) - len(visible)} 次尝试仅保存在运行记录中。")
+    for item in visible:
+        score = item.get("review_score")
+        score_text = f"{float(score):.3f}" if score is not None else "n/a"
+        operators = ">".join(str(name) for name in item.get("operators", [])) or "unknown"
+        issues = "；".join(str(issue) for issue in item.get("issues", [])) or "none"
+        lines.append(
+            f"- iter {item.get('iteration')} [{item.get('outcome')}], score={score_text}, "
+            f"ops={operators}, decision={item.get('decision') or 'none'}, issues={issues}"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -255,23 +290,3 @@ def _recommendation_block(recommended: dict | None) -> str:
         "【DataFlow 源码参考】建议查看类别：" + text + "。可用 `list_operators` 和 "
         "`get_operator_detail` 学习 API 与实现模式，但仍应为当前 raw data 编写自定义算子。\n"
     )
-
-
-def _size_block(target_samples: int) -> str:
-    if target_samples <= 0:
-        return ""
-    return (
-        f"【可调目标条数】从 `DF_TARGET_SAMPLES` 读取，缺省 {target_samples}；不要在代码中写死。"
-        "过滤或增强后应尽量接近目标数量。\n"
-    )
-
-
-def _init_block(reference_code: str | None, instruction: str | None) -> str:
-    if reference_code:
-        return (
-            "【初始流水线】将以下参考实现忠实改写成 DataFlow 契约，不改变处理逻辑：\n"
-            f"```python\n{reference_code}\n```\n"
-        )
-    if instruction:
-        return f"【初始流水线】额外构建要求：{instruction}\n"
-    return "【初始流水线】从固定 raw data 出发，设计一条稳定、可解释的处理基线。\n"

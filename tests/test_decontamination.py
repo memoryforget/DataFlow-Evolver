@@ -9,10 +9,10 @@ import pytest
 
 from dataflow_evolver.agents.review_agent import ReviewAgent
 from dataflow_evolver.core import decontamination
-from dataflow_evolver.core.schemas import TaskProfile
+from dataflow_evolver.core.schemas import TaskSpec
 from dataflow_evolver.llm.serving import LLMServingABC
 
-PROFILE = TaskProfile("t", {"instruction": "str", "answer": "str"}, [])
+TASK = TaskSpec("t", {"instruction": "str", "answer": "str"}, [])
 
 TEST_Q = (
     "Natalia sold clips to 48 of her friends in April and then she sold half "
@@ -117,14 +117,14 @@ def test_plain_text_reference_file(tmp_path):
 # ---- 在 ReviewAgent 里的行为 -----------------------------------------------
 _GOOD_REVIEW = json.dumps({
     "schema_score": 1.0, "relevance_score": 1.0, "correctness_score": 1.0,
-    "difficulty_score": 1.0, "diversity_score": 1.0, "issues": [],
+    "difficulty_score": 1.0, "issues": [],
 })
 
 
 def _review(tmp_path, rows, index):
     ds = _jsonl(tmp_path / "ds.jsonl", rows)
     agent = ReviewAgent(StubServing(_GOOD_REVIEW), contamination=index)
-    return agent.review(str(ds), PROFILE)
+    return agent.review(str(ds), TASK)
 
 
 def test_heavy_contamination_fails_the_gate(tmp_path):

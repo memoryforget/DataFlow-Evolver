@@ -10,8 +10,8 @@ dependencies = [
     "pydantic>=2.0",
 ]
 
-# 注意：DataFlow 源码以 vendored 方式置于 workspace/_agent_root/dataflow（非 pip 安装），
-# 但**运行**它生成的流水线仍需其第三方依赖，见 optional-dependencies 的 agent-runtime 组。
+# DataFlow is vendored under workspace/dataflow rather than installed as a package. Generated
+# pipelines still require its runtime dependencies below.
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]

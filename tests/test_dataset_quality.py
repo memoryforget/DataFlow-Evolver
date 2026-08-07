@@ -8,9 +8,10 @@ from dataflow_evolver.core.dataset_quality import (
     DatasetQualityEvaluator,
     EmbeddingBatch,
     ProxyDatasetConfig,
+    compute_embedding_diversity,
     compute_rbf_mmd,
 )
-from dataflow_evolver.core.schemas import DatasetQualityResult, ReviewResult, TaskProfile
+from dataflow_evolver.core.schemas import DatasetQualityResult, ReviewResult, TaskSpec
 from dataflow_evolver.llm.prompts import build_pipeline_prompt
 from dataflow_evolver.core.input_corpus import CorpusFile, InputCorpus
 
@@ -71,6 +72,21 @@ def test_mmd_clamps_tiny_negative_squared_value():
     assert mmd >= 0.0
 
 
+def test_embedding_diversity_separates_identical_and_orthogonal_vectors():
+    identical = np.asarray([[1.0, 0.0]] * 4, dtype=np.float64)
+    orthogonal = np.eye(4, dtype=np.float64)
+
+    collapsed = compute_embedding_diversity(identical)
+    diverse = compute_embedding_diversity(orthogonal)
+
+    assert collapsed["cosine_vendi_score"] == pytest.approx(1.0)
+    assert collapsed["cosine_vendi_ratio"] == pytest.approx(0.25)
+    assert collapsed["nearest_neighbor_cosine_mean"] == pytest.approx(1.0)
+    assert diverse["cosine_vendi_score"] == pytest.approx(4.0)
+    assert diverse["cosine_vendi_ratio"] == pytest.approx(1.0)
+    assert diverse["nearest_neighbor_cosine_mean"] == pytest.approx(0.0)
+
+
 def test_dataset_evaluator_uses_configured_sample_size_and_cache(tmp_path):
     candidate = tmp_path / "candidate.jsonl"
     proxy = tmp_path / "proxy.jsonl"
@@ -116,6 +132,8 @@ def test_dataset_evaluator_uses_configured_sample_size_and_cache(tmp_path):
     assert first.proxy_sample_size == 5
     assert first.embedding_dim == 3
     assert first.das == pytest.approx(-first.mmd)
+    assert first.embedding_diversity["cosine_vendi_score"] >= 1.0
+    assert "nearest_neighbor_cosine_p95" in first.embedding_diversity
     assert set(first.kernel_terms) == {
         "candidate_internal", "proxy_internal", "cross", "mmd_squared"
     }
@@ -199,6 +217,11 @@ class StubDatasetEvaluator:
             proxy_sample_size=5,
             mmd=0.2,
             das=-0.2,
+            embedding_diversity={
+                "cosine_vendi_score": 4.0,
+                "cosine_vendi_ratio": 0.5,
+                "nearest_neighbor_cosine_p95": 0.8,
+            },
         )
 
 
@@ -211,13 +234,28 @@ def test_review_agent_records_parent_mmd_delta():
     reviewer.dataset_quality_fields = ("instruction", "output")
     parent = ReviewResult(0.9, 0.9, True)
     parent.dataset_quality = DatasetQualityResult(
-        enabled=True, status="ok", mmd=0.25, das=-0.25
+        enabled=True,
+        status="ok",
+        mmd=0.25,
+        das=-0.25,
+        embedding_diversity={
+            "cosine_vendi_score": 3.5,
+            "cosine_vendi_ratio": 0.4,
+            "nearest_neighbor_cosine_p95": 0.9,
+        },
     )
     current = ReviewResult(0.9, 0.9, True)
 
     reviewer.apply_dataset_quality(current, "unused.jsonl", parent)
 
     assert current.dataset_quality.delta_mmd_vs_parent == pytest.approx(-0.05)
+    assert current.dataset_quality.delta_embedding_diversity_vs_parent == pytest.approx(
+        {
+            "cosine_vendi_score": 0.5,
+            "cosine_vendi_ratio": 0.1,
+            "nearest_neighbor_cosine_p95": -0.1,
+        }
+    )
 
 
 def test_pipeline_prompt_exposes_das_without_proxy_examples(tmp_path):
@@ -252,16 +290,55 @@ def test_pipeline_prompt_exposes_das_without_proxy_examples(tmp_path):
             "proxy_internal": 0.3,
             "cross": 0.35,
         },
+        embedding_diversity={
+            "cosine_vendi_score": 123.0,
+            "cosine_vendi_ratio": 0.0246,
+            "nearest_neighbor_cosine_mean": 0.81,
+            "nearest_neighbor_cosine_p95": 0.93,
+        },
+        delta_embedding_diversity_vs_parent={
+            "cosine_vendi_ratio": 0.004,
+            "nearest_neighbor_cosine_p95": -0.02,
+        },
     )
 
     prompt = build_pipeline_prompt(
-        TaskProfile("math", {"instruction": "str", "output": "str"}, []),
+        TaskSpec("math", {"instruction": "str", "output": "str"}, []),
         corpus,
-        "run/node_1",
+        str(tmp_path / "iteration_002"),
         parent_review=review,
     )
 
-    assert "Dataset-level DAS" in prompt
     assert "ΔMMD -0.030000" in prompt
-    assert "MMD 越低越好" in prompt
-    assert "ODA-Math-460k" in prompt
+    assert "normalized Vendi 0.024600 (Δ +0.004000)" in prompt
+    assert "NN cosine p95 0.930000 (Δ -0.020000)" in prompt
+    assert "MMD 核项" not in prompt
+    assert "ODA-Math-460k" not in prompt
+    assert "NN cosine mean" not in prompt
+
+
+def test_embedding_quality_is_calibrated_and_blended_into_review_score():
+    class NeverServing:
+        pass
+
+    reviewer = ReviewAgent(
+        NeverServing(),
+        dataset_quality_evaluator=StubDatasetEvaluator(),
+        dataset_quality_weight=0.25,
+    )
+    result = reviewer.parse(
+        {
+            "correctness_score": 1.0,
+            "relevance_score": 1.0,
+            "difficulty_score": 1.0,
+            "schema_score": 1.0,
+        }
+    )
+    reviewer.apply_dataset_quality(result, "unused.jsonl")
+
+    das_score = 1.0 - 0.2 / np.sqrt(2.0)
+    nn_score = (1.0 - 0.8) / 2.0
+    expected_embedding = 0.40 * das_score + 0.30 * 0.5 + 0.30 * nn_score
+    assert result.dataset_quality.embedding_quality_score == pytest.approx(expected_embedding)
+    assert result.review_score == pytest.approx(0.75 + 0.25 * expected_embedding)
+    assert result.score_components["embedding_weight"] == pytest.approx(0.25)

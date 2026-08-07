@@ -43,10 +43,11 @@ class <PipelineClassName>:
 
         # ── LLM Serving：在 __init__ 中统一声明 ──────────────────────────
         self.llm_serving = APILLMServing_request(
-            api_url=os.environ.get("DF_API_URL", "https://api.openai.com/v1"),
+            api_url=os.environ.get(
+                "DF_API_URL", "https://api.openai.com/v1/chat/completions"
+            ),
             key_name_of_api_key="DF_API_KEY",     # 对应环境变量名
             model_name=os.environ.get("DF_MODEL_NAME", "gpt-4o"),
-            max_workers=200,  # 自建/代理 API 推荐 200+；官方 API 推荐 50-100
         )
 
         # ── 算子成员变量：带 _stepN 后缀，N 为执行顺序 ──────────────────

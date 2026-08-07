@@ -1,18 +1,21 @@
 """Review-only scorer with sample, full-file, and optional dataset-distribution evidence.
 
-The five review dimensions are combined into one comparable score:
-- 五维 LLM-judge（各 0-1）：correctness / relevance / difficulty / diversity / schema。
-- 固定权重复合分：``llm_composite = 0.35·correctness + 0.20·relevance
-  + 0.15·difficulty + 0.15·diversity + 0.15·schema``。
+The four sample-level review dimensions are combined into one comparable score:
+- 四维 LLM-judge（各 0-1）：correctness / relevance / difficulty / schema。
+- 固定权重复合分：``llm_composite = 0.40·correctness + 0.25·relevance
+  + 0.15·difficulty + 0.20·schema``。
+- embedding quality（启用时）由归一化 DAS、normalized Vendi 和 NN-cosine p95 构成；
+  默认占 review_score 的 25%，sample-level LLM 占 75%。
 - 硬指标惩罚（扫全份文件，不花 LLM）：``dup_rate`` / ``null_rate`` / ``parse_valid_rate``
-  / ``contamination_rate``，``review_score = llm_composite × (1-dup)(1-null)(1-contam) × parse_valid``。
+  / ``contamination_rate``，在上述混合质量分之后统一相乘。
   其中 ``dup_rate`` 取「整记录哈希」与「训练字段级」两种口径的较大值——只看整记录会漏掉
   同一道题配不同措辞 CoT 的情形（详见 ``_scan_hard_metrics``）；``contamination_rate``
   是与 benchmark 测试集的 n-gram 重合率，超阈值直接判 ``passed=False``（见 core/decontamination.py）。
 - 抽样从「取前 N 行」改为**随机蓄水池采样**（一趟遍历、O(k) 内存、全份等概率）。
 - ``passed`` 门槛保留（schema/relevance 阈值），用于剔除垃圾节点。
-- 可选 DatasetQualityEvaluator 固定采样候选集和高质量代理集，计算 DAS=-MMD；该原始值
-  保持独立，不与 0-1 的 LLM 分数做无标定加权，但会随 ReviewResult 回传 PipelineAgent。
+- 可选 DatasetQualityEvaluator 固定采样候选集和高质量代理集，计算 DAS=-MMD，并复用
+  候选 embedding 计算 Vendi Score 与近邻 cosine 分布。这些 dataset-level 原始值保持独立，
+  不与 0-1 的 LLM 分数做无标定加权，但会随 ReviewResult 回传 PipelineAgent。
 
 Optional decontamination references are used only for n-gram overlap detection and are
 never included in an Agent prompt.
@@ -21,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import random
 import statistics
 import time
@@ -31,16 +35,21 @@ from typing import NamedTuple
 from dataflow_evolver.agents.base import AgentABC
 from dataflow_evolver.core.dataset_quality import DatasetQualityEvaluator
 from dataflow_evolver.core.decontamination import ContaminationIndex
-from dataflow_evolver.core.schemas import ReviewResult, TaskProfile
+from dataflow_evolver.core.schemas import ReviewResult, TaskSpec
 from dataflow_evolver.llm.prompts import FAILURE_SIGNALS, build_review_prompt
 
 # Review 复合分的固定权重。
 DEFAULT_REVIEW_WEIGHTS: dict[str, float] = {
-    "correctness": 0.35,
-    "relevance": 0.20,
+    "correctness": 0.40,
+    "relevance": 0.25,
     "difficulty": 0.15,
-    "diversity": 0.15,
-    "schema": 0.15,
+    "schema": 0.20,
+}
+
+DEFAULT_EMBEDDING_SCORE_WEIGHTS: dict[str, float] = {
+    "das": 0.40,
+    "vendi": 0.30,
+    "nearest_neighbor": 0.30,
 }
 
 
@@ -61,6 +70,8 @@ class ReviewAgent(AgentABC):
         null_threshold: float = 0.5,
         dataset_quality_evaluator: DatasetQualityEvaluator | None = None,
         dataset_quality_fields: tuple[str, str] = ("instruction", "output"),
+        dataset_quality_weight: float = 0.25,
+        dataset_quality_score_weights: dict[str, float] | None = None,
     ) -> None:
         super().__init__(serving, max_retries=max_retries)
         self.schema_threshold = schema_threshold
@@ -76,29 +87,31 @@ class ReviewAgent(AgentABC):
         self.contamination = contamination or ContaminationIndex()
         self.dataset_quality_evaluator = dataset_quality_evaluator
         self.dataset_quality_fields = dataset_quality_fields
+        self.dataset_quality_weight = _clip01(dataset_quality_weight)
+        self.dataset_quality_score_weights = _normalize_embedding_score_weights(
+            dataset_quality_score_weights
+        )
 
-    def build_prompt(self, profile: TaskProfile, samples_text: str) -> str:
-        return build_review_prompt(profile, samples_text)
+    def build_prompt(self, task: TaskSpec, samples_text: str) -> str:
+        return build_review_prompt(task, samples_text)
 
     def compute_composite(self, result: ReviewResult) -> float:
-        """五维加权复合分（仅依赖 LLM 维度与固定权重）。"""
+        """四维加权复合分（仅依赖 sample-level LLM 维度与固定权重）。"""
         w = self.weights
         return (
             w["correctness"] * result.correctness_score
             + w["relevance"] * result.relevance_score
             + w["difficulty"] * result.difficulty_score
-            + w["diversity"] * result.diversity_score
             + w["schema"] * result.schema_score
         )
 
     def parse(self, raw: dict) -> ReviewResult:
-        """把 LLM 返回的五维分解析进 ReviewResult（尚未叠加硬指标惩罚）。"""
+        """把 LLM 返回的四维分解析进 ReviewResult（尚未叠加硬指标惩罚）。"""
         schema_score = _clip01(raw.get("schema_score", 0.0))
         relevance_score = _clip01(raw.get("relevance_score", 0.0))
-        # 新增三维：缺省回退保证旧 prompt / 部分返回也不崩。
+        # 缺省回退保证部分返回不崩。
         correctness_score = _clip01(raw.get("correctness_score", 0.0))
         difficulty_score = _clip01(raw.get("difficulty_score", 0.0))
-        diversity_score = _clip01(raw.get("diversity_score", 0.0))
         passed = (
             schema_score >= self.schema_threshold
             and relevance_score >= self.relevance_threshold
@@ -116,19 +129,18 @@ class ReviewAgent(AgentABC):
             issues=issues,
             correctness_score=correctness_score,
             difficulty_score=difficulty_score,
-            diversity_score=diversity_score,
             failure_signals=signals,
         )
         result.llm_composite = self.compute_composite(result)
         # 未叠加硬指标前，review_score 先等于复合分（review() 会用硬指标覆盖）。
-        result.review_score = result.llm_composite
+        self._update_review_score(result)
         return result
 
     def apply_hard_metrics(
-        self, result: ReviewResult, dataset_path: str, profile: TaskProfile
+        self, result: ReviewResult, dataset_path: str, task: TaskSpec
     ) -> ReviewResult:
         """扫全份文件得硬指标并叠加惩罚，写回 result 并返回。"""
-        required = list(profile.target_schema.keys()) if profile.target_schema else []
+        required = list(task.target_schema.keys()) if task.target_schema else []
         metrics = _scan_hard_metrics(dataset_path, required)
         result.dup_rate = metrics.dup_rate
         result.null_rate = metrics.null_rate
@@ -173,24 +185,18 @@ class ReviewAgent(AgentABC):
                     f"{'；'.join(contam.examples)}。请去掉直接取自基准测试集的数据来源。"
                 )
 
-        result.review_score = (
-            result.llm_composite
-            * (1.0 - metrics.dup_rate)
-            * (1.0 - metrics.null_rate)
-            * (1.0 - contam.rate)
-            * metrics.parse_valid_rate
-        )
+        self._update_review_score(result)
         return result
 
     def review(
         self,
         dataset_path: str,
-        profile: TaskProfile,
+        task: TaskSpec,
         evidence_path: str | None = None,
         phase: str = "search",
         parent_review: ReviewResult | None = None,
     ) -> ReviewResult:
-        """LLM 抽样、全量硬指标和可选 DAS/MMD 共同生成 ReviewResult。
+        """LLM 抽样、全量硬指标和可选 embedding 指标共同生成 ReviewResult。
 
         `evidence_path` appends the exact sample, raw response, and parsed result so every
         feedback step can be audited or rescored offline.
@@ -200,20 +206,20 @@ class ReviewAgent(AgentABC):
             result = ReviewResult(0.0, 0.0, False, ["数据集为空或不可读"])
             self._dump_evidence(evidence_path, phase, dataset_path, "", None, result)
             return result
-        prompt = self.build_prompt(profile, samples_text)
+        prompt = self.build_prompt(task, samples_text)
         raw = self.run_json(prompt)
         if raw is None:
             result = ReviewResult(0.0, 0.0, False, ["评审 LLM 未返回有效 JSON"])
         else:
             result = self.parse(raw)
         if self.hard_metrics:
-            self.apply_hard_metrics(result, dataset_path, profile)
+            self.apply_hard_metrics(result, dataset_path, task)
         self.apply_dataset_quality(result, dataset_path, parent_review)
         self.logger.info(
-            "Review：corr=%.2f rel=%.2f diff=%.2f div=%.2f schema=%.2f "
+            "Review sample：corr=%.2f rel=%.2f diff=%.2f schema=%.2f "
             "| dup=%.2f null=%.2f parse=%.2f | composite=%.3f review_score=%.3f passed=%s | signals=%s",
             result.correctness_score, result.relevance_score, result.difficulty_score,
-            result.diversity_score, result.schema_score,
+            result.schema_score,
             result.dup_rate, result.null_rate, result.parse_valid_rate,
             result.llm_composite, result.review_score, result.passed,
             ",".join(result.failure_signals) or "-",
@@ -222,7 +228,7 @@ class ReviewAgent(AgentABC):
         if dq.enabled:
             self.logger.info(
                 "Dataset quality：status=%s MMD=%s DAS=%s delta_vs_parent=%s "
-                "samples=%d/%d proxy=%s",
+                "Vendi=%s NN-cos-mean=%s samples=%d/%d proxy=%s",
                 dq.status,
                 f"{dq.mmd:.6f}" if dq.mmd is not None else "-",
                 f"{dq.das:.6f}" if dq.das is not None else "-",
@@ -231,6 +237,8 @@ class ReviewAgent(AgentABC):
                     if dq.delta_mmd_vs_parent is not None
                     else "-"
                 ),
+                _format_metric(dq.embedding_diversity, "cosine_vendi_score", 3),
+                _format_metric(dq.embedding_diversity, "nearest_neighbor_cosine_mean", 4),
                 dq.candidate_sample_size,
                 dq.candidate_total,
                 dq.proxy_name,
@@ -246,6 +254,7 @@ class ReviewAgent(AgentABC):
     ) -> ReviewResult:
         """Run deterministic proxy-distribution evaluation without changing review_score."""
         if self.dataset_quality_evaluator is None:
+            self._update_review_score(result)
             return result
         user_field, assistant_field = self.dataset_quality_fields
         result.dataset_quality = self.dataset_quality_evaluator.evaluate(
@@ -262,7 +271,82 @@ class ReviewAgent(AgentABC):
             result.dataset_quality.delta_mmd_vs_parent = (
                 result.dataset_quality.mmd - parent_quality.mmd
             )
+        if parent_quality is not None:
+            result.dataset_quality.delta_embedding_diversity_vs_parent = {
+                key: value - parent_quality.embedding_diversity[key]
+                for key, value in result.dataset_quality.embedding_diversity.items()
+                if key in parent_quality.embedding_diversity
+            }
+        self._update_review_score(result)
         return result
+
+    def _update_review_score(self, result: ReviewResult) -> None:
+        """Combine sample quality, embedding quality, and full-file hard penalties."""
+        embedding_score: float | None = None
+        dataset_quality_enabled = self.dataset_quality_evaluator is not None
+        dataset_quality_weight = getattr(self, "dataset_quality_weight", 0.25)
+        if dataset_quality_enabled:
+            embedding_score = self._compute_embedding_quality(result)
+
+        if dataset_quality_enabled:
+            # Missing enabled evidence receives no embedding credit. This prevents a
+            # failed metric computation from outranking candidates with valid evidence.
+            dataset_component = embedding_score if embedding_score is not None else 0.0
+            combined = (
+                (1.0 - dataset_quality_weight) * result.llm_composite
+                + dataset_quality_weight * dataset_component
+            )
+        else:
+            dataset_component = 0.0
+            combined = result.llm_composite
+
+        hard_factor = (
+            (1.0 - result.dup_rate)
+            * (1.0 - result.null_rate)
+            * (1.0 - result.contamination_rate)
+            * result.parse_valid_rate
+        )
+        result.score_components = {
+            "llm_composite": result.llm_composite,
+            "embedding_quality": dataset_component,
+            "embedding_weight": dataset_quality_weight if dataset_quality_enabled else 0.0,
+            "hard_factor": hard_factor,
+            "combined_before_hard_penalty": combined,
+        }
+        result.review_score = _clip01(combined * hard_factor)
+
+    def _compute_embedding_quality(self, result: ReviewResult) -> float | None:
+        quality = result.dataset_quality
+        if quality.status != "ok" or quality.mmd is None:
+            quality.embedding_quality_components = {}
+            quality.embedding_quality_score = None
+            return None
+
+        diversity = quality.embedding_diversity
+        vendi_ratio = diversity.get("cosine_vendi_ratio")
+        nn_p95 = diversity.get("nearest_neighbor_cosine_p95")
+        components: dict[str, float] = {
+            # RBF kernels are bounded in [0, 1], so MMD is bounded by sqrt(2).
+            "das": _clip01(1.0 - quality.mmd / math.sqrt(2.0)),
+        }
+        if vendi_ratio is not None:
+            components["vendi"] = _clip01(vendi_ratio)
+        if nn_p95 is not None:
+            components["nearest_neighbor"] = _clip01((1.0 - nn_p95) / 2.0)
+
+        weights = getattr(
+            self, "dataset_quality_score_weights", DEFAULT_EMBEDDING_SCORE_WEIGHTS
+        )
+        available_weight = sum(weights[key] for key in components)
+        if available_weight <= 0.0:
+            return None
+        score = sum(
+            weights[key] * value
+            for key, value in components.items()
+        ) / available_weight
+        quality.embedding_quality_components = components
+        quality.embedding_quality_score = _clip01(score)
+        return quality.embedding_quality_score
 
     def _dump_evidence(
         self,
@@ -308,6 +392,24 @@ def _normalize_weights(weights: dict[str, float] | None) -> dict[str, float]:
             if k in merged:
                 merged[k] = float(v)
     return merged
+
+
+def _normalize_embedding_score_weights(
+    weights: dict[str, float] | None,
+) -> dict[str, float]:
+    merged = dict(DEFAULT_EMBEDDING_SCORE_WEIGHTS)
+    if weights:
+        for key, value in weights.items():
+            if key in merged:
+                merged[key] = max(0.0, float(value))
+    if sum(merged.values()) <= 0.0:
+        raise ValueError("dataset_quality.score_weights 至少需要一个正权重")
+    return merged
+
+
+def _format_metric(metrics: dict[str, float], key: str, precision: int) -> str:
+    value = metrics.get(key)
+    return f"{value:.{precision}f}" if value is not None else "-"
 
 
 def _normalize_signals(raw_signals) -> list[str]:

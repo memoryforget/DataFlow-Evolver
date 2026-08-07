@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dataflow_evolver.utils.config import load_config
 from dataflow_evolver.utils.parsing import extract_json, extract_code
+from dataflow_evolver.main import _normalize_pipeline_api_url
 
 
 def test_config_loads_and_expands():
@@ -16,7 +17,15 @@ def test_config_loads_and_expands():
     assert cfg.agent.setting_sources == ["project"]
     # env default expansion
     assert cfg.llm.api.model_name == "gpt-5.5"
+    assert int(cfg.llm.api.max_workers) == 10
     assert cfg.loop.get("missing", 42) == 42
+
+
+def test_pipeline_api_url_accepts_base_or_full_chat_endpoint():
+    full = "https://api.example/v1/chat/completions"
+    assert _normalize_pipeline_api_url("https://api.example/v1") == full
+    assert _normalize_pipeline_api_url(full + "/") == full
+    assert _normalize_pipeline_api_url("https://api.example/custom") == "https://api.example/custom"
 
 
 def test_extract_json_fenced():

@@ -279,10 +279,9 @@ from dataflow.operators.reasoning.refine.cot_llm_judge_refiner import CoTLLMJudg
 ### 3.5 环境变量配置模板
 
 ```bash
-export DF_API_KEY=sk-xxxxxxxxxxxx
+export DF_API_KEY=...
 export DF_API_URL=http://your-api/v1/chat/completions
 export DF_MODEL_NAME=gpt-4o
-export DF_MAX_WORKERS=200       # 根据 API 并发能力调整
 export DF_LOGGING_LEVEL=INFO    # DEBUG / INFO / WARNING / ERROR
 ```
 
@@ -321,7 +320,6 @@ class MyReasoningPipeline:
             api_url="http://your-api/v1/chat/completions",
             key_name_of_api_key="DF_API_KEY",
             model_name="gpt-4o",
-            max_workers=200,
         )
         self.generator_step1 = ReasoningAnswerGenerator(
             llm_serving=self.llm_serving,
@@ -374,12 +372,6 @@ import dataflow.operators.reasoning as r
 print(r._import_structure)
 ```
 
-### 5.4 APILLMServing_request 并发配置
-
-默认值 `max_workers=10` 极大低估了 API 能力，务必根据实际情况调整（自建/代理 API 推荐 200+）。
-
----
-
 ## 六、Python re.split() 捕获组规范
 
 > 诊断用根因分析见 `diagnostics/known_issues.md` Issue #006。本节仅列代码规范要求。
@@ -399,7 +391,7 @@ print(r._import_structure)
 |------|------|
 | 2026-03-29 | 初始化协同开发规范文件，基于主仓库 v1.0.10 |
 | 2026-03-29 | 新增 §1.7 算子复用原则、§1.8 算子健壮性与容错规范、§1.9 推理模型 CoT 输出处理规范 |
-| 2026-03-30 | 新增 §五 Pipeline 开发实战指南（LazyLoader 坑、storage.step() 用法、并发配置） |
+| 2026-03-30 | 新增 §五 Pipeline 开发实战指南（LazyLoader 坑、storage.step() 用法） |
 | 2026-03-30 | 新增 §六 re.split() 捕获组 Bug 记录 |
 | 2026-04-02 | 整理为 skill context 文件，补充 get_desc() 返回类型说明、两种 Pipeline 风格对比 |
 | 2026-04-03 | 移除 CoT Refiner 专项内容（未合入主仓库）；§二已知问题归并至 known_issues.md；对齐主仓库（OpenDCAI/DataFlow main） |

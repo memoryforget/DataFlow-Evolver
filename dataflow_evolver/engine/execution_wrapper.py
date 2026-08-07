@@ -1,6 +1,9 @@
 """ExecutionWrapper：运行 PipelineAgent 产出的 DataFlow 流水线代码并捕获崩溃栈。"""
 from __future__ import annotations
 
+import ast
+import json
+import os
 import subprocess
 import sys
 import re
@@ -15,9 +18,9 @@ from dataflow_evolver.telemetry.pipeline_usage import (
     ATTEMPT_ENV,
     BOOTSTRAP_DIR,
     EXECUTION_ID_ENV,
-    NODE_ENV,
+    ITERATION_ENV,
     USAGE_PATH_ENV,
-    write_combined_node_usage,
+    write_combined_iteration_usage,
     write_pipeline_usage_summary,
 )
 from dataflow_evolver.utils.logging import get_logger
@@ -35,6 +38,8 @@ class ExecutionResult:
     stdout: str = ""
     stderr: str = ""
     artifacts: dict[str, str] = field(default_factory=dict)
+    diagnostics: str = ""
+    failure_stage: str | None = None
 
 
 class ExecutionWrapperABC(ABC):
@@ -44,84 +49,96 @@ class ExecutionWrapperABC(ABC):
     def run(
         self,
         config: PipelineConfig,
-        node_dir: str,
+        iteration_dir: Path,
         env_overrides: dict[str, str] | None = None,
     ) -> ExecutionResult:
-        """在 `node_dir` 下执行 `config.code`，返回数据集路径或崩溃栈。
-
-        `env_overrides` adds or overrides variables for this iteration, such as the
-        optional ``DF_TARGET_SAMPLES`` value.
-        """
+        """Execute the generated pipeline inside one iteration directory."""
         raise NotImplementedError
 
 
 class SubprocessExecutionWrapper(ExecutionWrapperABC):
-    """在隔离子进程里运行生成的 pipeline.py，捕获崩溃栈。
+    """Run a generated pipeline from the canonical Agent workspace.
 
-    约定：PipelineAgent 已把 `pipeline.py` 写到 `node_dir`（位于 agent_root 下）。
-    子进程 cwd 设为 `agent_root`（使 `import dataflow` 与相对路径生效）。
-    成功后扫描 `node_dir` 下执行期间新增/更新的 .jsonl，取最新者作为产出数据集。
+    ``workspace_dir`` contains the project skill and vendored DataFlow code. Each
+    ``iteration_dir`` below it contains generated code, sessions, diagnostics, and
+    review output.
     """
 
     def __init__(
         self,
-        agent_root: str,
+        workspace_dir: str,
         pipeline_filename: str = "pipeline.py",
+        compile_timeout_sec: int = 120,
         timeout_sec: int = 1800,
         python_exe: str | None = None,
         extra_env: dict[str, str] | None = None,
-        token_usage_root: str | None = None,
     ) -> None:
-        self.agent_root = Path(agent_root).resolve()
+        self.workspace_dir = Path(workspace_dir).resolve()
         self.pipeline_filename = pipeline_filename
+        self.compile_timeout_sec = compile_timeout_sec
         self.timeout_sec = timeout_sec
         self.python_exe = python_exe or sys.executable
         self.extra_env = extra_env or {}
-        self.token_usage_root = (
-            Path(token_usage_root).expanduser().resolve()
-            if token_usage_root
-            else self.agent_root.parent / "agent_sessions"
-        )
         self._execution_attempts: dict[str, int] = {}
 
     def run(
         self,
         config: PipelineConfig,
-        node_dir: str,
+        iteration_dir: Path,
         env_overrides: dict[str, str] | None = None,
     ) -> ExecutionResult:
-        node_path = (self.agent_root / node_dir).resolve()
-        pipeline_path = node_path / self.pipeline_filename
+        iteration_dir = iteration_dir.resolve()
+        pipeline_path = iteration_dir / self.pipeline_filename
         if not pipeline_path.exists():
-            return ExecutionResult(False, traceback=f"流水线文件不存在：{pipeline_path}")
+            return ExecutionResult(
+                False,
+                traceback=f"流水线文件不存在：{pipeline_path}",
+                failure_stage="artifact_validation",
+            )
 
-        import os
+        artifact_errors = _validate_pipeline_artifact(pipeline_path)
+        if artifact_errors:
+            logger.warning("Pipeline artifact 校验失败：%s", "; ".join(artifact_errors))
+            return ExecutionResult(
+                False,
+                traceback="Pipeline artifact validation failed:\n- " + "\n- ".join(artifact_errors),
+                diagnostics=json.dumps(
+                    {"stage": "artifact_validation", "errors": artifact_errors},
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                failure_stage="artifact_validation",
+            )
+
         env = {**os.environ, **self.extra_env}
-        # `python <node_dir>/pipeline.py` 的 sys.path[0] 是**脚本所在目录**（node_dir），
-        # cwd=agent_root 并不会进 sys.path，因此 vendored 的 agent_root/dataflow 导入不到。
+        # The script directory enters sys.path, but vendored DataFlow lives in workspace_dir.
         # 不补这一项，每个节点首跑必定 ModuleNotFoundError('dataflow')，只能靠自纠回合补
         # sys.path，白烧一次 Agent 往返与一次自纠额度。
         prev_pp = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = os.pathsep.join(
             [
-                str(self.agent_root),
+                str(self.workspace_dir),
                 str(BOOTSTRAP_DIR),
                 *(p for p in prev_pp.split(os.pathsep) if p),
             ]
         )
         if env_overrides:
             env.update(env_overrides)
-        attempt = self._execution_attempts.get(node_dir, 0) + 1
-        self._execution_attempts[node_dir] = attempt
-        usage_dir = (self.token_usage_root / Path(node_dir) / "pipeline").resolve()
+        # Compile-only is framework-internal state. Never let a parent shell or caller
+        # accidentally turn the subsequent formal run into a second preflight.
+        env.pop("DF_COMPILE_ONLY", None)
+        key = str(iteration_dir)
+        attempt = self._execution_attempts.get(key, 0) + 1
+        self._execution_attempts[key] = attempt
+        usage_dir = iteration_dir / "sessions" / "pipeline"
         events_path = usage_dir / "pipeline_llm_calls.jsonl"
-        summary_path = node_path / "pipeline_llm_token_usage.json"
-        combined_path = node_path / "token_usage.json"
+        summary_path = iteration_dir / "pipeline_llm_token_usage.json"
+        combined_path = iteration_dir / "token_usage.json"
         env.update(
             {
                 USAGE_PATH_ENV: str(events_path),
                 EXECUTION_ID_ENV: uuid.uuid4().hex,
-                NODE_ENV: node_dir,
+                ITERATION_ENV: iteration_dir.name,
                 ATTEMPT_ENV: str(attempt),
             }
         )
@@ -134,15 +151,65 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
         def finalize_usage() -> None:
             try:
                 write_pipeline_usage_summary(events_path, summary_path)
-                write_combined_node_usage(node_path)
+                write_combined_iteration_usage(iteration_dir)
             except (OSError, ValueError) as exc:
                 logger.warning("记录 pipeline LLM token 失败（不影响主流程）：%s", exc)
 
+        compile_env = {**env, "DF_COMPILE_ONLY": "1"}
+        logger.info("开始 framework-owned compile 预检：%s", pipeline_path)
+        try:
+            compile_proc = subprocess.run(
+                [self.python_exe, str(pipeline_path)],
+                cwd=str(self.workspace_dir),
+                capture_output=True,
+                text=True,
+                timeout=self.compile_timeout_sec,
+                env=compile_env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            finalize_usage()
+            logger.error("compile 预检超时（>%ds）：%s", self.compile_timeout_sec, pipeline_path)
+            return ExecutionResult(
+                False,
+                traceback=f"CompileTimeoutExpired: compile 预检超过 {self.compile_timeout_sec}s",
+                stdout=exc.stdout or "",
+                stderr=exc.stderr or "",
+                artifacts=artifacts,
+                diagnostics=json.dumps(
+                    {"stage": "compile", "status": "timeout"}, ensure_ascii=False
+                ),
+                failure_stage="compile",
+            )
+
+        if compile_proc.returncode != 0:
+            finalize_usage()
+            logger.error("compile 预检失败（exit=%d）：%s", compile_proc.returncode, pipeline_path)
+            return ExecutionResult(
+                False,
+                traceback=compile_proc.stderr or f"compile preflight exited with code {compile_proc.returncode}",
+                stdout=compile_proc.stdout,
+                stderr=compile_proc.stderr,
+                artifacts=artifacts,
+                diagnostics=json.dumps(
+                    {
+                        "stage": "compile",
+                        "status": "failed",
+                        "returncode": compile_proc.returncode,
+                        "stdout_tail": compile_proc.stdout[-2000:],
+                        "stderr_tail": compile_proc.stderr[-4000:],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                failure_stage="compile",
+            )
+
+        logger.info("compile 预检通过，开始正式执行：%s", pipeline_path)
         start = time.time()
         try:
             proc = subprocess.run(
                 [self.python_exe, str(pipeline_path)],
-                cwd=str(self.agent_root),
+                cwd=str(self.workspace_dir),
                 capture_output=True,
                 text=True,
                 timeout=self.timeout_sec,
@@ -150,29 +217,38 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
             )
         except subprocess.TimeoutExpired as exc:
             finalize_usage()
-            logger.error("流水线执行超时（>%ds）：%s", self.timeout_sec, node_dir)
+            diagnostics = _jsonl_diagnostics(iteration_dir, since=start)
+            logger.error("流水线执行超时（>%ds）：%s", self.timeout_sec, iteration_dir)
             return ExecutionResult(
                 False, traceback=f"TimeoutExpired: 执行超过 {self.timeout_sec}s",
                 stdout=exc.stdout or "", stderr=exc.stderr or "", artifacts=artifacts,
+                diagnostics=diagnostics,
+                failure_stage="execution",
             )
 
         finalize_usage()
         if proc.returncode != 0:
-            logger.error("流水线执行失败（exit=%d）：%s", proc.returncode, node_dir)
+            diagnostics = _jsonl_diagnostics(iteration_dir, since=start)
+            logger.error("流水线执行失败（exit=%d）：%s", proc.returncode, iteration_dir)
             if proc.stderr:
                 logger.error("stderr:\n%s", proc.stderr[-2000:])
             return ExecutionResult(
                 False,
                 traceback=proc.stderr or f"non-zero exit code {proc.returncode}",
                 stdout=proc.stdout, stderr=proc.stderr, artifacts=artifacts,
+                diagnostics=diagnostics,
+                failure_stage="execution",
             )
 
-        dataset_path = _find_fresh_jsonl(node_path, since=start)
+        dataset_path = _find_fresh_jsonl(iteration_dir, since=start)
         if dataset_path is None:
-            logger.warning("流水线执行成功但未发现输出 jsonl：%s", node_dir)
+            diagnostics = _jsonl_diagnostics(iteration_dir, since=start)
+            logger.warning("流水线执行成功但未发现有效输出 jsonl：%s", iteration_dir)
             return ExecutionResult(
-                False, traceback="执行成功但未在 node_dir 找到输出 .jsonl 数据集",
+                False, traceback="执行成功但最终 JSONL 不存在或为空",
                 stdout=proc.stdout, stderr=proc.stderr, artifacts=artifacts,
+                diagnostics=diagnostics,
+                failure_stage="output_validation",
             )
         logger.info("流水线产出数据集：%s", dataset_path)
         return ExecutionResult(
@@ -181,11 +257,82 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
         )
 
 
+def _validate_pipeline_artifact(path: Path) -> list[str]:
+    """Validate the mandatory compile contract without importing generated code."""
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return [f"cannot read pipeline.py: {exc}"]
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError as exc:
+        return [f"syntax error at line {exc.lineno}: {exc.msg}"]
+
+    compile_lines: list[int] = []
+    forward_lines: list[int] = []
+    guard_lines: list[int] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "compile":
+                compile_lines.append(node.lineno)
+            elif node.func.attr == "forward":
+                forward_lines.append(node.lineno)
+        elif isinstance(node, ast.If) and _is_compile_only_guard(node):
+            guard_lines.append(node.lineno)
+
+    errors: list[str] = []
+    if not compile_lines:
+        errors.append("missing pipeline.compile() call")
+    if not guard_lines:
+        errors.append("missing terminating DF_COMPILE_ONLY guard")
+    if not forward_lines:
+        errors.append("missing pipeline.forward() call")
+    if not errors:
+        compile_line = min(compile_lines)
+        guard_line = min(guard_lines)
+        forward_after_guard = [line for line in forward_lines if line > guard_line]
+        if not (compile_line < guard_line and forward_after_guard):
+            errors.append(
+                "main execution order must be pipeline.compile() -> "
+                "DF_COMPILE_ONLY guard -> pipeline.forward()"
+            )
+    return errors
+
+
+def _is_compile_only_guard(node: ast.If) -> bool:
+    mentions_flag = any(
+        isinstance(child, ast.Constant) and child.value == "DF_COMPILE_ONLY"
+        for child in ast.walk(node.test)
+    )
+    if not mentions_flag:
+        return False
+    for statement in ast.walk(ast.Module(body=node.body, type_ignores=[])):
+        if isinstance(statement, (ast.Return, ast.Raise)):
+            return True
+        if isinstance(statement, ast.Call):
+            function = statement.func
+            if isinstance(function, ast.Name) and function.id == "exit":
+                return True
+            if isinstance(function, ast.Attribute) and function.attr == "exit":
+                return True
+    return False
+
+
 _STEP_RE = re.compile(r"_step(\d+)\.jsonl$", re.IGNORECASE)
+_METADATA_JSONL = {"review.jsonl", "agent_sessions.jsonl", "agent_tools.jsonl"}
 
 
-def _find_fresh_jsonl(node_path: Path, since: float) -> Path | None:
-    """返回 node_path 下执行期间产生的输出 jsonl（流水线的最终产物）。
+def _is_pipeline_artifact(path: Path, iteration_dir: Path) -> bool:
+    """Exclude framework/session telemetry from candidate dataset discovery."""
+    try:
+        relative = path.relative_to(iteration_dir)
+    except ValueError:
+        return False
+    return bool(relative.parts) and relative.parts[0] != "sessions" and path.name not in _METADATA_JSONL
+
+
+def _find_fresh_jsonl(iteration_dir: Path, since: float) -> Path | None:
+    """Return the final JSONL created by this iteration.
 
     DataFlow 的 FileStorage 把每个算子产物**确定性**命名为
     `{file_name_prefix}_step{N}.{cache_type}`（见 storage.py `_get_cache_file_path`），
@@ -196,28 +343,70 @@ def _find_fresh_jsonl(node_path: Path, since: float) -> Path | None:
     的文件（自定义产物名），再退回"最新非空 → 最新"的 mtime 启发式。
     """
     fresh = [
-        p for p in node_path.rglob("*.jsonl")
-        if p.is_file() and p.stat().st_mtime >= since - 1.0
+        p for p in iteration_dir.rglob("*.jsonl")
+        if p.is_file()
+        and _is_pipeline_artifact(p, iteration_dir)
+        and p.stat().st_mtime >= since - 1.0
     ]
     if not fresh:
         return None
 
-    # 优先：按 _step{N} 命名取最大 step 的非空文件
+    # 最大 step 就是最终产物；为空时明确失败，不能回退到中间步骤。
     stepped = []
     for p in fresh:
         m = _STEP_RE.search(p.name)
         if m:
             stepped.append((int(m.group(1)), p))
-    for _, p in sorted(stepped, key=lambda t: t[0], reverse=True):
-        if _jsonl_nonempty(p):
-            return p
+    if stepped:
+        final = max(stepped, key=lambda item: item[0])[1]
+        return final if _jsonl_nonempty(final) else None
 
     # 回退：无 step 命名 → 最新的非空；若全为空 → 最新文件（交由下游 Review 判其不合格）
     fresh.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     for p in fresh:
         if _jsonl_nonempty(p):
             return p
-    return fresh[0]
+    return None
+
+
+def _jsonl_diagnostics(iteration_dir: Path, since: float) -> str:
+    """Summarize row counts and first-row schemas for execution repair."""
+    rows: list[dict[str, object]] = []
+    for path in sorted(iteration_dir.rglob("*.jsonl")):
+        if not _is_pipeline_artifact(path, iteration_dir):
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if stat.st_mtime < since - 1.0:
+            continue
+        line_count = 0
+        fields: list[str] = []
+        parse_error: str | None = None
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    line_count += 1
+                    if not fields:
+                        try:
+                            value = json.loads(line)
+                            if isinstance(value, dict):
+                                fields = sorted(str(key) for key in value)
+                        except json.JSONDecodeError as exc:
+                            parse_error = f"line 1: {exc.msg}"
+        except OSError as exc:
+            parse_error = str(exc)
+        rows.append({
+            "path": str(path.relative_to(iteration_dir)),
+            "bytes": stat.st_size,
+            "rows": line_count,
+            "fields": fields,
+            "parse_error": parse_error,
+        })
+    return json.dumps(rows, ensure_ascii=False, indent=2) if rows else "no fresh JSONL artifacts"
 
 
 def _jsonl_nonempty(path: Path) -> bool:

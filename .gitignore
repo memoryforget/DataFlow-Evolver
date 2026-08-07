@@ -1,42 +1,22 @@
-# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
 .env
 
-# HuggingFace 本地缓存（运行期产物，勿提交）
+# User-provided assets.
+data/*
+model/*
+input/*
+logs/
 hf_cache/
 
-# 本地运行日志
-logs/
-
-# 用户输入语料按任务变化且通常较大，不入库
-input/*
-
-# 本地数据属于运行输入或产物，不入库
-data/*
-
-# 本地模型权重由用户自行准备，不入库
-model/*
-
-# Optional centralized Claude/OpenCode session state
-agent_sessions/
-
-# 忽略 workspace 运行产物
+# The workspace is the Agent project root. Keep its project skill and vendored
+# DataFlow source tracked; ignore runtime state and unrelated root-level output.
 workspace/*
-
-# 放行 PipelineAgent 所需的 _agent_root
-!workspace/_agent_root/
-workspace/_agent_root/*
-# 放行 vendored DataFlow 源码副本（Apache-2.0，见 dataflow/VENDOR.md）
-!workspace/_agent_root/dataflow/
-!workspace/_agent_root/dataflow/**
-# 但继续忽略 vendored 目录内的 Python 编译产物
-workspace/_agent_root/dataflow/**/__pycache__/
-workspace/_agent_root/dataflow/**/*.py[cod]
-
-# 放行 dataflow-dev skill
-!workspace/_agent_root/.claude/
-!workspace/_agent_root/.claude/skills/
-!workspace/_agent_root/.claude/skills/**
+!workspace/.claude/
+!workspace/.claude/**
+!workspace/dataflow/
+!workspace/dataflow/**
+workspace/dataflow/**/__pycache__/
+workspace/dataflow/**/*.py[cod]

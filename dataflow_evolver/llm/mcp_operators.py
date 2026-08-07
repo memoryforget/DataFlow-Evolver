@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Annotated, Any
@@ -33,14 +34,14 @@ from typing import Annotated, Any
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 # ---------------------------------------------------------------------------
-# Registry bootstrap — ensure dataflow package is importable from _agent_root
+# Registry bootstrap: import DataFlow from the canonical Agent workspace.
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-AGENT_ROOT = PROJECT_ROOT / "workspace" / "_agent_root"
+WORKSPACE_DIR = Path(os.environ.get("DF_WORKSPACE", PROJECT_ROOT / "workspace")).resolve()
 
-if str(AGENT_ROOT) not in sys.path:
-    sys.path.insert(0, str(AGENT_ROOT))
+if str(WORKSPACE_DIR) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_DIR))
 
 from dataflow.utils.registry import OPERATOR_REGISTRY  # noqa: E402
 

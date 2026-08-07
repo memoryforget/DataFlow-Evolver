@@ -1,4 +1,4 @@
-"""Per-node agent session isolation and token-usage accounting."""
+"""Per-iteration agent session isolation and token-usage accounting."""
 from __future__ import annotations
 
 import json
@@ -10,7 +10,7 @@ from typing import Any
 
 from dataflow_evolver.utils.config import Config
 from dataflow_evolver.utils.logging import get_logger
-from dataflow_evolver.telemetry.pipeline_usage import write_combined_node_usage
+from dataflow_evolver.telemetry.pipeline_usage import write_combined_iteration_usage
 
 logger = get_logger("llm.session_state")
 
@@ -35,7 +35,7 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _claude_usage(root: Path) -> dict[str, Any]:
-    source_files = sorted((root / ".claude/projects").glob("**/*.jsonl"))
+    source_files = sorted((root / "projects").glob("**/*.jsonl"))
     totals = {
         "input_tokens": 0,
         "cache_creation_input_tokens": 0,
@@ -101,7 +101,7 @@ def _claude_usage(root: Path) -> dict[str, Any]:
 
 
 def _opencode_usage(root: Path) -> dict[str, Any]:
-    db_path = root / ".local/share/opencode/opencode.db"
+    db_path = root / "data/opencode/opencode.db"
     totals = {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -194,31 +194,26 @@ class AgentSessionStore:
 
     def environment(self) -> dict[str, str]:
         """Return an isolated HOME/XDG layout matching the corresponding CLI."""
-        paths = [
-            self.root,
-            self.root / ".config",
-            self.root / ".cache",
-            self.root / ".local/share",
-        ]
+        paths = [self.root, self.root / "home", self.root / "config", self.root / "cache"]
         for path in paths:
             path.mkdir(parents=True, exist_ok=True)
         env = {
-            "HOME": str(self.root),
-            "XDG_CONFIG_HOME": str(self.root / ".config"),
-            "XDG_CACHE_HOME": str(self.root / ".cache"),
+            "HOME": str(self.root / "home"),
+            "XDG_CONFIG_HOME": str(self.root / "config"),
+            "XDG_CACHE_HOME": str(self.root / "cache"),
         }
         if self.backend == "claude":
-            claude_dir = self.root / ".claude"
-            claude_dir.mkdir(parents=True, exist_ok=True)
-            env["CLAUDE_CONFIG_DIR"] = str(claude_dir)
+            env["CLAUDE_CONFIG_DIR"] = str(self.root)
         elif self.backend == "opencode":
-            env["XDG_DATA_HOME"] = str(self.root / ".local/share")
+            data_dir = self.root / "data"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            env["XDG_DATA_HOME"] = str(data_dir)
         else:
             raise ValueError(f"unsupported agent backend: {self.backend}")
         return env
 
     def finalize(self, *, phase: str, result: Any) -> None:
-        """Record the session mapping and refresh cumulative per-node token usage."""
+        """Record the session mapping and refresh cumulative per-iteration token usage."""
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         manifest = self.artifact_dir / "agent_sessions.jsonl"
         row = {
@@ -235,7 +230,7 @@ class AgentSessionStore:
         usage = _claude_usage(self.root) if self.backend == "claude" else _opencode_usage(self.root)
         usage["updated_at"] = datetime.now(timezone.utc).isoformat()
         _write_json(self.artifact_dir / "agent_token_usage.json", usage)
-        write_combined_node_usage(self.artifact_dir)
+        write_combined_iteration_usage(self.artifact_dir)
 
 
 def prepare_agent_session_store(
@@ -245,43 +240,15 @@ def prepare_agent_session_store(
     cwd: str,
     tool_log_dir: str | None,
 ) -> AgentSessionStore | None:
-    """Resolve a stable, isolated session root for one pipeline node.
-
-    With no explicit ``agent.session_root``, state is stored in the project workspace next
-    to the agent root: ``<agent_root parent>/agent_sessions``. When a root is configured,
-    the node path relative to ``cwd`` is retained below it so concurrent runs and nodes
-    cannot share a Claude project directory or OpenCode DB.
-    """
-    configured = str(agent_cfg.get("session_root", "") or "").strip()
-    node_dir = Path(tool_log_dir).resolve() if tool_log_dir else None
-    cwd_path = Path(cwd).resolve()
-    if node_dir is None and not configured:
+    """Store native CLI state under ``<iteration>/sessions/<backend>``."""
+    del agent_cfg, cwd
+    iteration_dir = Path(tool_log_dir).resolve() if tool_log_dir else None
+    if iteration_dir is None:
         return None
-
-    if configured:
-        base = Path(configured).expanduser()
-        if not base.is_absolute():
-            base = base.resolve()
-        if node_dir is not None:
-            try:
-                relative_node = node_dir.relative_to(cwd_path)
-            except ValueError:
-                relative_node = Path(node_dir.name)
-            root = base / relative_node / backend
-        else:
-            root = base / backend
-    else:
-        assert node_dir is not None
-        try:
-            relative_node = node_dir.relative_to(cwd_path)
-        except ValueError:
-            relative_node = Path(node_dir.name)
-        root = cwd_path.parent / "agent_sessions" / relative_node / backend
-
     return AgentSessionStore(
         backend=backend,
-        root=root.resolve(),
-        artifact_dir=(node_dir or root).resolve(),
+        root=(iteration_dir / "sessions" / backend).resolve(),
+        artifact_dir=iteration_dir,
     )
 
 

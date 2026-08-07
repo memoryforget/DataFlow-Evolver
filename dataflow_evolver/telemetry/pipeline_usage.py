@@ -20,7 +20,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 USAGE_PATH_ENV = "DF_PIPELINE_LLM_USAGE_PATH"
 EXECUTION_ID_ENV = "DF_PIPELINE_LLM_EXECUTION_ID"
-NODE_ENV = "DF_PIPELINE_LLM_NODE"
+ITERATION_ENV = "DF_PIPELINE_LLM_ITERATION"
 ATTEMPT_ENV = "DF_PIPELINE_LLM_ATTEMPT"
 BOOTSTRAP_DIR = Path(__file__).resolve().parent / "_bootstrap"
 
@@ -149,7 +149,7 @@ def build_usage_event(
         "schema_version": 1,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "execution_id": os.environ.get(EXECUTION_ID_ENV, ""),
-        "node": os.environ.get(NODE_ENV, ""),
+        "iteration": os.environ.get(ITERATION_ENV, ""),
         "attempt": _as_int(os.environ.get(ATTEMPT_ENV, "0")),
         "kind": kind,
         "model": str(response_data.get("model") or payload.get("model") or ""),
@@ -313,9 +313,9 @@ def write_pipeline_usage_summary(
     return summary
 
 
-def write_combined_node_usage(node_dir: str | Path) -> dict[str, Any]:
+def write_combined_iteration_usage(iteration_dir: str | Path) -> dict[str, Any]:
     """Namespace Agent and pipeline usage without inventing an incompatible grand total."""
-    root = Path(node_dir)
+    root = Path(iteration_dir)
 
     def read(path: Path) -> dict[str, Any] | None:
         if not path.exists():
