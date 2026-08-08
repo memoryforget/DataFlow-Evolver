@@ -28,6 +28,7 @@ import math
 import random
 import statistics
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 from typing import NamedTuple
@@ -37,6 +38,11 @@ from dataflow_evolver.core.dataset_quality import DatasetQualityEvaluator
 from dataflow_evolver.core.decontamination import ContaminationIndex
 from dataflow_evolver.core.schemas import ReviewResult, TaskSpec
 from dataflow_evolver.llm.prompts import FAILURE_SIGNALS, build_review_prompt
+from dataflow_evolver.telemetry.pipeline_usage import (
+    write_combined_iteration_usage,
+    write_pipeline_usage_summary,
+    write_usage_payload,
+)
 
 # Review 复合分的固定权重。
 DEFAULT_REVIEW_WEIGHTS: dict[str, float] = {
@@ -195,19 +201,41 @@ class ReviewAgent(AgentABC):
         evidence_path: str | None = None,
         phase: str = "search",
         parent_review: ReviewResult | None = None,
+        usage_dir: str | None = None,
     ) -> ReviewResult:
         """LLM 抽样、全量硬指标和可选 embedding 指标共同生成 ReviewResult。
 
         `evidence_path` appends the exact sample, raw response, and parsed result so every
         feedback step can be audited or rescored offline.
         """
+        usage_root = Path(usage_dir).resolve() if usage_dir else None
+        review_events = (
+            usage_root / "sessions/review/review_llm_calls.jsonl"
+            if usage_root is not None
+            else None
+        )
         samples_text = _sample_jsonl(dataset_path, self.sample_size, seed=self.seed)
         if not samples_text:
             result = ReviewResult(0.0, 0.0, False, ["数据集为空或不可读"])
             self._dump_evidence(evidence_path, phase, dataset_path, "", None, result)
+            self._finalize_usage(usage_root, review_events, result)
             return result
         prompt = self.build_prompt(task, samples_text)
-        raw = self.run_json(prompt)
+        capture = getattr(self.serving, "capture_usage", None)
+        context = (
+            capture(review_events, phase=phase, kind="review_llm")
+            if callable(capture) and review_events is not None
+            else nullcontext()
+        )
+        try:
+            with context:
+                raw = self.run_json(prompt)
+        finally:
+            if usage_root is not None and review_events is not None:
+                write_pipeline_usage_summary(
+                    review_events,
+                    usage_root / "review_llm_token_usage.json",
+                )
         if raw is None:
             result = ReviewResult(0.0, 0.0, False, ["评审 LLM 未返回有效 JSON"])
         else:
@@ -244,7 +272,28 @@ class ReviewAgent(AgentABC):
                 dq.proxy_name,
             )
         self._dump_evidence(evidence_path, phase, dataset_path, samples_text, raw, result)
+        self._finalize_usage(usage_root, review_events, result)
         return result
+
+    def _finalize_usage(
+        self,
+        usage_root: Path | None,
+        review_events: Path | None,
+        result: ReviewResult,
+    ) -> None:
+        if usage_root is None:
+            return
+        if review_events is not None:
+            write_pipeline_usage_summary(
+                review_events,
+                usage_root / "review_llm_token_usage.json",
+            )
+        if result.dataset_quality.enabled:
+            write_usage_payload(
+                usage_root / "embedding_token_usage.json",
+                result.dataset_quality.embedding_usage,
+            )
+        write_combined_iteration_usage(usage_root)
 
     def apply_dataset_quality(
         self,

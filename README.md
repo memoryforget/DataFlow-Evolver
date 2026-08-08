@@ -185,8 +185,11 @@ python -m dataflow_evolver.main \
 
 A non-empty existing `workspace/runs/<run_name>/` is rejected. Use a new run name rather
 than mixing artifacts. The final `manifest.json` records the selected pipeline, dataset,
-review, and all iterations. Token usage is stored per iteration in `token_usage.json`,
-with Agent and pipeline-runtime calls kept as separate namespaces.
+review, and all iterations. Token usage is stored per iteration in `token_usage.json`
+under four separate namespaces: `agent`, `pipeline_llm`, `review_llm`, and `embedding`.
+The Review API and embedding endpoint use provider-reported usage; missing usage is
+marked explicitly instead of estimated. A fully cached embedding evaluation reports
+zero requests and zero tokens for that iteration.
 
 ## Test
 

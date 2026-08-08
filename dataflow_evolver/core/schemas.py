@@ -49,6 +49,7 @@ class DatasetQualityResult:
     delta_embedding_diversity_vs_parent: dict[str, float] = field(default_factory=dict)
     embedding_quality_components: dict[str, float] = field(default_factory=dict)
     embedding_quality_score: float | None = None
+    embedding_usage: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
 
 

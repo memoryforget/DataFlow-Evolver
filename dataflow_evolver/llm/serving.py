@@ -13,9 +13,14 @@ OpenAI-compatible API 与本地 vLLM 之间切换。
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+import time
+from pathlib import Path
 from typing import Any
 
+from dataflow_evolver.telemetry.pipeline_usage import append_usage_event, normalize_usage
 from dataflow_evolver.utils.config import Config
 from dataflow_evolver.utils.logging import get_logger
 
@@ -33,6 +38,56 @@ class LLMServingABC(ABC):
     def generate_one(self, prompt: str, **kwargs: Any) -> str:
         """单条便捷封装。"""
         return self.generate([prompt], **kwargs)[0]
+
+    @contextmanager
+    def capture_usage(
+        self,
+        path: str | Path,
+        *,
+        phase: str,
+        kind: str = "review_llm",
+    ):
+        """Route usage-only events for this logical operation to one JSONL file."""
+        previous = getattr(self, "_usage_capture", None)
+        self._usage_capture = (str(path), phase, kind)
+        try:
+            yield
+        finally:
+            self._usage_capture = previous
+
+    def _record_usage(
+        self,
+        *,
+        model: str,
+        raw_usage: Any,
+        success: bool,
+        latency_seconds: float,
+        item_count: int = 1,
+        error_type: str | None = None,
+    ) -> None:
+        capture = getattr(self, "_usage_capture", None)
+        if not capture:
+            return
+        path, phase, kind = capture
+        usage_value = _model_dump(raw_usage)
+        usage = normalize_usage(usage_value)
+        event = {
+            "schema_version": 1,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "phase": phase,
+            "kind": kind,
+            "model": model,
+            "item_count": item_count,
+            "success": success,
+            "latency_seconds": round(max(latency_seconds, 0.0), 6),
+            "error_type": error_type,
+            "usage_status": "exact" if usage is not None else "missing",
+            "usage": usage,
+        }
+        try:
+            append_usage_event(path, event)
+        except (OSError, TypeError, ValueError):
+            logger.warning("模型 token usage 落盘失败（不影响调用）：%s", path)
 
 
 class APILLMServing(LLMServingABC):
@@ -68,10 +123,27 @@ class APILLMServing(LLMServingABC):
             "API 请求：model=%s, prompt_len=%d, temperature=%.2f",
             self.model_name, len(prompt), kwargs.get("temperature", self.temperature),
         )
-        resp = self._client.chat.completions.create(
-            model=self.model_name,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=kwargs.get("temperature", self.temperature),
+        started = time.perf_counter()
+        try:
+            resp = self._client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=kwargs.get("temperature", self.temperature),
+            )
+        except Exception as exc:
+            self._record_usage(
+                model=self.model_name,
+                raw_usage=None,
+                success=False,
+                latency_seconds=time.perf_counter() - started,
+                error_type=type(exc).__name__,
+            )
+            raise
+        self._record_usage(
+            model=str(getattr(resp, "model", None) or self.model_name),
+            raw_usage=getattr(resp, "usage", None),
+            success=True,
+            latency_seconds=time.perf_counter() - started,
         )
         result = resp.choices[0].message.content or ""
         logger.debug("API 响应：len=%d, preview=%.200s", len(result), result)
@@ -119,6 +191,7 @@ class VLLMServing(LLMServingABC):
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
         self.system_prompt = system_prompt
+        self.model_name = hf_model_name_or_path
         self._sampling = SamplingParams(
             temperature=temperature,
             top_p=top_p,
@@ -151,7 +224,36 @@ class VLLMServing(LLMServingABC):
             tokenize=False,
             add_generation_prompt=True,
         )
-        outputs = self._llm.generate(templated, self._sampling)
+        started = time.perf_counter()
+        try:
+            outputs = self._llm.generate(templated, self._sampling)
+        except Exception as exc:
+            self._record_usage(
+                model=self.model_name,
+                raw_usage=None,
+                success=False,
+                latency_seconds=time.perf_counter() - started,
+                item_count=len(prompts),
+                error_type=type(exc).__name__,
+            )
+            raise
+        input_tokens = sum(len(getattr(output, "prompt_token_ids", None) or []) for output in outputs)
+        output_tokens = sum(
+            len(getattr(completion, "token_ids", None) or [])
+            for output in outputs
+            for completion in list(getattr(output, "outputs", None) or [])[:1]
+        )
+        self._record_usage(
+            model=self.model_name,
+            raw_usage={
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
+            success=True,
+            latency_seconds=time.perf_counter() - started,
+            item_count=len(prompts),
+        )
         return [o.outputs[0].text for o in outputs]
 
 
@@ -195,3 +297,14 @@ def _to_base_url(api_url: str) -> str:
     if api_url.endswith(suffix):
         return api_url[: -len(suffix)]
     return api_url.rstrip("/")
+
+
+def _model_dump(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return None
+    if hasattr(value, "model_dump"):
+        result = value.model_dump(mode="json", by_alias=True, exclude_none=True)
+        return result if isinstance(result, dict) else None
+    return None

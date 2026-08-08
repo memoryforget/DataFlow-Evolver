@@ -1,12 +1,15 @@
 import json
+from types import SimpleNamespace
 
 import numpy as np
+import openai
 import pytest
 
 from dataflow_evolver.agents.review_agent import ReviewAgent
 from dataflow_evolver.core.dataset_quality import (
     DatasetQualityEvaluator,
     EmbeddingBatch,
+    OpenAIChatEmbeddingBackend,
     ProxyDatasetConfig,
     compute_embedding_diversity,
     compute_rbf_mmd,
@@ -139,6 +142,45 @@ def test_dataset_evaluator_uses_configured_sample_size_and_cache(tmp_path):
     }
     assert second.mmd == pytest.approx(first.mmd)
     assert embedder.calls == 2  # Candidate + proxy only once; second evaluation is cached.
+    assert first.embedding_usage["usage_status"] == "unavailable"
+    assert second.embedding_usage["usage_status"] == "cache_only"
+    assert second.embedding_usage["request_count"] == 0
+    assert second.embedding_usage["tokens"]["total_tokens"] == 0
+
+
+def test_openai_embedding_backend_aggregates_exact_api_usage(monkeypatch):
+    class FakeClient:
+        async def post(self, _path, *, cast_to, body):
+            del cast_to
+            index = int(body["messages"][0]["content"][-1])
+            return SimpleNamespace(
+                data=[SimpleNamespace(embedding=[float(index), 1.0])],
+                usage={"prompt_tokens": 10 + index, "total_tokens": 10 + index},
+            )
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", lambda **_kwargs: FakeClient())
+    backend = OpenAIChatEmbeddingBackend(
+        model_name="embedding-model",
+        base_url="http://127.0.0.1:8000/v1",
+        max_concurrent_requests=2,
+    )
+
+    batch = backend.embed(
+        [
+            [{"role": "user", "content": "item0"}],
+            [{"role": "user", "content": "item1"}],
+        ]
+    )
+
+    assert batch.vectors.shape == (2, 2)
+    assert batch.usage["usage_status"] == "exact"
+    assert batch.usage["request_count"] == 2
+    assert batch.usage["success_count"] == 2
+    assert batch.usage["tokens"]["input_tokens"] == 21
+    assert batch.usage["tokens"]["total_tokens"] == 21
 
 
 def test_dataset_evaluator_reads_local_parquet_snapshot_directory(tmp_path):

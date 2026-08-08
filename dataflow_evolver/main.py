@@ -206,6 +206,7 @@ class ReviewOnlyLoop:
             evidence_path=str(evidence_path),
             phase=f"iteration_{iteration}",
             parent_review=parent_review,
+            usage_dir=str(iteration_dir),
         )
         return Candidate(
             iteration=iteration,

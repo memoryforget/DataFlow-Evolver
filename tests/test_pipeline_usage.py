@@ -8,11 +8,14 @@ from types import SimpleNamespace
 
 from dataflow_evolver.core.schemas import PipelineConfig
 from dataflow_evolver.engine.execution_wrapper import SubprocessExecutionWrapper
+from dataflow_evolver.llm.serving import APILLMServing
 from dataflow_evolver.telemetry.pipeline_usage import (
     aggregate_pipeline_usage,
     append_usage_event,
     build_usage_event,
     normalize_usage,
+    write_combined_iteration_usage,
+    write_usage_payload,
 )
 
 
@@ -127,6 +130,48 @@ def test_aggregate_counts_successful_retries_and_missing_usage(tmp_path):
     assert report["missing_usage_count"] == 1
     assert report["tokens"]["total_tokens"] == 30
     assert report["execution_ids"] == ["exec-1", "exec-2"]
+
+
+def test_review_serving_capture_records_exact_usage_without_prompt(tmp_path):
+    response = SimpleNamespace(
+        model="review-model",
+        usage={"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+        choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))],
+    )
+    serving = APILLMServing.__new__(APILLMServing)
+    serving.model_name = "configured-review-model"
+    serving.max_workers = 1
+    serving.temperature = 0.0
+    serving._client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **_kwargs: response)
+        )
+    )
+    events = tmp_path / "review_llm_calls.jsonl"
+
+    with serving.capture_usage(events, phase="iteration_001"):
+        assert serving.generate_one("private review prompt") == "{}"
+
+    summary = aggregate_pipeline_usage(events)
+    assert summary["request_count"] == 1
+    assert summary["tokens"]["input_tokens"] == 100
+    assert summary["tokens"]["output_tokens"] == 20
+    assert summary["tokens"]["total_tokens"] == 120
+    serialized = events.read_text(encoding="utf-8")
+    assert json.loads(serialized)["kind"] == "review_llm"
+    assert "private review prompt" not in serialized
+
+
+def test_combined_iteration_usage_includes_review_and_embedding(tmp_path):
+    review = {"kind": "review_llm", "tokens": {"total_tokens": 120}}
+    embedding = {"kind": "embedding", "tokens": {"total_tokens": 500}}
+    write_usage_payload(tmp_path / "review_llm_token_usage.json", review)
+    write_usage_payload(tmp_path / "embedding_token_usage.json", embedding)
+
+    combined = write_combined_iteration_usage(tmp_path)
+
+    assert combined["review_llm"]["tokens"]["total_tokens"] == 120
+    assert combined["embedding"]["tokens"]["total_tokens"] == 500
 
 
 def _write_http_pipeline(iteration_dir: Path) -> None:

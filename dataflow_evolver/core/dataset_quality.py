@@ -22,6 +22,7 @@ from typing import Any, Protocol
 import numpy as np
 
 from dataflow_evolver.core.schemas import DatasetQualityResult
+from dataflow_evolver.telemetry.pipeline_usage import normalize_usage
 from dataflow_evolver.utils.logging import get_logger
 
 
@@ -43,6 +44,7 @@ class ProxyDatasetConfig:
 class EmbeddingBatch:
     vectors: np.ndarray
     fail_rate: float = 0.0
+    usage: dict[str, Any] | None = None
 
 
 class EmbeddingBackend(Protocol):
@@ -89,7 +91,9 @@ class OpenAIChatEmbeddingBackend:
         client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
         semaphore = asyncio.Semaphore(self.max_concurrent_requests)
 
-        async def one(messages: Conversation) -> list[float] | None:
+        async def one(
+            messages: Conversation,
+        ) -> tuple[list[float] | None, dict[str, int] | None, int]:
             body: dict[str, Any] = {
                 "messages": messages,
                 "model": self.model_name,
@@ -104,23 +108,135 @@ class OpenAIChatEmbeddingBackend:
                             cast_to=CreateEmbeddingResponse,
                             body=body,
                         )
-                        return list(response.data[0].embedding)
+                        usage = normalize_usage(_model_dump(getattr(response, "usage", None)))
+                        return list(response.data[0].embedding), usage, attempt + 1
                     except Exception:
                         if attempt + 1 >= self.max_retries:
-                            return None
+                            return None, None, attempt + 1
                 await asyncio.sleep(0.1 * (attempt + 1))
-            return None
+            return None, None, self.max_retries
 
         try:
             results = await asyncio.gather(*(one(messages) for messages in conversations))
         finally:
             await client.close()
 
-        successful = [value for value in results if value is not None]
+        successful = [value[0] for value in results if value[0] is not None]
         fail_rate = 1.0 - (len(successful) / len(conversations)) if conversations else 0.0
+        usage = _embedding_batch_usage(results, self.model_name, len(conversations))
         if not successful:
-            return EmbeddingBatch(np.empty((0, 0), dtype=np.float32), fail_rate)
-        return EmbeddingBatch(np.asarray(successful, dtype=np.float32), fail_rate)
+            return EmbeddingBatch(
+                np.empty((0, 0), dtype=np.float32), fail_rate, usage
+            )
+        return EmbeddingBatch(
+            np.asarray(successful, dtype=np.float32), fail_rate, usage
+        )
+
+
+def _model_dump(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return None
+    if hasattr(value, "model_dump"):
+        payload = value.model_dump(mode="json", by_alias=True, exclude_none=True)
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
+def _empty_embedding_tokens() -> dict[str, int]:
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "reasoning_tokens": 0,
+    }
+
+
+def _embedding_batch_usage(
+    results: list[tuple[list[float] | None, dict[str, int] | None, int]],
+    model: str,
+    item_count: int,
+) -> dict[str, Any]:
+    tokens = _empty_embedding_tokens()
+    request_count = sum(attempts for _, _, attempts in results)
+    success_count = sum(vector is not None for vector, _, _ in results)
+    failure_count = max(request_count - success_count, 0)
+    missing_usage_count = failure_count
+    exact_usage_count = 0
+    for vector, usage, _ in results:
+        if vector is None:
+            continue
+        if usage is None:
+            missing_usage_count += 1
+            continue
+        exact_usage_count += 1
+        for key in tokens:
+            tokens[key] += int(usage.get(key) or 0)
+    return {
+        "model": model,
+        "item_count": item_count,
+        "request_count": request_count,
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "missing_usage_count": missing_usage_count,
+        "exact_usage_count": exact_usage_count,
+        "usage_status": "exact" if missing_usage_count == 0 else "partial",
+        "tokens": tokens,
+    }
+
+
+def _combine_embedding_usage(
+    events: list[dict[str, Any]],
+    *,
+    model: str,
+) -> dict[str, Any]:
+    totals = _empty_embedding_tokens()
+    combined: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "embedding",
+        "model": model,
+        "batch_count": len(events),
+        "cache_hit_count": sum(bool(event.get("cache_hit")) for event in events),
+        "item_count": 0,
+        "request_count": 0,
+        "success_count": 0,
+        "failure_count": 0,
+        "missing_usage_count": 0,
+        "exact_usage_count": 0,
+        "unavailable_batch_count": sum(
+            event.get("usage_status") == "unavailable" for event in events
+        ),
+        "tokens": totals,
+        "batches": events,
+    }
+    for event in events:
+        for key in (
+            "item_count",
+            "request_count",
+            "success_count",
+            "failure_count",
+            "missing_usage_count",
+            "exact_usage_count",
+        ):
+            combined[key] += int(event.get(key) or 0)
+        event_tokens = event.get("tokens")
+        if isinstance(event_tokens, dict):
+            for key in totals:
+                totals[key] += int(event_tokens.get(key) or 0)
+    if not events:
+        combined["usage_status"] = "not_requested"
+    elif all(event.get("cache_hit") for event in events):
+        combined["usage_status"] = "cache_only"
+    elif combined["unavailable_batch_count"]:
+        combined["usage_status"] = "unavailable"
+    elif combined["missing_usage_count"]:
+        combined["usage_status"] = "partial"
+    else:
+        combined["usage_status"] = "exact"
+    return combined
 
 
 class DatasetQualityEvaluator:
@@ -155,6 +271,7 @@ class DatasetQualityEvaluator:
         self.cache_dir = Path(cache_dir).resolve() if cache_dir else None
         self.require_full_sample = require_full_sample
         self._proxy_messages: list[Conversation] | None = None
+        self._embedding_usage_events: list[dict[str, Any]] = []
 
     @property
     def proxy_name(self) -> str:
@@ -169,6 +286,7 @@ class DatasetQualityEvaluator:
         candidate_user_field: str,
         candidate_assistant_field: str,
     ) -> DatasetQualityResult:
+        self._embedding_usage_events = []
         base = DatasetQualityResult(
             enabled=True,
             status="error",
@@ -219,8 +337,8 @@ class DatasetQualityEvaluator:
                 )
                 return base
 
-            candidate_batch = self._embed_cached(candidate_messages)
-            proxy_batch = self._embed_cached(proxy_messages)
+            candidate_batch = self._embed_cached(candidate_messages, scope="candidate")
+            proxy_batch = self._embed_cached(proxy_messages, scope="proxy")
             base.embedding_fail_rate = max(
                 candidate_batch.fail_rate, proxy_batch.fail_rate
             )
@@ -262,6 +380,11 @@ class DatasetQualityEvaluator:
             base.error = f"{type(exc).__name__}: {exc}"
             logger.exception("DAS 计算失败：%s", base.error)
             return base
+        finally:
+            base.embedding_usage = _combine_embedding_usage(
+                self._embedding_usage_events,
+                model=self.embedder.model_name,
+            )
 
     def _load_proxy_messages(self) -> list[Conversation]:
         if self._proxy_messages is not None:
@@ -282,10 +405,28 @@ class DatasetQualityEvaluator:
         self._proxy_messages = messages
         return messages
 
-    def _embed_cached(self, conversations: list[Conversation]) -> EmbeddingBatch:
+    def _embed_cached(
+        self,
+        conversations: list[Conversation],
+        *,
+        scope: str,
+    ) -> EmbeddingBatch:
         cache_path = self._cache_path(conversations)
         if cache_path is not None and cache_path.exists():
             logger.info("命中 dataset embedding 缓存：%s", cache_path)
+            self._embedding_usage_events.append(
+                {
+                    "scope": scope,
+                    "model": self.embedder.model_name,
+                    "cache_hit": True,
+                    "item_count": len(conversations),
+                    "request_count": 0,
+                    "success_count": 0,
+                    "failure_count": 0,
+                    "missing_usage_count": 0,
+                    "tokens": _empty_embedding_tokens(),
+                }
+            )
             with np.load(cache_path, allow_pickle=False) as payload:
                 return EmbeddingBatch(
                     np.asarray(payload["embeddings"], dtype=np.float32),
@@ -294,6 +435,27 @@ class DatasetQualityEvaluator:
 
         logger.info("未命中 dataset embedding 缓存，开始编码 %d 条样本", len(conversations))
         batch = self.embedder.embed(conversations)
+        usage = dict(batch.usage or {})
+        usage.update(
+            {
+                "scope": scope,
+                "model": str(usage.get("model") or self.embedder.model_name),
+                "cache_hit": False,
+                "item_count": int(usage.get("item_count") or len(conversations)),
+            }
+        )
+        if not batch.usage:
+            usage.update(
+                {
+                    "usage_status": "unavailable",
+                    "request_count": 0,
+                    "success_count": 0,
+                    "failure_count": 0,
+                    "missing_usage_count": 0,
+                    "tokens": _empty_embedding_tokens(),
+                }
+            )
+        self._embedding_usage_events.append(usage)
         if batch.vectors.ndim != 2 or batch.vectors.shape[0] == 0:
             raise RuntimeError("embedding 服务没有返回有效的二维向量")
         if cache_path is not None:

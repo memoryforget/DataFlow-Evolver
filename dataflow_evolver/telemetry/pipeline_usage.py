@@ -313,6 +313,22 @@ def write_pipeline_usage_summary(
     return summary
 
 
+def write_usage_payload(output_path: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Atomically persist a pre-aggregated model-usage payload."""
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    value = dict(payload)
+    value.setdefault("schema_version", 1)
+    value["updated_at"] = datetime.now(timezone.utc).isoformat()
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(destination)
+    return value
+
+
 def write_combined_iteration_usage(iteration_dir: str | Path) -> dict[str, Any]:
     """Namespace Agent and pipeline usage without inventing an incompatible grand total."""
     root = Path(iteration_dir)
@@ -331,6 +347,8 @@ def write_combined_iteration_usage(iteration_dir: str | Path) -> dict[str, Any]:
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "agent": read(root / "agent_token_usage.json"),
         "pipeline_llm": read(root / "pipeline_llm_token_usage.json"),
+        "review_llm": read(root / "review_llm_token_usage.json"),
+        "embedding": read(root / "embedding_token_usage.json"),
     }
     destination = root / "token_usage.json"
     temporary = destination.with_suffix(".json.tmp")

@@ -2,7 +2,8 @@ import json
 from pathlib import Path
 
 from dataflow_evolver.agents.review_agent import ReviewAgent
-from dataflow_evolver.core.schemas import TaskSpec
+from dataflow_evolver.core.schemas import DatasetQualityResult, TaskSpec
+from dataflow_evolver.llm.serving import LLMServingABC
 
 TASK = TaskSpec("QA", {"q": "str", "a": "str"}, [])
 GOOD_JSON = json.dumps({
@@ -84,3 +85,73 @@ def test_evidence_write_failure_does_not_break_review(tmp_path):
         dataset, TASK, evidence_path=impossible
     )
     assert result.review_score > 0
+
+
+def test_review_writes_llm_embedding_and_combined_usage(tmp_path):
+    class MeteredServing(LLMServingABC):
+        def generate(self, prompts, **_kwargs):
+            self._record_usage(
+                model="review-model",
+                raw_usage={
+                    "prompt_tokens": 30,
+                    "completion_tokens": 3,
+                    "total_tokens": 33,
+                },
+                success=True,
+                latency_seconds=0.01,
+                item_count=len(prompts),
+            )
+            return [GOOD_JSON for _ in prompts]
+
+    class MeteredDatasetEvaluator:
+        def evaluate(self, *_args, **_kwargs):
+            return DatasetQualityResult(
+                enabled=True,
+                status="ok",
+                mmd=0.2,
+                das=-0.2,
+                embedding_diversity={
+                    "cosine_vendi_ratio": 0.5,
+                    "nearest_neighbor_cosine_p95": 0.8,
+                },
+                embedding_usage={
+                    "schema_version": 1,
+                    "kind": "embedding",
+                    "usage_status": "exact",
+                    "request_count": 5,
+                    "tokens": {
+                        "input_tokens": 77,
+                        "output_tokens": 0,
+                        "total_tokens": 77,
+                    },
+                },
+            )
+
+    iteration = tmp_path / "iteration_001"
+    iteration.mkdir()
+    reviewer = ReviewAgent(
+        MeteredServing(),
+        sample_size=5,
+        dataset_quality_evaluator=MeteredDatasetEvaluator(),
+        dataset_quality_fields=("q", "a"),
+    )
+
+    reviewer.review(
+        _dataset(tmp_path),
+        TASK,
+        evidence_path=str(iteration / "review.jsonl"),
+        phase="iteration_001",
+        usage_dir=str(iteration),
+    )
+
+    review_usage = json.loads(
+        (iteration / "review_llm_token_usage.json").read_text(encoding="utf-8")
+    )
+    embedding_usage = json.loads(
+        (iteration / "embedding_token_usage.json").read_text(encoding="utf-8")
+    )
+    combined = json.loads((iteration / "token_usage.json").read_text(encoding="utf-8"))
+    assert review_usage["tokens"]["total_tokens"] == 33
+    assert embedding_usage["tokens"]["total_tokens"] == 77
+    assert combined["review_llm"]["tokens"]["total_tokens"] == 33
+    assert combined["embedding"]["tokens"]["total_tokens"] == 77
