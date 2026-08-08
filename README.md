@@ -24,6 +24,7 @@ model/                              local models; ignored by Git
 workspace/
   dataflow/                         tracked vendored DataFlow source
   .claude/skills/dataflow-dev/      canonical Claude/OpenCode coding skill
+  .agents/skills/dataflow-dev/      Codex-native copy of the DataFlow skill
   cache/das/                        shared embedding cache
   runs/<run_name>/
     manifest.json
@@ -33,14 +34,14 @@ workspace/
       operators/
       cache/
       review.jsonl
-      sessions/claude|opencode|pipeline/
+      sessions/claude|opencode|codex|pipeline/
 ```
 
-The framework starts both Claude and OpenCode with `workspace/` as their working directory.
-Claude loads the project skill from `workspace/.claude/skills/`; OpenCode discovers the
-same Claude-compatible skill, so no second copy is maintained. Native Claude/OpenCode
-state is stored under each iteration's `sessions/` directory and is separate from the
-project-level skill.
+The framework starts Claude, OpenCode, or Codex with `workspace/` as the working
+directory. Claude and OpenCode use the skill under `.claude/skills/`; Codex uses a full
+copy under its native `.agents/skills/` location. The two directories intentionally carry
+the same files, with only their internal discovery-root paths adapted. Native backend
+state and per-turn token usage are stored under each iteration's `sessions/<backend>/`.
 
 ## Install
 
@@ -54,8 +55,9 @@ python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -e ".[agent,agent-runtime,dataset-quality,dev]"
 ```
 
-Install either `claude` or `opencode` separately and make the selected CLI available on
-`PATH`.
+Install the `claude` or `opencode` CLI separately when selecting those backends. The
+`openai-codex` Python package installs its pinned Codex runtime; `CODEX_BIN` can override
+it when needed.
 
 ## Configure
 
@@ -85,12 +87,23 @@ before allowing a full execution. Review feedback advances to the next normal it
 The framework does not impose a target sample count. Pipelines start from the complete raw
 dataset and may clean, filter, transform, or augment it according to the task.
 
+Use provider-neutral credentials for the selected PipelineAgent backend:
+
+```bash
+export DF_AGENT_API_KEY=...
+export DF_AGENT_BASE_URL=https://provider-compatible.example/
+```
+
+The endpoint must implement the selected backend's protocol: an Anthropic-compatible
+endpoint for Claude, the configured OpenCode provider protocol for OpenCode, and an
+OpenAI Codex/Responses-compatible endpoint for Codex. These credentials are independent
+of `DF_API_*`, which configures ReviewAgent and generated-pipeline LLM calls.
+
 For Claude:
 
 ```bash
 export AGENT_BACKEND=claude
-export ANTHROPIC_API_KEY=...
-export ANTHROPIC_BASE_URL=https://anthropic-compatible.example/
+export CLAUDE_AGENT_MODEL=claude-opus-4-8
 ```
 
 For OpenCode:
@@ -99,9 +112,22 @@ For OpenCode:
 export AGENT_BACKEND=opencode
 export OPENCODE_BIN=opencode
 export OPENCODE_MODEL=anthropic/<model-name>
-export ANTHROPIC_API_KEY=...
-export ANTHROPIC_BASE_URL=https://anthropic-compatible.example/
+export OPENCODE_PROVIDER=anthropic
 ```
+
+For Codex:
+
+```bash
+export AGENT_BACKEND=codex
+export CODEX_MODEL=gpt-5.4
+export CODEX_EFFORT=high
+```
+
+Backend-specific `CLAUDE_AGENT_API_KEY_ENV`/`CLAUDE_AGENT_BASE_URL`,
+`OPENCODE_API_KEY_ENV`/`OPENCODE_BASE_URL`, and
+`CODEX_API_KEY_ENV`/`CODEX_BASE_URL` can override the generic values. Legacy `ANTHROPIC_API_KEY`,
+`ANTHROPIC_BASE_URL`, `CODEX_API_KEY`, `OPENAI_API_KEY`, and `OPENAI_BASE_URL` remain
+accepted as fallbacks.
 
 ## Optional embedding-based dataset review
 

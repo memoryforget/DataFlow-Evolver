@@ -4,7 +4,10 @@ import json
 import sqlite3
 from types import SimpleNamespace
 
-from dataflow_evolver.llm.session_state import prepare_agent_session_store
+from dataflow_evolver.llm.session_state import (
+    prepare_agent_session_store,
+    record_codex_turn_usage,
+)
 from dataflow_evolver.utils.config import Config
 
 
@@ -71,3 +74,30 @@ def test_opencode_usage_reads_iteration_local_database(tmp_path):
     report = json.loads((iteration_dir / "agent_token_usage.json").read_text())
     assert report["status"] == "ok"
     assert report["tokens"]["total_including_cache"] == 168
+
+
+def test_codex_state_and_turn_usage_are_iteration_local(tmp_path):
+    iteration_dir, store = _store(tmp_path, "codex", "iteration_003")
+    env = store.environment()
+    assert env["CODEX_HOME"] == str(store.root)
+    assert store.root == (iteration_dir / "sessions/codex").resolve()
+
+    record_codex_turn_usage(
+        store.root,
+        phase="generate",
+        session_id="thread-1",
+        usage={
+            "input_tokens": 100,
+            "cached_input_tokens": 25,
+            "output_tokens": 30,
+            "reasoning_tokens": 10,
+            "total_tokens": 130,
+        },
+    )
+    store.finalize(phase="generate", result=_result("thread-1"))
+    report = json.loads((iteration_dir / "agent_token_usage.json").read_text())
+    assert report["backend"] == "codex"
+    assert report["usage_records"] == 1
+    assert report["session_ids"] == ["thread-1"]
+    assert report["tokens"]["total_tokens"] == 130
+    assert report["tokens"]["billable_tokens_estimate"] == 130

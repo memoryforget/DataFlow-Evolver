@@ -15,6 +15,25 @@ from dataflow_evolver.telemetry.pipeline_usage import write_combined_iteration_u
 logger = get_logger("llm.session_state")
 
 
+def record_codex_turn_usage(
+    root: Path,
+    *,
+    phase: str,
+    session_id: str | None,
+    usage: dict[str, Any],
+) -> None:
+    """Persist one Codex turn's non-cumulative usage next to native session state."""
+    root.mkdir(parents=True, exist_ok=True)
+    row = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "phase": phase,
+        "session_id": session_id,
+        "usage": usage,
+    }
+    with (root / "turn_usage.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def _read_jsonl(path: Path):
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
@@ -186,6 +205,56 @@ def _opencode_usage(root: Path) -> dict[str, Any]:
     }
 
 
+def _codex_usage(root: Path) -> dict[str, Any]:
+    usage_path = root / "turn_usage.jsonl"
+    totals = {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens": 0,
+        "billable_tokens_estimate": 0,
+    }
+    sessions: set[str] = set()
+    usage_records = 0
+    if usage_path.is_file():
+        for row in _read_jsonl(usage_path):
+            usage = row.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            values = {
+                key: int(usage.get(key) or 0)
+                for key in (
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "output_tokens",
+                    "reasoning_tokens",
+                    "total_tokens",
+                )
+            }
+            if not any(values.values()):
+                continue
+            usage_records += 1
+            for key, value in values.items():
+                totals[key] += value
+            # Reasoning tokens are a subset of output-token billing.
+            totals["billable_tokens_estimate"] += (
+                values["input_tokens"] + values["output_tokens"]
+            )
+            if row.get("session_id"):
+                sessions.add(str(row["session_id"]))
+    native_sessions = sorted((root / "sessions").glob("**/*.jsonl"))
+    return {
+        "backend": "codex",
+        "session_state_dir": str(root),
+        "source_usage_file": str(usage_path),
+        "native_session_files": [str(path) for path in native_sessions],
+        "session_ids": sorted(sessions),
+        "usage_records": usage_records,
+        "tokens": totals,
+    }
+
+
 @dataclass(frozen=True)
 class AgentSessionStore:
     backend: str
@@ -193,7 +262,7 @@ class AgentSessionStore:
     artifact_dir: Path
 
     def environment(self) -> dict[str, str]:
-        """Return an isolated HOME/XDG layout matching the corresponding CLI."""
+        """Return an isolated, backend-specific CLI state layout."""
         paths = [self.root, self.root / "home", self.root / "config", self.root / "cache"]
         for path in paths:
             path.mkdir(parents=True, exist_ok=True)
@@ -208,12 +277,14 @@ class AgentSessionStore:
             data_dir = self.root / "data"
             data_dir.mkdir(parents=True, exist_ok=True)
             env["XDG_DATA_HOME"] = str(data_dir)
+        elif self.backend == "codex":
+            env["CODEX_HOME"] = str(self.root)
         else:
             raise ValueError(f"unsupported agent backend: {self.backend}")
         return env
 
     def finalize(self, *, phase: str, result: Any) -> None:
-        """Record the session mapping and refresh cumulative per-iteration token usage."""
+        """Record the session mapping and refresh cumulative per-iteration usage."""
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         manifest = self.artifact_dir / "agent_sessions.jsonl"
         row = {
@@ -227,7 +298,14 @@ class AgentSessionStore:
         }
         with manifest.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-        usage = _claude_usage(self.root) if self.backend == "claude" else _opencode_usage(self.root)
+        if self.backend == "claude":
+            usage = _claude_usage(self.root)
+        elif self.backend == "opencode":
+            usage = _opencode_usage(self.root)
+        elif self.backend == "codex":
+            usage = _codex_usage(self.root)
+        else:
+            raise ValueError(f"unsupported agent backend: {self.backend}")
         usage["updated_at"] = datetime.now(timezone.utc).isoformat()
         _write_json(self.artifact_dir / "agent_token_usage.json", usage)
         write_combined_iteration_usage(self.artifact_dir)

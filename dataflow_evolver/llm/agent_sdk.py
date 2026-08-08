@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from dataflow_evolver.llm.agent_credentials import backend_value, resolve_agent_endpoint
 from dataflow_evolver.llm.session_state import (
     finalize_agent_session,
     prepare_agent_session_store,
@@ -151,7 +152,7 @@ _DEFAULT_SYSTEM_PROMPT_APPEND = (
 
 @dataclass
 class AgentRunResult:
-    """Claude 与 OpenCode runtime 共用的单次运行结果。"""
+    """Claude、OpenCode 与 Codex runtime 共用的单次运行结果。"""
 
     success: bool
     result_text: str = ""                  # ResultMessage.result 的最终文本
@@ -163,6 +164,8 @@ class AgentRunResult:
     session_id: str | None = None          # 本次运行的会话 id（用于失败后 resume 续跑，见 run_pipeline_agent）
     # Tool trace for debugging PipelineAgent behavior.
     tool_uses: list[dict[str, Any]] = field(default_factory=list)
+    # Backend-native per-turn usage normalized to a JSON-safe mapping when available.
+    usage: dict[str, Any] | None = None
 
 
 def _truncate_arg(value: Any, maxlen: int = 600) -> Any:
@@ -232,7 +235,8 @@ def _build_options(
       可用的请求格式，从而不受环境里 CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1（会退化成 thinking.enabled
       → Bedrock 400）影响；即项目自带正确配置，不依赖全局/外部 env。配置 thinking: none 可关闭该显式指定。
     - env：叠加 PATH，使 Agent 开发环境与框架执行器使用的 sys.executable 一致（见 _agent_env）。
-    SDK 鉴权（ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL）经环境变量传入，子进程默认继承 os.environ。
+    对外使用 provider-neutral Agent 凭据配置；runtime 内部映射为 Claude SDK
+    要求的 ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL，并保留旧环境变量回退。
     """
     from claude_agent_sdk import ClaudeAgentOptions
 
@@ -241,15 +245,21 @@ def _build_options(
     mcp_servers: dict[str, Any] = {"dataflow-operators": operator_mcp_server}
 
     append_text = agent_cfg.get("system_prompt_append", _DEFAULT_SYSTEM_PROMPT_APPEND)
-    effort = agent_cfg.get("effort", None) or None  # 空串/None → 不传，走模型默认
+    model = backend_value(agent_cfg, "claude", "model", default="claude-opus-4-8")
+    effort = backend_value(agent_cfg, "claude", "effort", default="max") or None
     thinking_mode = (agent_cfg.get("thinking", "adaptive") or "adaptive").lower()
     thinking = {"type": "adaptive"} if thinking_mode == "adaptive" else None
     env = _agent_env(agent_cfg)
+    endpoint = resolve_agent_endpoint(agent_cfg, "claude")
+    if endpoint.api_key:
+        env["ANTHROPIC_API_KEY"] = endpoint.api_key
+    if endpoint.base_url:
+        env["ANTHROPIC_BASE_URL"] = endpoint.base_url
     if session_env:
         env.update(session_env)
     return ClaudeAgentOptions(
         cwd=cwd,
-        model=agent_cfg.get("model", None),
+        model=model,
         tools={"type": "preset", "preset": "claude_code"},
         system_prompt={"type": "preset", "preset": "claude_code", "append": append_text},
         permission_mode=agent_cfg.get("permission_mode", "bypassPermissions"),

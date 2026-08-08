@@ -50,7 +50,7 @@ def test_unknown_runtime_is_rejected():
     try:
         build_agent_runtime(Config({"backend": "other"}))
     except ValueError as exc:
-        assert "claude 或 opencode" in str(exc)
+        assert "claude, opencode, or codex" in str(exc)
     else:
         raise AssertionError("unknown backend should fail")
 

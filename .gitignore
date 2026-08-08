@@ -16,6 +16,8 @@ hf_cache/
 workspace/*
 !workspace/.claude/
 !workspace/.claude/**
+!workspace/.agents/
+!workspace/.agents/**
 !workspace/dataflow/
 !workspace/dataflow/**
 workspace/dataflow/**/__pycache__/

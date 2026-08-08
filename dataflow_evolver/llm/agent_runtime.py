@@ -51,4 +51,10 @@ def build_agent_runtime(agent_cfg: Config) -> AgentRuntime:
         from dataflow_evolver.llm.opencode_runtime import OpenCodeAgentRuntime
 
         return OpenCodeAgentRuntime()
-    raise ValueError(f"未知 agent.backend: {backend!r}；可选值为 claude 或 opencode")
+    if backend == "codex":
+        from dataflow_evolver.llm.codex_runtime import CodexAgentRuntime
+
+        return CodexAgentRuntime()
+    raise ValueError(
+        f"unknown agent.backend: {backend!r}; expected claude, opencode, or codex"
+    )

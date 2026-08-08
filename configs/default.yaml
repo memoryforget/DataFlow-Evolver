@@ -32,13 +32,15 @@ llm:
     reasoning:
       model_name: ${DF_PIPELINE_MODEL:gpt-4o}
 
-# PipelineAgent runtime. Both backends receive the same prompt and must write the
+# PipelineAgent runtime. All backends receive the same prompt and must write the
 # same pipeline.py + decision.json artifacts.
 agent:
-  backend: ${AGENT_BACKEND:claude}  # claude | opencode
-  model: ${DF_AGENT_MODEL:claude-opus-4-8}
-  # Claude-specific reasoning effort. OpenCode uses opencode.variant below.
-  effort: ${DF_AGENT_EFFORT:max}
+  backend: ${AGENT_BACKEND:claude}  # claude | opencode | codex
+  # Provider-neutral defaults. A non-empty backend-specific value below wins.
+  model: ${DF_AGENT_MODEL:}
+  effort: ${DF_AGENT_EFFORT:}
+  api_key_env: ${DF_AGENT_API_KEY_ENV:DF_AGENT_API_KEY}
+  base_url: ${DF_AGENT_BASE_URL:}
   permission_mode: bypassPermissions
   setting_sources: [project]
   max_turns: 50
@@ -47,17 +49,31 @@ agent:
   retry_base_delay: 10
   run_timeout_sec: 1800
   resume_on_retry: true
+  claude:
+    model: ${CLAUDE_AGENT_MODEL:}
+    effort: ${CLAUDE_AGENT_EFFORT:}
+    api_key_env: ${CLAUDE_AGENT_API_KEY_ENV:}
+    base_url: ${CLAUDE_AGENT_BASE_URL:}
   opencode:
     binary: ${OPENCODE_BIN:opencode}
-    # Empty means: reuse agent.model. Add a provider prefix for non-Anthropic models.
+    # Empty model means agent.model, then the runtime default. Provider selects
+    # only OpenCode's provider adapter; credentials still use the generic fields.
     model: ${OPENCODE_MODEL:}
     provider: ${OPENCODE_PROVIDER:anthropic}
-    api_key_env: ${OPENCODE_API_KEY_ENV:ANTHROPIC_API_KEY}
-    # Empty means: use ANTHROPIC_BASE_URL when provider=anthropic.
+    api_key_env: ${OPENCODE_API_KEY_ENV:}
     base_url: ${OPENCODE_BASE_URL:}
     variant: ${OPENCODE_VARIANT:}
     max_steps: ${OPENCODE_MAX_STEPS:50}
     mcp_timeout_ms: ${OPENCODE_MCP_TIMEOUT_MS:30000}
+  codex:
+    # openai-codex ships a pinned binary; set CODEX_BIN only to override it.
+    binary: ${CODEX_BIN:}
+    model: ${CODEX_MODEL:}
+    model_provider: ${CODEX_MODEL_PROVIDER:}
+    effort: ${CODEX_EFFORT:}
+    api_key_env: ${CODEX_API_KEY_ENV:}
+    base_url: ${CODEX_BASE_URL:}
+    mcp_timeout_ms: ${CODEX_MCP_TIMEOUT_MS:30000}
 
 loop:
   # Total number of linear Pipeline -> Review iterations.
@@ -91,7 +107,7 @@ review:
   # diversity metrics. All embedding evidence remains separate from the 0-1 LLM
   # review_score and is fed directly to the next PipelineAgent prompt.
   dataset_quality:
-    enabled: ${DF_EMBEDDING_REVIEW_ENABLED:false}
+    enabled: ${DF_EMBEDDING_REVIEW_ENABLED:true}
     # When enabled, review_score blends sample-level LLM quality with embedding quality,
     # then applies full-file duplicate/null/parse/contamination penalties.
     score_weight: ${DF_DATASET_QUALITY_SCORE_WEIGHT:0.25}

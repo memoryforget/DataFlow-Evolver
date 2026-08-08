@@ -292,6 +292,13 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
         raise FileNotFoundError(f"project.workspace_dir 缺少 vendored dataflow：{workspace}")
     if not (workspace / ".claude/skills/dataflow-dev/SKILL.md").is_file():
         raise FileNotFoundError(f"project.workspace_dir 缺少 dataflow-dev skill：{workspace}")
+    backend = str(cfg.agent.get("backend", "claude") or "claude").strip().lower()
+    if backend == "codex" and not (
+        workspace / ".agents/skills/dataflow-dev/SKILL.md"
+    ).is_file():
+        raise FileNotFoundError(
+            f"Codex backend requires .agents/skills/dataflow-dev/SKILL.md: {workspace}"
+        )
 
     corpus = input_corpus.discover(
         project.get("input_dir", "") or "",

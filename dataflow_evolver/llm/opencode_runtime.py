@@ -9,6 +9,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+from dataflow_evolver.llm.agent_credentials import (
+    backend_value,
+    resolve_agent_endpoint,
+)
 from dataflow_evolver.llm.agent_sdk import (
     AgentRunResult,
     _DEFAULT_SYSTEM_PROMPT_APPEND,
@@ -43,7 +47,15 @@ def _opencode_cfg(agent_cfg: Config) -> dict[str, Any]:
 
 def _model(agent_cfg: Config) -> str:
     cfg = _opencode_cfg(agent_cfg)
-    raw = str(cfg.get("model", "") or agent_cfg.get("model", "") or "").strip()
+    raw = str(
+        backend_value(
+            agent_cfg,
+            "opencode",
+            "model",
+            default="claude-opus-4-8",
+        )
+        or ""
+    ).strip()
     if not raw:
         raise ValueError("agent.opencode.model（或 agent.model）不能为空")
     provider = str(cfg.get("provider", "anthropic") or "anthropic").strip()
@@ -95,12 +107,9 @@ def build_opencode_config(
     agent_name = "dataflow-pipeline"
     timeout_ms = int(cfg.get("mcp_timeout_ms", 30000) or 30000)
 
-    key_env = str(cfg.get("api_key_env", "ANTHROPIC_API_KEY") or "").strip()
-    default_base_env = "ANTHROPIC_BASE_URL" if provider == "anthropic" else ""
-    base_url = str(
-        cfg.get("base_url", "")
-        or (os.environ.get(default_base_env, "") if default_base_env else "")
-    ).strip()
+    endpoint = resolve_agent_endpoint(agent_cfg, "opencode", provider=provider)
+    key_env = endpoint.api_key_env
+    base_url = endpoint.base_url
     options: dict[str, Any] = {}
     if key_env:
         options["apiKey"] = f"{{env:{key_env}}}"
