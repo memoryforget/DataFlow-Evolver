@@ -205,7 +205,7 @@ def _parent_quality_block(review: ReviewResult) -> str:
         for attr, label in _DIM_LABELS
     ]
     lines = [
-        "【上一轮 ReviewAgent 反馈——本轮必须直接回应】",
+        "【当前最佳 incumbent 的 ReviewAgent 反馈——本轮必须直接回应】",
         f"Review：{review.review_score:.3f}；评审{'通过' if review.passed else '未通过'}",
         "抽样四维：" + " | ".join(f"{label} {score:.2f}" for label, score in dims),
         f"全量硬指标：重复率 {review.dup_rate:.2f} | 空值率 {review.null_rate:.2f} | "
