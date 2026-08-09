@@ -78,6 +78,7 @@ class ReviewAgent(AgentABC):
         dataset_quality_fields: tuple[str, str] = ("instruction", "output"),
         dataset_quality_weight: float = 0.25,
         dataset_quality_score_weights: dict[str, float] | None = None,
+        duplicate_fields: list[str] | None = None,
     ) -> None:
         super().__init__(serving, max_retries=max_retries)
         self.schema_threshold = schema_threshold
@@ -97,6 +98,7 @@ class ReviewAgent(AgentABC):
         self.dataset_quality_score_weights = _normalize_embedding_score_weights(
             dataset_quality_score_weights
         )
+        self.duplicate_fields = list(duplicate_fields) if duplicate_fields else None
 
     def build_prompt(self, task: TaskSpec, samples_text: str) -> str:
         return build_review_prompt(task, samples_text)
@@ -147,7 +149,11 @@ class ReviewAgent(AgentABC):
     ) -> ReviewResult:
         """扫全份文件得硬指标并叠加惩罚，写回 result 并返回。"""
         required = list(task.target_schema.keys()) if task.target_schema else []
-        metrics = _scan_hard_metrics(dataset_path, required)
+        metrics = _scan_hard_metrics(
+            dataset_path,
+            required,
+            duplicate_fields=self.duplicate_fields,
+        )
         result.dup_rate = metrics.dup_rate
         result.null_rate = metrics.null_rate
         result.parse_valid_rate = metrics.parse_valid_rate
@@ -534,7 +540,12 @@ CONTENT_FIELD_MIN_MEDIAN_LEN = 40
 _LENGTH_SAMPLE_CAP = 4096
 
 
-def _scan_hard_metrics(path: str, required_fields: list[str]) -> HardMetrics:
+def _scan_hard_metrics(
+    path: str,
+    required_fields: list[str],
+    *,
+    duplicate_fields: list[str] | None = None,
+) -> HardMetrics:
     """扫全份 jsonl 得硬指标。
 
     - dup_rate: 重复占比，取 ``max(整记录哈希重复率, 训练字段级重复率)``。
@@ -555,9 +566,12 @@ def _scan_hard_metrics(path: str, required_fields: list[str]) -> HardMetrics:
     hashes: set[str] = set()
     null_slots = 0
     field_slots = 0
-    # 只对 required_fields 逐字段留哈希，字段数有界，仍是一趟流式扫描。
-    field_hashes: dict[str, set[str]] = {fld: set() for fld in required_fields}
-    field_lengths: dict[str, list[int]] = {fld: [] for fld in required_fields}
+    # Null/schema coverage always uses every required field. Duplicate evidence may
+    # use a narrower set so a deliberately fixed task instruction is not mistaken
+    # for collapsed sample content.
+    content_fields = duplicate_fields if duplicate_fields is not None else required_fields
+    field_hashes: dict[str, set[str]] = {fld: set() for fld in content_fields}
+    field_lengths: dict[str, list[int]] = {fld: [] for fld in content_fields}
 
     with p.open("r", encoding="utf-8") as f:
         for line in f:
@@ -580,6 +594,8 @@ def _scan_hard_metrics(path: str, required_fields: list[str]) -> HardMetrics:
                     value = obj.get(fld)
                     if _is_empty(value):
                         null_slots += 1
+                for fld in content_fields:
+                    value = obj.get(fld)
                     text = _as_text(value)
                     field_hashes[fld].add(
                         hashlib.md5(text.encode("utf-8")).hexdigest()

@@ -109,6 +109,37 @@ def test_field_dup_catches_same_question_with_varied_cot(tmp_path):
     assert m.dup_rate == pytest.approx(0.4)
 
 
+def test_configured_duplicate_fields_ignore_fixed_instruction(tmp_path):
+    ds = tmp_path / "fixed_instruction.jsonl"
+    fixed = _long("Solve the following grade-school math problem.")
+    rows = [
+        {
+            "instruction": fixed,
+            "input": _long(f"Distinct problem {index}"),
+            "output": _long(f"Distinct solution {index}"),
+        }
+        for index in range(5)
+    ]
+    ds.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows),
+        encoding="utf-8",
+    )
+
+    default_metrics = _scan_hard_metrics(
+        str(ds), ["instruction", "input", "output"]
+    )
+    configured_metrics = _scan_hard_metrics(
+        str(ds),
+        ["instruction", "input", "output"],
+        duplicate_fields=["input", "output"],
+    )
+
+    assert default_metrics.dup_field == "instruction"
+    assert default_metrics.field_dup_rate == pytest.approx(0.8)
+    assert configured_metrics.field_dup_rate == 0.0
+    assert configured_metrics.dup_rate == 0.0
+
+
 def test_short_label_fields_do_not_inflate_dup(tmp_path):
     """answer/difficulty 这类短标签天然重复，纳入会把每份数据都判成重灾区。"""
     ds = tmp_path / "d.jsonl"

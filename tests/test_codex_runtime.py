@@ -181,7 +181,11 @@ def test_sdk_boundary_maps_generic_endpoint_and_explicit_skill(monkeypatch, tmp_
         {
             "api_key_env": "DF_AGENT_API_KEY",
             "base_url": "https://codex-gateway.example/v1",
-            "codex": {"model": "gpt-5.4", "effort": "high"},
+            "codex": {
+                "model": "gpt-5.4",
+                "effort": "high",
+                "model_provider": "openai-custom",
+            },
         }
     )
 
@@ -202,11 +206,15 @@ def test_sdk_boundary_maps_generic_endpoint_and_explicit_skill(monkeypatch, tmp_
     assert client.env["CODEX_API_KEY"] == "generic-key"
     assert client.env["CODEX_HOME"].endswith("sessions/codex")
     assert client.config_overrides == (
-        'openai_base_url="https://codex-gateway.example/v1"',
+        'model_providers.openai-custom.name="openai-custom"',
+        'model_providers.openai-custom.base_url="https://codex-gateway.example/v1"',
+        'model_providers.openai-custom.wire_api="responses"',
+        'model_providers.openai-custom.env_key="CODEX_API_KEY"',
     )
     thread = captured["thread_kwargs"]
     assert thread["approval_mode"] == "deny-all"
     assert thread["sandbox"] == "workspace-write"
+    assert thread["model_provider"] == "openai-custom"
     assert set(thread["config"]["mcp_servers"]) == {"dataflow-operators"}
     assert captured["turn_input"][0][0] == "skill"
     assert captured["turn_input"][0][1]["path"] == str(skill_path.resolve())

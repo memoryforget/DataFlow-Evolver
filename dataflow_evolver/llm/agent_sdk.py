@@ -41,7 +41,7 @@ class AgentInfraError(RuntimeError):
 _RETRYABLE_ERROR_TYPES = {"Timeout", "CLIConnectionError"}
 _TRANSIENT_MARKERS = (
     "429", "request rejected", "temporary issues", "temporarily unavailable",
-    "temporarily", "overloaded", "rate limit", "rate_limit", "too many requests",
+    "temporarily", "overloaded", "high demand", "rate limit", "rate_limit", "too many requests",
     "502", "503", "504", "internal server error", "bad gateway",
     "service unavailable", "gateway timeout", "timed out", "timeout",
     "connection reset", "connection error", "connection refused", "econnreset",

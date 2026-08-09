@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -206,6 +207,7 @@ def _combine_embedding_usage(
         "failure_count": 0,
         "missing_usage_count": 0,
         "exact_usage_count": 0,
+        "wall_time_seconds": 0.0,
         "unavailable_batch_count": sum(
             event.get("usage_status") == "unavailable" for event in events
         ),
@@ -226,6 +228,8 @@ def _combine_embedding_usage(
         if isinstance(event_tokens, dict):
             for key in totals:
                 totals[key] += int(event_tokens.get(key) or 0)
+        combined["wall_time_seconds"] += float(event.get("wall_time_seconds") or 0.0)
+    combined["wall_time_seconds"] = round(combined["wall_time_seconds"], 6)
     if not events:
         combined["usage_status"] = "not_requested"
     elif all(event.get("cache_hit") for event in events):
@@ -385,6 +389,9 @@ class DatasetQualityEvaluator:
                 self._embedding_usage_events,
                 model=self.embedder.model_name,
             )
+            base.embedding_wall_time_seconds = float(
+                base.embedding_usage.get("wall_time_seconds") or 0.0
+            )
 
     def _load_proxy_messages(self) -> list[Conversation]:
         if self._proxy_messages is not None:
@@ -411,9 +418,15 @@ class DatasetQualityEvaluator:
         *,
         scope: str,
     ) -> EmbeddingBatch:
+        started = time.perf_counter()
         cache_path = self._cache_path(conversations)
         if cache_path is not None and cache_path.exists():
             logger.info("命中 dataset embedding 缓存：%s", cache_path)
+            with np.load(cache_path, allow_pickle=False) as payload:
+                batch = EmbeddingBatch(
+                    np.asarray(payload["embeddings"], dtype=np.float32),
+                    float(payload["fail_rate"]),
+                )
             self._embedding_usage_events.append(
                 {
                     "scope": scope,
@@ -424,14 +437,11 @@ class DatasetQualityEvaluator:
                     "success_count": 0,
                     "failure_count": 0,
                     "missing_usage_count": 0,
+                    "wall_time_seconds": round(time.perf_counter() - started, 6),
                     "tokens": _empty_embedding_tokens(),
                 }
             )
-            with np.load(cache_path, allow_pickle=False) as payload:
-                return EmbeddingBatch(
-                    np.asarray(payload["embeddings"], dtype=np.float32),
-                    float(payload["fail_rate"]),
-                )
+            return batch
 
         logger.info("未命中 dataset embedding 缓存，开始编码 %d 条样本", len(conversations))
         batch = self.embedder.embed(conversations)
@@ -442,6 +452,7 @@ class DatasetQualityEvaluator:
                 "model": str(usage.get("model") or self.embedder.model_name),
                 "cache_hit": False,
                 "item_count": int(usage.get("item_count") or len(conversations)),
+                "wall_time_seconds": round(time.perf_counter() - started, 6),
             }
         )
         if not batch.usage:

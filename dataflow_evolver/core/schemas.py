@@ -44,6 +44,7 @@ class DatasetQualityResult:
     das: float | None = None
     delta_mmd_vs_parent: float | None = None
     embedding_fail_rate: float = 0.0
+    embedding_wall_time_seconds: float = 0.0
     kernel_terms: dict[str, float] = field(default_factory=dict)
     embedding_diversity: dict[str, float] = field(default_factory=dict)
     delta_embedding_diversity_vs_parent: dict[str, float] = field(default_factory=dict)

@@ -240,8 +240,19 @@ async def _run_once_async(
     if endpoint.api_key:
         env["CODEX_API_KEY"] = endpoint.api_key
 
+    provider = str(cfg.get("model_provider", "") or "").strip() or None
     overrides: list[str] = []
-    if endpoint.base_url:
+    if provider and endpoint.base_url:
+        provider_key = f"model_providers.{provider}"
+        overrides.extend(
+            [
+                f"{provider_key}.name={json.dumps(provider)}",
+                f"{provider_key}.base_url={json.dumps(endpoint.base_url)}",
+                f'{provider_key}.wire_api="responses"',
+                f'{provider_key}.env_key="CODEX_API_KEY"',
+            ]
+        )
+    elif endpoint.base_url:
         overrides.append(f"openai_base_url={json.dumps(endpoint.base_url)}")
     binary = str(cfg.get("binary", "") or "").strip() or None
     client_config = sdk["CodexConfig"](
@@ -255,7 +266,6 @@ async def _run_once_async(
 
     model = str(backend_value(agent_cfg, "codex", "model", default="gpt-5.4"))
     effort = str(backend_value(agent_cfg, "codex", "effort", default="high") or "high")
-    provider = str(cfg.get("model_provider", "") or "").strip() or None
     timeout_ms = int(cfg.get("mcp_timeout_ms", 30000) or 30000)
     thread_config = build_codex_thread_config(cwd, timeout_ms)
     developer_instructions = str(

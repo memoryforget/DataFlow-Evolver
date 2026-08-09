@@ -143,9 +143,12 @@ def test_dataset_evaluator_uses_configured_sample_size_and_cache(tmp_path):
     assert second.mmd == pytest.approx(first.mmd)
     assert embedder.calls == 2  # Candidate + proxy only once; second evaluation is cached.
     assert first.embedding_usage["usage_status"] == "unavailable"
+    assert first.embedding_wall_time_seconds >= 0.0
+    assert first.embedding_usage["wall_time_seconds"] >= 0.0
     assert second.embedding_usage["usage_status"] == "cache_only"
     assert second.embedding_usage["request_count"] == 0
     assert second.embedding_usage["tokens"]["total_tokens"] == 0
+    assert second.embedding_wall_time_seconds >= 0.0
 
 
 def test_openai_embedding_backend_aggregates_exact_api_usage(monkeypatch):

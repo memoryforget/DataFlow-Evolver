@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,8 @@ class Candidate:
     failure_stage: str | None = None
     parent_iteration: int | None = None
     accepted_as_incumbent: bool = False
+    execution_repairs: int = 0
+    wall_time_seconds: float = 0.0
 
     @property
     def score(self) -> float:
@@ -77,6 +80,7 @@ class ReviewOnlyLoop:
         self.max_iterations = max_iterations
         self.execution_repairs = max(0, execution_repairs)
         self.candidates: list[Candidate] = []
+        self.data_preparation_wall_time_seconds = 0.0
 
     @property
     def run_dir(self) -> Path:
@@ -84,6 +88,7 @@ class ReviewOnlyLoop:
 
     def run(self) -> Candidate | None:
         """Run up to ``max_iterations`` candidates while retaining the best incumbent."""
+        run_started = time.perf_counter()
         self.workspace.mkdir(parents=True, exist_ok=True)
         if self.run_dir.exists() and any(self.run_dir.iterdir()):
             raise FileExistsError(
@@ -153,6 +158,9 @@ class ReviewOnlyLoop:
                 break
 
         best = incumbent or select_best(self.candidates)
+        self.data_preparation_wall_time_seconds = round(
+            time.perf_counter() - run_started, 6
+        )
         if best is not None:
             self._write_manifest(best)
             logger.info(
@@ -173,6 +181,7 @@ class ReviewOnlyLoop:
         config: PipelineConfig,
         parent_review: ReviewResult | None = None,
     ) -> Candidate:
+        iteration_started = time.perf_counter()
         result: ExecutionResult = self.executor.run(config, iteration_dir)
         retries = 0
         while not result.success and retries < self.execution_repairs:
@@ -197,6 +206,8 @@ class ReviewOnlyLoop:
                 config=config,
                 execution_error=result.traceback or "unknown execution failure",
                 failure_stage=result.failure_stage,
+                execution_repairs=retries,
+                wall_time_seconds=round(time.perf_counter() - iteration_started, 6),
             )
 
         evidence_path = iteration_dir / "review.jsonl"
@@ -214,6 +225,8 @@ class ReviewOnlyLoop:
             config=config,
             dataset_path=result.dataset_path,
             review=review,
+            execution_repairs=retries,
+            wall_time_seconds=round(time.perf_counter() - iteration_started, 6),
         )
 
     def _append_trace(self, candidate: Candidate) -> None:
@@ -254,6 +267,8 @@ class ReviewOnlyLoop:
             "run_name": self.run_name,
             "max_iterations": self.max_iterations,
             "completed_iterations": len(self.candidates),
+            "total_execution_repairs": sum(c.execution_repairs for c in self.candidates),
+            "data_preparation_wall_time_seconds": self.data_preparation_wall_time_seconds,
             "selection_rule": "best-so-far incumbent: passed first, then highest review_score",
             "best": _candidate_record(best),
             "evolution_history": self._evolution_history(),
@@ -345,6 +360,7 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
         dataset_quality_score_weights=_plain_dict(
             dataset_quality_cfg.get("score_weights")
         ) or None,
+        duplicate_fields=list(review_cfg.get("duplicate_fields", []) or []) or None,
     )
 
     agent_cfg = cfg.agent
@@ -390,6 +406,8 @@ def _candidate_record(candidate: Candidate) -> dict[str, Any]:
         "failure_stage": candidate.failure_stage,
         "parent_iteration": candidate.parent_iteration,
         "accepted_as_incumbent": candidate.accepted_as_incumbent,
+        "execution_repairs": candidate.execution_repairs,
+        "wall_time_seconds": candidate.wall_time_seconds,
         "field_flow": candidate.config.field_flow,
         "operators": candidate.config.operators,
         "review": asdict(candidate.review) if candidate.review is not None else None,

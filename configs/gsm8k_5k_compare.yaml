@@ -1,0 +1,113 @@
+# Reproducible DataFlow-Evolver side of the GSM8K 5k data-construction comparison.
+# Secrets remain environment-only. Use this file explicitly with --config.
+project:
+  workspace_dir: ${DF_WORKSPACE:./workspace}
+  input_dir: ${RAW_DATA_DIR:/vepfs-mlp2/c20250602/500050/lh/xqf/DataFlow-Evolver/input/gsm8k_5k_seed42}
+  input_entry: ${RAW_DATA_ENTRY:gsm8k_train_5k_seed42.jsonl}
+  run_name: ${DF_RUN_NAME:gsm8k_5k_seed42_df_gpt54_codex_r2}
+
+task:
+  target_schema:
+    instruction: str
+    input: str
+    output: str
+  quality_criteria:
+    - Only transform the supplied GSM8K raw records; do not synthesize replacements.
+    - Preserve the concrete math problem in input and produce ordered reasoning in output.
+    - End output with Final answer: \boxed{...}.
+
+llm:
+  backend: api
+  api:
+    # DF_API_URL is an endpoint, not a secret. It intentionally includes
+    # /v1/chat/completions; ReviewAgent normalizes it to an OpenAI base URL.
+    api_url: ${DF_API_URL:http://123.129.219.111:3000/v1/chat/completions}
+    model_name: ${DF_REVIEW_MODEL:gpt-5.5}
+    api_key: ${DF_API_KEY:}
+    max_workers: ${DF_API_MAX_WORKERS:100}
+  pipeline_llm:
+    generation:
+      model_name: ${DF_PIPELINE_MODEL:gpt-4o}
+    reasoning:
+      model_name: ${DF_PIPELINE_MODEL:gpt-4o}
+
+agent:
+  backend: codex
+  model: ${DF_AGENT_MODEL:gpt-5.4}
+  effort: ${DF_AGENT_EFFORT:xhigh}
+  api_key_env: ${DF_AGENT_API_KEY_ENV:DF_AGENT_API_KEY}
+  base_url: ${DF_AGENT_BASE_URL:http://123.129.219.111:3000/v1}
+  permission_mode: bypassPermissions
+  setting_sources: [project]
+  max_turns: 50
+  pipeline_filename: pipeline.py
+  max_retries: 4
+  retry_base_delay: 10
+  run_timeout_sec: 1800
+  resume_on_retry: true
+  codex:
+    binary: ${CODEX_BIN:}
+    model: ${CODEX_MODEL:}
+    model_provider: ${CODEX_MODEL_PROVIDER:openai-custom}
+    effort: ${CODEX_EFFORT:}
+    api_key_env: ${CODEX_API_KEY_ENV:}
+    base_url: ${CODEX_BASE_URL:}
+    mcp_timeout_ms: ${CODEX_MCP_TIMEOUT_MS:30000}
+
+loop:
+  max_iterations: 5
+  compile_timeout_sec: ${DF_COMPILE_TIMEOUT_SEC:120}
+  execution_timeout_sec: ${DF_EXECUTION_TIMEOUT_SEC:1200}
+  execution_repairs: 3
+  python_exe: ${DF_AGENT_PYTHON:}
+
+review:
+  sample_size: ${DF_REVIEW_SAMPLE_SIZE:80}
+  sample_seed: 42
+  schema_threshold: 0.6
+  relevance_threshold: 0.6
+  null_threshold: 0.5
+  hard_metrics: true
+  duplicate_fields: [input, output]
+  weights:
+    correctness: 0.40
+    relevance: 0.25
+    difficulty: 0.15
+    schema: 0.20
+  decontamination:
+    reference_files: []
+    ngram: 8
+    max_rate: 0.01
+  dataset_quality:
+    enabled: true
+    score_weight: ${DF_DATASET_QUALITY_SCORE_WEIGHT:0.25}
+    score_weights:
+      das: 0.40
+      vendi: 0.30
+      nearest_neighbor: 0.30
+    sample_size: 1000
+    sample_seed: 42
+    require_full_sample: true
+    rbf_sigma: 1.0
+    biased: true
+    normalize_embeddings: true
+    max_embedding_fail_rate: 0.02
+    cache_dir: ${DF_DAS_CACHE_DIR:./workspace/cache/das/gsm8k_5k_seed42_compare}
+    candidate:
+      user_field: input
+      assistant_field: output
+    proxy:
+      source: local
+      path: ${DF_DAS_PROXY_PATH:./data/ODA-Math-460k}
+      name: ODA-Math-460k
+      split: train
+      user_field: question
+      assistant_field: response
+    embedding:
+      model_name: ${DF_DAS_EMBEDDING_MODEL:./model/Qwen3-Embedding-8B}
+      base_url: ${DF_DAS_EMBEDDING_URL:http://127.0.0.1:8000/v1}
+      api_key: ${DF_DAS_EMBEDDING_API_KEY:EMPTY}
+      max_concurrent_requests: ${DF_DAS_EMBEDDING_CONCURRENCY:128}
+      max_retries: 3
+      truncate_prompt_tokens: 40960
+      truncation_side: right

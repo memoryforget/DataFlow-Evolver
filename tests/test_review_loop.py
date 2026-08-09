@@ -104,6 +104,8 @@ def test_review_feedback_is_passed_directly_to_next_pipeline_prompt(tmp_path):
     assert [review.review_score for review in loop.pipeline_agent.feedback] == [0.3, 0.8]
     manifest = json.loads((loop.run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["completed_iterations"] == 3
+    assert manifest["data_preparation_wall_time_seconds"] >= 0.0
+    assert manifest["total_execution_repairs"] == 0
     assert manifest["best"]["iteration"] == 1
     assert [step["outcome"] for step in manifest["evolution_history"]] == [
         "accepted", "accepted", "rejected"
@@ -138,6 +140,10 @@ def test_execution_repairs_are_configurable_and_receive_diagnostics(tmp_path):
     assert len(loop.pipeline_agent.repairs) == 2
     assert loop.pipeline_agent.repairs[0][2] == '[{"rows": 0}]'
     assert loop.pipeline_agent.repairs[0][3] == "compile"
+    manifest = json.loads((loop.run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["total_execution_repairs"] == 2
+    assert manifest["best"]["execution_repairs"] == 2
+    assert manifest["best"]["wall_time_seconds"] >= 0.0
 
 
 def test_best_selection_prefers_passed_candidate_before_raw_score(tmp_path):

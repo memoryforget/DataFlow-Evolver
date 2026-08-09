@@ -10,6 +10,15 @@ def test_tool_arguments_are_truncated():
     assert len(value["content"]) < 700
 
 
+def test_high_demand_is_retryable():
+    result = AgentRunResult(
+        False,
+        error="We're currently experiencing high demand, which may cause temporary errors.",
+        error_type="RuntimeError",
+    )
+    assert sdk._is_retryable(result)
+
+
 def test_tool_trace_appends_by_phase(tmp_path):
     sdk._record_tool_uses(tmp_path, [{"name": "Read", "input": {"file": "a"}}], "generate")
     sdk._record_tool_uses(tmp_path, [{"name": "Write", "input": {"file": "b"}}], "retry")
