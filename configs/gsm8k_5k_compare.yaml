@@ -4,7 +4,7 @@ project:
   workspace_dir: ${DF_WORKSPACE:./workspace}
   input_dir: ${RAW_DATA_DIR:/vepfs-mlp2/c20250602/500050/lh/xqf/DataFlow-Evolver/input/gsm8k_5k_seed42}
   input_entry: ${RAW_DATA_ENTRY:gsm8k_train_5k_seed42.jsonl}
-  run_name: ${DF_RUN_NAME:gsm8k_5k_seed42_df_gpt54_codex_r2}
+  run_name: ${DF_RUN_NAME:gsm8k_5k_seed42_df_gpt54_codex_cli_r3}
 
 task:
   target_schema:
@@ -14,7 +14,8 @@ task:
   quality_criteria:
     - Only transform the supplied GSM8K raw records; do not synthesize replacements.
     - Preserve the concrete math problem in input and produce ordered reasoning in output.
-    - End output with Final answer: \boxed{...}.
+    - "Preserve the GSM8K answer convention: end output with `#### <final answer>`."
+    - The final answer after `####` must be mathematically equivalent to the source answer.
 
 llm:
   backend: api
@@ -46,7 +47,8 @@ agent:
   run_timeout_sec: 1800
   resume_on_retry: true
   codex:
-    binary: ${CODEX_BIN:}
+    # This comparison is pinned to the tested Codex CLI 0.118.0.
+    binary: ${CODEX_BIN:codex}
     model: ${CODEX_MODEL:}
     model_provider: ${CODEX_MODEL_PROVIDER:openai-custom}
     effort: ${CODEX_EFFORT:}

@@ -23,8 +23,6 @@ agent = [
     # claude-agent-sdk 依赖 mcp -> pydantic>=2.11，与 llamafactory 冲突
     # 编排层单独装，不要和 SFT / eval 混装
     "claude-agent-sdk>=0.2",
-    # Official Python SDK; it installs a pinned Codex runtime binary.
-    "openai-codex>=0.144",
 ]
 agent-runtime = [
     # --- 运行 vendored DataFlow 流水线所需（装在 dfe-review 环境）---

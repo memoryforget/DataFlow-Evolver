@@ -1,9 +1,10 @@
-"""OpenAI Codex Python SDK runtime for PipelineAgent."""
+"""Codex JSON CLI runtime for PipelineAgent."""
 from __future__ import annotations
 
-import asyncio
 import json
 import os
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -130,115 +131,17 @@ def _tool_trace(items: list[Any]) -> list[dict[str, Any]]:
     return uses
 
 
-def _assistant_texts(items: list[Any], final_response: str) -> list[str]:
-    texts: list[str] = []
-    for item in items:
-        payload = _item_payload(item)
-        kind = str(payload.get("type") or payload.get("kind") or "").lower()
-        if "agentmessage" not in kind and "agent_message" not in kind:
-            continue
-        text = str(_pick(payload, "text", "content", "message") or "").strip()
-        if text:
-            texts.append(text)
-    if final_response and final_response not in texts:
-        texts.append(final_response)
-    return texts
-
-
-def result_from_codex_turn(turn: Any, *, session_id: str) -> AgentRunResult:
-    items = list(getattr(turn, "items", None) or [])
-    final_response = str(getattr(turn, "final_response", None) or "")
-    status_value = getattr(getattr(turn, "status", None), "value", None)
-    status = str(status_value or getattr(turn, "status", "")).lower()
-    error_obj = getattr(turn, "error", None)
-    error_payload = _jsonable(error_obj)
-    if isinstance(error_payload, dict):
-        error = str(_pick(error_payload, "message", "details") or error_payload)
-    else:
-        error = str(error_payload or "")
-    success = status in {"completed", "success", "succeeded"} and not error
-    return AgentRunResult(
-        success=success,
-        result_text=final_response,
-        assistant_texts=_assistant_texts(items, final_response),
-        error=error or (None if success else f"Codex turn ended with status {status or 'unknown'}"),
-        error_type=None if success else "CodexTurnError",
-        session_id=session_id,
-        tool_uses=_tool_trace(items),
-        usage=normalize_codex_usage(getattr(turn, "usage", None)),
-    )
-
-
-def build_codex_thread_config(cwd: str, timeout_ms: int) -> dict[str, Any]:
-    pythonpath = str(_PROJECT_ROOT)
-    inherited = os.environ.get("PYTHONPATH", "")
-    if inherited:
-        pythonpath += os.pathsep + inherited
-    return {
-        "sandbox_workspace_write": {"network_access": False},
-        "web_search": "disabled",
-        "mcp_servers": {
-            "dataflow-operators": {
-                "command": sys.executable,
-                "args": ["-m", "dataflow_evolver.llm.mcp_stdio"],
-                "cwd": str(_PROJECT_ROOT),
-                "env": {"DF_WORKSPACE": cwd, "PYTHONPATH": pythonpath},
-                "enabled": True,
-                "required": True,
-                "startup_timeout_ms": timeout_ms,
-                "tool_timeout_sec": max(timeout_ms / 1000.0, 1.0),
-                "default_tools_approval_mode": "approve",
-                "enabled_tools": list(_OPERATOR_TOOLS),
-            }
-        },
-    }
-
-
-def _sdk_components() -> dict[str, Any]:
-    from openai_codex import (  # type: ignore[import-not-found]
-        ApprovalMode,
-        AsyncCodex,
-        CodexConfig,
-        Sandbox,
-        SkillInput,
-        TextInput,
-        is_retryable_error,
-    )
-
-    return {
-        "ApprovalMode": ApprovalMode,
-        "AsyncCodex": AsyncCodex,
-        "CodexConfig": CodexConfig,
-        "Sandbox": Sandbox,
-        "SkillInput": SkillInput,
-        "TextInput": TextInput,
-        "is_retryable_error": is_retryable_error,
-    }
-
-
-async def _run_once_async(
-    prompt: str,
-    *,
-    cwd: str,
+def _codex_provider_overrides(
     agent_cfg: Config,
-    resume: str | None,
-    timeout: float,
-    session_env: dict[str, str] | None,
-) -> AgentRunResult:
-    session_id = resume
-    try:
-        sdk = _sdk_components()
-    except (ImportError, ModuleNotFoundError) as exc:
-        return AgentRunResult(False, error=str(exc), error_type="SDKNotInstalledError")
-
+) -> tuple[list[str], dict[str, str], str | None]:
+    """Resolve Codex CLI provider overrides and its process environment."""
     cfg = backend_config(agent_cfg, "codex")
     endpoint = resolve_agent_endpoint(agent_cfg, "codex", provider="openai")
     env = os.environ.copy()
     env.update(_agent_env(agent_cfg))
-    if session_env:
-        env.update(session_env)
     if endpoint.api_key:
         env["CODEX_API_KEY"] = endpoint.api_key
+        env["OPENAI_API_KEY"] = endpoint.api_key
 
     provider = str(cfg.get("model_provider", "") or "").strip() or None
     overrides: list[str] = []
@@ -250,84 +153,209 @@ async def _run_once_async(
                 f"{provider_key}.base_url={json.dumps(endpoint.base_url)}",
                 f'{provider_key}.wire_api="responses"',
                 f'{provider_key}.env_key="CODEX_API_KEY"',
+                f"model_provider={json.dumps(provider)}",
             ]
         )
     elif endpoint.base_url:
         overrides.append(f"openai_base_url={json.dumps(endpoint.base_url)}")
-    binary = str(cfg.get("binary", "") or "").strip() or None
-    client_config = sdk["CodexConfig"](
-        codex_bin=binary,
-        config_overrides=tuple(overrides),
-        cwd=cwd,
-        env=env,
-        client_name="dataflow_evolver",
-        client_title="DataFlow Evolver PipelineAgent",
+    return overrides, env, provider
+
+
+def _codex_mcp_overrides(cwd: str, timeout_ms: int) -> list[str]:
+    pythonpath = str(_PROJECT_ROOT)
+    inherited = os.environ.get("PYTHONPATH", "")
+    if inherited:
+        pythonpath += os.pathsep + inherited
+    server = "mcp_servers.dataflow-operators"
+    return [
+        f"{server}.command={json.dumps(sys.executable)}",
+        f"{server}.args={json.dumps(['-m', 'dataflow_evolver.llm.mcp_stdio'])}",
+        f"{server}.cwd={json.dumps(str(_PROJECT_ROOT))}",
+        (
+            f"{server}.env={{DF_WORKSPACE={json.dumps(cwd)},"
+            f"PYTHONPATH={json.dumps(pythonpath)}}}"
+        ),
+        f"{server}.startup_timeout_ms={timeout_ms}",
+        f"{server}.tool_timeout_sec={max(timeout_ms / 1000.0, 1.0)}",
+        f"{server}.enabled_tools={json.dumps(list(_OPERATOR_TOOLS))}",
+    ]
+
+
+def result_from_codex_cli(
+    stdout: str,
+    stderr: str,
+    *,
+    exit_code: int,
+    timed_out: bool = False,
+) -> AgentRunResult:
+    """Convert ``codex exec --json`` events into the common agent result."""
+    session_id: str | None = None
+    assistant_texts: list[str] = []
+    tool_uses: list[dict[str, Any]] = []
+    usage: dict[str, int] | None = None
+    errors: list[str] = []
+    completed = False
+
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("type") or "")
+        if event_type == "thread.started":
+            session_id = str(event.get("thread_id") or "") or session_id
+        elif event_type == "turn.completed":
+            completed = True
+            usage = normalize_codex_usage(event.get("usage"))
+        elif event_type in {"turn.failed", "error"}:
+            payload = event.get("error")
+            if isinstance(payload, dict):
+                message = str(_pick(payload, "message", "details") or payload)
+            else:
+                message = str(payload or event.get("message") or "Codex CLI error")
+            errors.append(message)
+        elif event_type in {"item.started", "item.completed"}:
+            item = event.get("item")
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("type") or "").lower()
+            if event_type == "item.completed" and kind == "agent_message":
+                text = str(item.get("text") or "").strip()
+                if text:
+                    assistant_texts.append(text)
+            if event_type == "item.completed":
+                tool_uses.extend(_tool_trace([item]))
+
+    result_text = assistant_texts[-1] if assistant_texts else ""
+    if timed_out:
+        error = errors[-1] if errors else "Codex CLI run timed out"
+        error_type = "Timeout"
+    elif exit_code != 0 or not completed:
+        error = errors[-1] if errors else stderr.strip() or "Codex CLI did not complete the turn"
+        error_type = "CodexCLIError"
+    else:
+        error = None
+        error_type = None
+    return AgentRunResult(
+        success=completed and exit_code == 0 and not errors and not timed_out,
+        result_text=result_text,
+        assistant_texts=assistant_texts,
+        error=error,
+        error_type=error_type,
+        exit_code=exit_code,
+        session_id=session_id,
+        tool_uses=tool_uses,
+        usage=usage,
     )
 
+
+def _terminate_cli(process: subprocess.Popen[str]) -> tuple[str, str]:
+    try:
+        if os.name != "nt":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+        return process.communicate(timeout=5)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        if process.poll() is None:
+            if os.name != "nt":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        return process.communicate()
+
+
+def _run_once_cli(
+    prompt: str,
+    *,
+    cwd: str,
+    agent_cfg: Config,
+    resume: str | None,
+    timeout: float,
+    session_env: dict[str, str] | None,
+) -> AgentRunResult:
+    cfg = backend_config(agent_cfg, "codex")
+    overrides, env, _ = _codex_provider_overrides(agent_cfg)
+    if session_env:
+        env.update(session_env)
+    timeout_ms = int(cfg.get("mcp_timeout_ms", 30000) or 30000)
+    overrides.extend(_codex_mcp_overrides(cwd, timeout_ms))
+    overrides.extend(
+        [
+            'approval_policy="never"',
+            'sandbox_mode="workspace-write"',
+            'web_search="disabled"',
+            'sandbox_workspace_write.network_access=false',
+        ]
+    )
+
+    binary = str(cfg.get("binary", "") or "codex").strip() or "codex"
+    binary_path = Path(binary).expanduser()
+    if binary_path.is_absolute():
+        env["PATH"] = str(binary_path.parent) + os.pathsep + env.get("PATH", "")
     model = str(backend_value(agent_cfg, "codex", "model", default="gpt-5.4"))
     effort = str(backend_value(agent_cfg, "codex", "effort", default="high") or "high")
-    timeout_ms = int(cfg.get("mcp_timeout_ms", 30000) or 30000)
-    thread_config = build_codex_thread_config(cwd, timeout_ms)
-    developer_instructions = str(
-        agent_cfg.get("system_prompt_append", _DEFAULT_SYSTEM_PROMPT_APPEND)
-    )
+    args = [binary, "exec"]
+    if resume:
+        args.extend(["resume", "--json", "--skip-git-repo-check", "--full-auto"])
+    else:
+        args.extend(
+            [
+                "--json",
+                "--skip-git-repo-check",
+                "--full-auto",
+                "--cd",
+                cwd,
+            ]
+        )
+    args.extend(["--model", model, "-c", f"model_reasoning_effort={json.dumps(effort)}"])
+    for override in overrides:
+        args.extend(["-c", override])
+    if resume:
+        args.append(resume)
+    else:
+        developer = str(
+            agent_cfg.get("system_prompt_append", _DEFAULT_SYSTEM_PROMPT_APPEND)
+        ).strip()
+        if developer:
+            prompt = f"{developer}\n\n{prompt}"
+    args.append(prompt)
 
     try:
-        async with sdk["AsyncCodex"](client_config) as codex:
-            if endpoint.api_key:
-                await codex.login_api_key(endpoint.api_key)
-            thread_kwargs = {
-                "approval_mode": sdk["ApprovalMode"].deny_all,
-                "config": thread_config,
-                "cwd": cwd,
-                "developer_instructions": developer_instructions,
-                "model": model,
-                "model_provider": provider,
-                "sandbox": sdk["Sandbox"].workspace_write,
-            }
-            if resume:
-                thread = await codex.thread_resume(resume, **thread_kwargs)
-            else:
-                thread = await codex.thread_start(ephemeral=False, **thread_kwargs)
-            session_id = str(thread.id)
-            skill_path = Path(cwd) / ".agents/skills/dataflow-dev/SKILL.md"
-            turn_input: Any = prompt
-            if skill_path.is_file():
-                turn_input = [
-                    sdk["SkillInput"](name="dataflow-dev", path=str(skill_path.resolve())),
-                    sdk["TextInput"](text=prompt),
-                ]
-            turn = await asyncio.wait_for(
-                thread.run(
-                    turn_input,
-                    approval_mode=sdk["ApprovalMode"].deny_all,
-                    cwd=cwd,
-                    effort=effort,
-                    model=model,
-                    sandbox=sdk["Sandbox"].workspace_write,
-                ),
-                timeout=timeout if timeout > 0 else None,
-            )
-            return result_from_codex_turn(turn, session_id=session_id)
-    except (asyncio.TimeoutError, TimeoutError):
-        return AgentRunResult(
-            False,
-            error=f"Codex SDK 运行超过 {timeout:.0f}s 超时",
-            error_type="Timeout",
-            session_id=session_id,
+        process = subprocess.Popen(
+            args,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=os.name != "nt",
         )
-    except Exception as exc:  # SDK exception hierarchy remains provider/runtime-specific.
-        retryable = False
-        try:
-            retryable = bool(sdk["is_retryable_error"](exc))
-        except Exception:
-            pass
+    except OSError as exc:
         return AgentRunResult(
             False,
             error=str(exc),
             error_type=type(exc).__name__,
-            retryable=retryable,
-            session_id=session_id,
+        )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout if timeout > 0 else None)
+        return result_from_codex_cli(
+            stdout,
+            stderr,
+            exit_code=int(process.returncode or 0),
+        )
+    except subprocess.TimeoutExpired:
+        stdout, stderr = _terminate_cli(process)
+        return result_from_codex_cli(
+            stdout,
+            stderr,
+            exit_code=int(process.returncode or -1),
+            timed_out=True,
         )
 
 
@@ -340,15 +368,13 @@ def _run_once(
     timeout: float,
     session_env: dict[str, str] | None = None,
 ) -> AgentRunResult:
-    return asyncio.run(
-        _run_once_async(
-            prompt,
-            cwd=cwd,
-            agent_cfg=agent_cfg,
-            resume=resume,
-            timeout=timeout,
-            session_env=session_env,
-        )
+    return _run_once_cli(
+        prompt,
+        cwd=cwd,
+        agent_cfg=agent_cfg,
+        resume=resume,
+        timeout=timeout,
+        session_env=session_env,
     )
 
 
@@ -374,12 +400,11 @@ def run_codex_agent(
     session_env = session_store.environment() if session_store is not None else None
     resume_id: str | None = None
     result = AgentRunResult(False, error="未发起任何 Codex 运行", error_type="NoAttempt")
-
     for attempt in range(1, max_retries + 1):
         used_resume = bool(resume_enabled and resume_id)
         current_prompt = _RESUME_NUDGE if used_resume else prompt
         logger.info(
-            "启动 Codex SDK（尝试 %d/%d，%s）：cwd=%s",
+            "启动 Codex CLI（尝试 %d/%d，%s）：cwd=%s",
             attempt,
             max_retries,
             f"resume={resume_id}" if used_resume else "全新会话",
@@ -435,7 +460,7 @@ def run_codex_agent(
 
 
 class CodexAgentRuntime:
-    """AgentRuntime implementation backed by the official Python Codex SDK."""
+    """AgentRuntime implementation backed by ``codex exec --json``."""
 
     def run(
         self,

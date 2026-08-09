@@ -55,9 +55,8 @@ python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -e ".[agent,agent-runtime,dataset-quality,dev]"
 ```
 
-Install the `claude` or `opencode` CLI separately when selecting those backends. The
-`openai-codex` Python package installs its pinned Codex runtime; `CODEX_BIN` can override
-it when needed.
+Install the `claude`, `opencode`, or `codex` CLI separately when selecting those
+backends. Codex is invoked through `codex exec --json`; `CODEX_BIN` selects the binary.
 
 ## Configure
 
@@ -119,6 +118,7 @@ For Codex:
 
 ```bash
 export AGENT_BACKEND=codex
+export CODEX_BIN=/path/to/codex
 export CODEX_MODEL=gpt-5.4
 export CODEX_EFFORT=high
 ```

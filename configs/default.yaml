@@ -66,8 +66,8 @@ agent:
     max_steps: ${OPENCODE_MAX_STEPS:50}
     mcp_timeout_ms: ${OPENCODE_MCP_TIMEOUT_MS:30000}
   codex:
-    # openai-codex ships a pinned binary; set CODEX_BIN only to override it.
-    binary: ${CODEX_BIN:}
+    # Codex uses the local `codex exec --json` CLI.
+    binary: ${CODEX_BIN:codex}
     model: ${CODEX_MODEL:}
     model_provider: ${CODEX_MODEL_PROVIDER:}
     effort: ${CODEX_EFFORT:}

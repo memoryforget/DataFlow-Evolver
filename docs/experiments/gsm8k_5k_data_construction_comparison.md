@@ -28,7 +28,7 @@ The frozen 5k file has SHA-256:
 |---|---|
 | DataEvolver understanding/orchestration/evolution/instantiation/Judge | `gpt-5.5` |
 | DataEvolver runtime pipeline LLM operators | `gpt-4o` |
-| DataFlow PipelineAgent | Codex SDK / `gpt-5.4` / effort `xhigh` / Responses API |
+| DataFlow PipelineAgent | Codex CLI 0.118.0 / `gpt-5.4` / effort `xhigh` / Responses API |
 | DataFlow generated-pipeline generation/reasoning | `gpt-4o` |
 | DataFlow ReviewAgent | `gpt-5.5` |
 | DAS embedding | local `model/Qwen3-Embedding-8B` |
@@ -82,8 +82,9 @@ dataevolver run gsm8k_5k_seed5_gpt55_gpt4o_r1
 
 Use `configs/gsm8k_5k_compare.yaml`. Important resolved values:
 
-- `project.run_name=gsm8k_5k_seed42_df_gpt54_codex_r2`
+- `project.run_name=gsm8k_5k_seed42_df_gpt54_codex_cli_r3`
 - `agent.backend=codex`, `agent.model=gpt-5.4`, `agent.effort=xhigh`
+- Codex CLI pinned to the tested version `0.118.0`
 - Codex provider `openai-custom`, `wire_api=responses`
 - pipeline generation/reasoning model `gpt-4o`
 - Review model `gpt-5.5`
@@ -108,6 +109,7 @@ The configured non-secret endpoints are:
 ```bash
 export DF_API_URL=http://123.129.219.111:3000/v1/chat/completions
 export DF_AGENT_BASE_URL=http://123.129.219.111:3000/v1
+export CODEX_BIN=/path/to/codex-0.118.0
 ```
 
 Run command, only after confirmation and after the local embedding endpoint is healthy:
@@ -117,7 +119,7 @@ cd /vepfs-mlp2/c20250602/500050/lh/xqf/DataFlow-Evolver
 /vepfs-mlp2/c20250602/500050/lh/xqf/miniconda3/envs/dfe-review/bin/python \
   -m dataflow_evolver.main \
   --config configs/gsm8k_5k_compare.yaml \
-  --task 'Transform only the supplied GSM8K 5k raw records into exactly 5,000 SFT records. Do not download or synthesize replacement problems. Each record must contain a fixed non-empty instruction, the concrete source problem in input, and ordered reasoning in output ending with Final answer: \boxed{...}. Do not read GSM8K test or any external training questions.'
+  --task 'Transform only the supplied GSM8K 5k raw records into exactly 5,000 SFT records. Do not download or synthesize replacement problems. Each record must contain a fixed non-empty instruction, the concrete source problem in input, and ordered reasoning in output ending with the GSM8K convention #### <final answer>. The final answer must be mathematically equivalent to the source answer. Do not read GSM8K test or any external training questions.'
 ```
 
 For the recorded server run, prefer `scripts/run_gsm8k_5k_compare.sh` after exporting
