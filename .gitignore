@@ -10,6 +10,16 @@ model/*
 input/*
 logs/
 hf_cache/
+artifacts/
+
+# Local experiment records and one-off comparison assets.
+archive/
+experiments/
+docs/experiments/
+
+# Local heterogeneous-math comparison configuration and launcher.
+configs/math_markdown_pilot6_compare.yaml
+scripts/run_math_markdown_pilot6_compare.sh
 
 # The workspace is the Agent project root. Keep its project skill and vendored
 # DataFlow source tracked; ignore runtime state and unrelated root-level output.

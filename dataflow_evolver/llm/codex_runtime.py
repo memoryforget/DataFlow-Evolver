@@ -144,6 +144,8 @@ def _codex_provider_overrides(
         env["OPENAI_API_KEY"] = endpoint.api_key
 
     provider = str(cfg.get("model_provider", "") or "").strip() or None
+    if endpoint.base_url and not provider:
+        provider = "dataflow-openai-compatible"
     overrides: list[str] = []
     if provider and endpoint.base_url:
         provider_key = f"model_providers.{provider}"
@@ -152,12 +154,11 @@ def _codex_provider_overrides(
                 f"{provider_key}.name={json.dumps(provider)}",
                 f"{provider_key}.base_url={json.dumps(endpoint.base_url)}",
                 f'{provider_key}.wire_api="responses"',
+                f"{provider_key}.supports_websockets=false",
                 f'{provider_key}.env_key="CODEX_API_KEY"',
                 f"model_provider={json.dumps(provider)}",
             ]
         )
-    elif endpoint.base_url:
-        overrides.append(f"openai_base_url={json.dumps(endpoint.base_url)}")
     return overrides, env, provider
 
 

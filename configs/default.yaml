@@ -35,9 +35,6 @@ llm:
 # same pipeline.py + decision.json artifacts.
 agent:
   backend: ${AGENT_BACKEND:claude}  # claude | opencode | codex
-  # Provider-neutral defaults. A non-empty backend-specific value below wins.
-  model: ${DF_AGENT_MODEL:}
-  effort: ${DF_AGENT_EFFORT:}
   api_key_env: ${DF_AGENT_API_KEY_ENV:DF_AGENT_API_KEY}
   base_url: ${DF_AGENT_BASE_URL:}
   setting_sources: [project]
@@ -58,8 +55,8 @@ agent:
       IS_SANDBOX: ${IS_SANDBOX:1}
   opencode:
     binary: ${OPENCODE_BIN:opencode}
-    # Empty model means agent.model, then the runtime default. Provider selects
-    # only OpenCode's provider adapter; credentials still use the generic fields.
+    # Empty model uses the OpenCode runtime default. Provider selects only
+    # OpenCode's adapter; credentials still use the generic fields above.
     model: ${OPENCODE_MODEL:}
     provider: ${OPENCODE_PROVIDER:anthropic}
     api_key_env: ${OPENCODE_API_KEY_ENV:}

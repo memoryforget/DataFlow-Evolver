@@ -173,6 +173,7 @@ def test_cli_runtime_uses_configured_binary_provider_and_session_home(
         item == 'model_providers.openai-custom.base_url="https://codex-gateway.example/v1"'
         for item in args
     )
+    assert "model_providers.openai-custom.supports_websockets=false" in args
     assert any(item.startswith("mcp_servers.dataflow-operators.command=") for item in args)
     assert args[-1].startswith("developer guard\n\nwrite pipeline")
     assert captured["kwargs"]["env"]["CODEX_API_KEY"] == "generic-key"
@@ -180,6 +181,27 @@ def test_cli_runtime_uses_configured_binary_provider_and_session_home(
     assert captured["kwargs"]["env"]["CODEX_HOME"].endswith("sessions/codex")
     assert captured["kwargs"]["env"]["PATH"].split(runtime.os.pathsep)[0] == (
         "/opt/codex-0.118"
+    )
+
+
+def test_custom_base_url_uses_http_only_provider_when_name_is_omitted(monkeypatch):
+    monkeypatch.setenv("DF_AGENT_API_KEY", "generic-key")
+    cfg = Config(
+        {
+            "api_key_env": "DF_AGENT_API_KEY",
+            "base_url": "https://gateway.example/v1",
+            "codex": {},
+        }
+    )
+
+    overrides, env, provider = runtime._codex_provider_overrides(cfg)
+
+    assert provider == "dataflow-openai-compatible"
+    assert env["CODEX_API_KEY"] == "generic-key"
+    assert 'model_provider="dataflow-openai-compatible"' in overrides
+    assert (
+        "model_providers.dataflow-openai-compatible.supports_websockets=false"
+        in overrides
     )
 
 

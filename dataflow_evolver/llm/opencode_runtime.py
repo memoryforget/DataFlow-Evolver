@@ -54,7 +54,7 @@ def _model(agent_cfg: Config) -> str:
         or ""
     ).strip()
     if not raw:
-        raise ValueError("agent.opencode.model（或 agent.model）不能为空")
+        raise ValueError("agent.opencode.model 不能为空")
     provider = str(cfg.get("provider", "anthropic") or "anthropic").strip()
     return raw if "/" in raw else f"{provider}/{raw}"
 
