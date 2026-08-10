@@ -15,28 +15,35 @@ DataFlow Evolver 在用户提供的固定原始数据集上持续改进数据处
 ## 仓库结构
 
 ```text
-dataflow_evolver/                   框架源码
-configs/default.yaml
-data/                               本地数据集；Git 忽略
-model/                              本地模型；Git 忽略
-workspace/
-  dataflow/                         纳入版本管理的 DataFlow 源码副本
-  .claude/skills/dataflow-dev/      Claude 原生 DataFlow 开发 Skill
-  .agents/skills/dataflow-dev/      Codex 原生 DataFlow Skill 副本
-  .opencode/skills/dataflow-dev/    OpenCode 原生 DataFlow Skill 副本
-  cache/das/                        共享 embedding 缓存
-  runs/<run_name>/
-    manifest.json
-    iterations.jsonl
-    iteration_001/
-      pipeline.py
-      operators/
-      cache/
-      review.jsonl
-      sessions/claude|opencode|codex|pipeline/
+DataFlow-Evolver/
+├── dataflow_evolver/                  # 进化循环、Agent、Review 与运行时
+├── configs/
+│   └── default.yaml                   # 主配置文件
+├── data/                              # 本地数据集（Git 忽略）
+├── model/                             # 本地 embedding 模型（Git 忽略）
+├── docs/                              # 设计与工作流文档
+├── tests/                             # 单元测试与集成测试
+└── workspace/                         # Agent 工作区与实验制品
+    ├── dataflow/                      # 纳入版本管理的 DataFlow 源码副本
+    ├── .claude/skills/dataflow-dev/   # Claude 原生 DataFlow Skill
+    ├── .agents/skills/dataflow-dev/   # Codex 原生 DataFlow Skill
+    ├── .opencode/skills/dataflow-dev/ # OpenCode 原生 DataFlow Skill
+    ├── cache/das/                     # 共享 embedding 缓存
+    └── runs/<run_name>/               # 相互隔离的运行目录
 ```
 
-框架会以 `workspace/` 为工作目录启动 Claude、OpenCode 或 Codex。每个后端都在其原生项目 Skill 目录中使用一份完整副本。这三个目录有意保持相同文件，仅适配各自内部的发现根路径。原生后端状态以及每轮的 token 用量保存在对应迭代目录的 `sessions/<backend>/` 下。
+每次运行均为自包含结构：
+
+| 运行制品 | 用途 |
+| --- | --- |
+| `manifest.json` | 记录选中的 incumbent、最优数据集和完整运行摘要 |
+| `iterations.jsonl` | 按时间排列的精简进化历史 |
+| `iteration_NNN/pipeline.py` | 单轮迭代提出的 Pipeline |
+| `iteration_NNN/operators/` | 自动生成的自定义算子 |
+| `iteration_NNN/review.jsonl` | Review Agent 的结构化评审证据 |
+| `iteration_NNN/sessions/<backend>/` | 原生 Agent 状态和逐轮 token 用量 |
+
+框架会以 `workspace/` 为工作目录启动 Claude、OpenCode 或 Codex。每个后端都会从其原生发现路径获得一份完整的 DataFlow Skill；三份 Skill 有意保持相同指导内容，仅适配各后端的根路径。
 
 ## 安装
 
