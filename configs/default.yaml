@@ -94,6 +94,7 @@ loop:
 review:
   sample_size: ${DF_REVIEW_SAMPLE_SIZE:80}
   sample_seed: 42
+  correctness_threshold: 0.6
   schema_threshold: 0.6
   relevance_threshold: 0.6
   null_threshold: 0.5

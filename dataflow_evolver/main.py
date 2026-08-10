@@ -342,6 +342,7 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
             max_rate=float(decon_cfg.get("max_rate", decontamination.DEFAULT_MAX_RATE)),
             fields=list(decon_cfg.get("fields", []) or []) or None,
         ),
+        correctness_threshold=float(review_cfg.get("correctness_threshold", 0.6)),
         schema_threshold=float(review_cfg.get("schema_threshold", 0.6)),
         relevance_threshold=float(review_cfg.get("relevance_threshold", 0.6)),
         sample_size=int(review_cfg.get("sample_size", 80)),

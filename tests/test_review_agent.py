@@ -32,8 +32,14 @@ class StubServing(LLMServingABC):
         return out
 
 
-def _agent(weights=None, hard_metrics=True, seed=0):
-    return ReviewAgent(StubServing(["{}"]), weights=weights, hard_metrics=hard_metrics, seed=seed)
+def _agent(weights=None, hard_metrics=True, seed=0, **kwargs):
+    return ReviewAgent(
+        StubServing(["{}"]),
+        weights=weights,
+        hard_metrics=hard_metrics,
+        seed=seed,
+        **kwargs,
+    )
 
 
 def test_composite_uses_fixed_default_weights():
@@ -66,6 +72,21 @@ def test_clip_out_of_range_scores():
     r = agent.parse({"correctness_score": 5, "relevance_score": -3, "difficulty_score": 0.5,
                      "schema_score": 0.5})
     assert r.correctness_score == 1.0 and r.relevance_score == 0.0
+
+
+def test_passed_requires_configured_correctness_threshold():
+    raw = {
+        "correctness_score": 0.59,
+        "relevance_score": 1.0,
+        "difficulty_score": 1.0,
+        "schema_score": 1.0,
+    }
+    assert _agent().parse(raw).passed is False
+
+    raw["correctness_score"] = 0.6
+    assert _agent().parse(raw).passed is True
+
+    assert _agent(correctness_threshold=0.8).parse(raw).passed is False
 
 
 def test_hard_metric_penalty_math(tmp_path):

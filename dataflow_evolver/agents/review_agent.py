@@ -12,7 +12,8 @@ The four sample-level review dimensions are combined into one comparable score:
   同一道题配不同措辞 CoT 的情形（详见 ``_scan_hard_metrics``）；``contamination_rate``
   是与 benchmark 测试集的 n-gram 重合率，超阈值直接判 ``passed=False``（见 core/decontamination.py）。
 - 抽样从「取前 N 行」改为**随机蓄水池采样**（一趟遍历、O(k) 内存、全份等概率）。
-- ``passed`` 门槛保留（schema/relevance 阈值），用于剔除垃圾节点。
+- ``passed`` 同时要求 correctness / relevance / schema 达到各自阈值，用于剔除答案错误、
+  任务偏离或结构不合格的节点。
 - 可选 DatasetQualityEvaluator 固定采样候选集和高质量代理集，计算 DAS=-MMD，并复用
   候选 embedding 计算 Vendi Score 与近邻 cosine 分布。这些 dataset-level 原始值保持独立，
   不与 0-1 的 LLM 分数做无标定加权，但会随 ReviewResult 回传 PipelineAgent。
@@ -67,6 +68,7 @@ class ReviewAgent(AgentABC):
         serving,
         schema_threshold: float = 0.6,
         relevance_threshold: float = 0.6,
+        correctness_threshold: float = 0.6,
         sample_size: int = 80,
         max_retries: int = 2,
         weights: dict[str, float] | None = None,
@@ -83,6 +85,7 @@ class ReviewAgent(AgentABC):
         super().__init__(serving, max_retries=max_retries)
         self.schema_threshold = schema_threshold
         self.relevance_threshold = relevance_threshold
+        self.correctness_threshold = correctness_threshold
         # 关键字段空缺率的一票否决线。字段名整体对不上时空缺率≈1，取 0.5 能果断拦住，
         # 又不会因个别行缺字段就毙掉整个节点（那种情况仍按比例扣 review_score）。
         self.null_threshold = null_threshold
@@ -121,7 +124,8 @@ class ReviewAgent(AgentABC):
         correctness_score = _clip01(raw.get("correctness_score", 0.0))
         difficulty_score = _clip01(raw.get("difficulty_score", 0.0))
         passed = (
-            schema_score >= self.schema_threshold
+            correctness_score >= self.correctness_threshold
+            and schema_score >= self.schema_threshold
             and relevance_score >= self.relevance_threshold
         )
         # ANDES F1-F7 失败信号：只规整为合法编号并去重，**不并入 issues**。
