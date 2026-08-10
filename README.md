@@ -1,5 +1,7 @@
 # DataFlow Evolver
 
+[English](README.md) | [简体中文](README_zh.md)
+
 DataFlow Evolver improves a data-processing pipeline over a fixed, user-provided raw
 dataset. Every iteration follows one transparent feedback loop:
 
