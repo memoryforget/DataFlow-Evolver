@@ -14,11 +14,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from dataflow_evolver.llm.agent_credentials import backend_value, resolve_agent_endpoint
+from dataflow_evolver.llm.agent_credentials import (
+    backend_config,
+    backend_value,
+    resolve_agent_endpoint,
+)
 from dataflow_evolver.llm.session_state import (
     finalize_agent_session,
     prepare_agent_session_store,
 )
+from dataflow_evolver.llm.skill_paths import skill_root_for_backend
 from dataflow_evolver.utils.config import Config
 from dataflow_evolver.utils.logging import get_logger
 
@@ -45,16 +50,17 @@ _TRANSIENT_MARKERS = (
     "502", "503", "504", "internal server error", "bad gateway",
     "service unavailable", "gateway timeout", "timed out", "timeout",
     "connection reset", "connection error", "connection refused", "econnreset",
+    "stream disconnected", "upstream request failed",
 )
 
-_DEFAULT_SYSTEM_PROMPT_APPEND = (
+_SYSTEM_PROMPT_APPEND_TEMPLATE = (
     "You write DataFlow pipelines with custom operators that process the fixed raw corpus.\n"
     "Do not fetch or download external datasets. Network calls are allowed only for the configured LLM serving API.\n\n"
 
     "## CRITICAL: Read API Reference FIRST\n"
     "Before writing ANY code, you MUST read:\n"
-    "1. `.claude/skills/dataflow-dev/templates/operator_api_reference.md` - Complete operator example with correct APIs\n"
-    "2. `.claude/skills/dataflow-dev/diagnostics/known_issues.md` - Common API errors and fixes\n\n"
+    "1. `{skill_root}/templates/operator_api_reference.md` - Complete operator example with correct APIs\n"
+    "2. `{skill_root}/diagnostics/known_issues.md` - Common API errors and fixes\n\n"
 
     "Key facts you'll learn:\n"
     "- FileStorage.write() takes ONLY ONE argument: `storage.write(df)`\n"
@@ -130,7 +136,7 @@ _DEFAULT_SYSTEM_PROMPT_APPEND = (
 
     "## Error Fixing Strategy\n"
     "If compile/execution fails:\n"
-    "1. Read `.claude/skills/dataflow-dev/diagnostics/known_issues.md`\n"
+    "1. Read `{skill_root}/diagnostics/known_issues.md`\n"
     "2. Match error message to Issue #001-#011\n"
     "3. Apply the exact fix from the Issue\n"
     "4. If not in known_issues, check DataFlow source code:\n"
@@ -147,6 +153,13 @@ _DEFAULT_SYSTEM_PROMPT_APPEND = (
     "- Strip <think> tags for non-CoT target fields\n"
     "- If compile/import fails, Read source to debug — fix in place.\n"
 )
+
+
+def default_system_prompt_append(backend: str) -> str:
+    """Render shared PipelineAgent guidance with the backend's native skill root."""
+    return _SYSTEM_PROMPT_APPEND_TEMPLATE.replace(
+        "{skill_root}", skill_root_for_backend(backend)
+    )
 
 
 
@@ -198,7 +211,7 @@ def _record_tool_uses(iteration_dir: str | Path, uses: list[dict[str, Any]], pha
         logger.warning("写 Agent 工具日志失败（%s）：%s", path, exc)
 
 
-def _agent_env(agent_cfg: Config) -> dict[str, str]:
+def _agent_env(agent_cfg: Config, backend: str = "") -> dict[str, str]:
     """给 Agent 子进程叠加环境变量，并与框架执行器使用同一 Python 环境。
 
     Agent 只写产物、不自行执行流水线；统一 PATH 仍保证其读取依赖元数据或运行普通开发工具时
@@ -212,6 +225,11 @@ def _agent_env(agent_cfg: Config) -> dict[str, str]:
     extra = agent_cfg.get("env", {})
     extra = extra.to_dict() if isinstance(extra, Config) else (extra or {})
     env.update({str(k): str(v) for k, v in extra.items()})
+    if backend:
+        backend_extra = backend_config(agent_cfg, backend).get("env", {}) or {}
+        if isinstance(backend_extra, Config):
+            backend_extra = backend_extra.to_dict()
+        env.update({str(k): str(v) for k, v in backend_extra.items()})
     return env
 
 
@@ -244,12 +262,15 @@ def _build_options(
 
     mcp_servers: dict[str, Any] = {"dataflow-operators": operator_mcp_server}
 
-    append_text = agent_cfg.get("system_prompt_append", _DEFAULT_SYSTEM_PROMPT_APPEND)
+    append_text = agent_cfg.get(
+        "system_prompt_append", default_system_prompt_append("claude")
+    )
     model = backend_value(agent_cfg, "claude", "model", default="claude-opus-4-8")
     effort = backend_value(agent_cfg, "claude", "effort", default="max") or None
     thinking_mode = (agent_cfg.get("thinking", "adaptive") or "adaptive").lower()
     thinking = {"type": "adaptive"} if thinking_mode == "adaptive" else None
-    env = _agent_env(agent_cfg)
+    claude_cfg = backend_config(agent_cfg, "claude")
+    env = _agent_env(agent_cfg, "claude")
     endpoint = resolve_agent_endpoint(agent_cfg, "claude")
     if endpoint.api_key:
         env["ANTHROPIC_API_KEY"] = endpoint.api_key
@@ -262,7 +283,7 @@ def _build_options(
         model=model,
         tools={"type": "preset", "preset": "claude_code"},
         system_prompt={"type": "preset", "preset": "claude_code", "append": append_text},
-        permission_mode=agent_cfg.get("permission_mode", "bypassPermissions"),
+        permission_mode=claude_cfg.get("permission_mode", "bypassPermissions"),
         setting_sources=list(agent_cfg.get("setting_sources", ["project"])),
         skills="all",
         max_turns=agent_cfg.get("max_turns", 50),

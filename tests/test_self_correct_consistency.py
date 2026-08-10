@@ -9,11 +9,14 @@ def test_exec_repair_prompt_syncs_decision():
         "/workspace/runs/run/iteration_004",
         "Traceback: boom",
         failure_stage="compile",
+        skill_root=".agents/skills/dataflow-dev",
     )
     assert "/workspace/runs/run/iteration_004/decision.json" in prompt
     assert "ops` / `field_flow` / `reason" in prompt
     assert "失败阶段：`compile`" in prompt
     assert "不要自行执行" in prompt
+    assert ".agents/skills/dataflow-dev/diagnostics/known_issues.md" in prompt
+    assert ".claude/skills/dataflow-dev" not in prompt
 
 
 def test_stale_decision_warns_after_execution_repair(tmp_path, monkeypatch, caplog):

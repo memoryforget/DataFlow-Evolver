@@ -13,6 +13,14 @@ export DF_AGENT_BASE_URL="${DF_AGENT_BASE_URL:-http://123.129.219.111:3000/v1}"
 export CODEX_BIN="${CODEX_BIN:-codex}"
 export PYTHONUNBUFFERED=1
 
+if [[ -n "${NODE_BIN:-}" ]]; then
+  NODE_DIR="$(cd "$(dirname "${NODE_BIN}")" && pwd)"
+  export PATH="${NODE_DIR}:${PATH}"
+elif [[ "${CODEX_BIN}" == */* ]]; then
+  CODEX_DIR="$(cd "$(dirname "${CODEX_BIN}")" && pwd)"
+  export PATH="${CODEX_DIR}:${PATH}"
+fi
+
 CODEX_VERSION="$("${CODEX_BIN}" --version 2>/dev/null || true)"
 if [[ "${CODEX_VERSION}" != "codex-cli 0.118.0" ]]; then
   echo "Expected Codex CLI 0.118.0, got: ${CODEX_VERSION:-not found}" >&2

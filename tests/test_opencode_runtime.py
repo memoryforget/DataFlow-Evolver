@@ -64,14 +64,29 @@ def test_inline_config_exposes_only_pipeline_tools(monkeypatch, tmp_path):
     assert set(config["mcp"]) == {"dataflow-operators"}
     assert config["mcp"]["dataflow-operators"]["timeout"] == 30000
     assert config["mcp"]["dataflow-operators"]["environment"]["DF_WORKSPACE"] == str(tmp_path)
-    permissions = config["agent"][agent_name]["permission"]
-    assert permissions["webfetch"] == "deny"
-    assert permissions["websearch"] == "deny"
-    assert permissions["skill"]["dataflow-dev"] == "allow"
-    assert permissions["dataflow-operators_*"] == "allow"
+    assert config["agent"][agent_name]["permission"] == "allow"
+    prompt = config["agent"][agent_name]["prompt"]
+    assert ".opencode/skills/dataflow-dev/templates/operator_api_reference.md" in prompt
+    assert ".claude/skills/dataflow-dev" not in prompt
     serialized = json.dumps(config)
     assert "secret-must-not-be-serialized" not in serialized
     assert "{env:ANTHROPIC_API_KEY}" in serialized
+
+
+def test_invalid_permission_mode_is_rejected(tmp_path):
+    cfg = _cfg(
+        opencode={
+            "provider": "anthropic",
+            "model": "claude-opus-4-8",
+            "permission": "bypassPermissions",
+        }
+    )
+    try:
+        build_opencode_config(cfg, cwd=str(tmp_path))
+    except ValueError as exc:
+        assert "allow, ask, or deny" in str(exc)
+    else:
+        raise AssertionError("invalid OpenCode permission must be rejected")
 
 
 def test_provider_prefix_and_non_anthropic_base_url(monkeypatch, tmp_path):

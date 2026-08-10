@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataflow_evolver.core.input_corpus import InputCorpus
 from dataflow_evolver.core.schemas import ReviewResult, TaskSpec
+from dataflow_evolver.llm.skill_paths import skill_root_for_backend
 
 
 PIPELINE_PROMPT = """为下述目标编写一条完整、可直接运行的 DataFlow 流水线（含自定义算子）。
@@ -46,7 +47,7 @@ PIPELINE_SELFCORRECT_PROMPT = """流水线 `{iteration_dir}/pipeline.py` 未通�
 失败阶段：`{failure_stage}`。
 
 请先读取
-`.claude/skills/dataflow-dev/diagnostics/known_issues.md`，再对照 DataFlow 源码定位并修复。
+`{skill_root}/diagnostics/known_issues.md`，再对照 DataFlow 源码定位并修复。
 
 可查阅：
 - `dataflow/utils/storage.py`
@@ -164,12 +165,14 @@ def build_selfcorrect_prompt(
     traceback: str,
     diagnostics: str = "not available",
     failure_stage: str = "execution",
+    skill_root: str | None = None,
 ) -> str:
     return PIPELINE_SELFCORRECT_PROMPT.format(
         iteration_dir=iteration_dir,
         failure_stage=failure_stage,
         traceback=traceback,
         diagnostics=diagnostics,
+        skill_root=skill_root or skill_root_for_backend("claude"),
         decision_sync_note=DECISION_SYNC_NOTE.format(iteration_dir=iteration_dir),
     )
 

@@ -18,6 +18,8 @@ workspace/*
 !workspace/.claude/**
 !workspace/.agents/
 !workspace/.agents/**
+!workspace/.opencode/
+!workspace/.opencode/**
 !workspace/dataflow/
 !workspace/dataflow/**
 workspace/dataflow/**/__pycache__/

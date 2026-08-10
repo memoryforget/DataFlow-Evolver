@@ -27,6 +27,7 @@ from dataflow_evolver.engine.execution_wrapper import (
     SubprocessExecutionWrapper,
 )
 from dataflow_evolver.llm.serving import build_serving
+from dataflow_evolver.llm.skill_paths import skill_root_for_backend
 from dataflow_evolver.utils.config import Config, load_config
 from dataflow_evolver.utils.logging import get_logger, setup_logging
 
@@ -306,14 +307,11 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
     workspace = Path(project.workspace_dir).resolve()
     if not (workspace / "dataflow").is_dir():
         raise FileNotFoundError(f"project.workspace_dir 缺少 vendored dataflow：{workspace}")
-    if not (workspace / ".claude/skills/dataflow-dev/SKILL.md").is_file():
-        raise FileNotFoundError(f"project.workspace_dir 缺少 dataflow-dev skill：{workspace}")
     backend = str(cfg.agent.get("backend", "claude") or "claude").strip().lower()
-    if backend == "codex" and not (
-        workspace / ".agents/skills/dataflow-dev/SKILL.md"
-    ).is_file():
+    skill_root = skill_root_for_backend(backend)
+    if not (workspace / skill_root / "SKILL.md").is_file():
         raise FileNotFoundError(
-            f"Codex backend requires .agents/skills/dataflow-dev/SKILL.md: {workspace}"
+            f"{backend} backend requires {skill_root}/SKILL.md: {workspace}"
         )
 
     corpus = input_corpus.discover(

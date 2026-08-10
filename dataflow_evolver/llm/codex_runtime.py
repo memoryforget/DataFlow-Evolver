@@ -17,12 +17,12 @@ from dataflow_evolver.llm.agent_credentials import (
 )
 from dataflow_evolver.llm.agent_sdk import (
     AgentRunResult,
-    _DEFAULT_SYSTEM_PROMPT_APPEND,
     _RESUME_NUDGE,
     _agent_env,
     _is_retryable,
     _record_tool_uses,
     _truncate_arg,
+    default_system_prompt_append,
 )
 from dataflow_evolver.llm.session_state import (
     finalize_agent_session,
@@ -138,7 +138,7 @@ def _codex_provider_overrides(
     cfg = backend_config(agent_cfg, "codex")
     endpoint = resolve_agent_endpoint(agent_cfg, "codex", provider="openai")
     env = os.environ.copy()
-    env.update(_agent_env(agent_cfg))
+    env.update(_agent_env(agent_cfg, "codex"))
     if endpoint.api_key:
         env["CODEX_API_KEY"] = endpoint.api_key
         env["OPENAI_API_KEY"] = endpoint.api_key
@@ -232,7 +232,7 @@ def result_from_codex_cli(
     if timed_out:
         error = errors[-1] if errors else "Codex CLI run timed out"
         error_type = "Timeout"
-    elif exit_code != 0 or not completed:
+    elif errors or exit_code != 0 or not completed:
         error = errors[-1] if errors else stderr.strip() or "Codex CLI did not complete the turn"
         error_type = "CodexCLIError"
     else:
@@ -277,19 +277,21 @@ def _run_once_cli(
     session_env: dict[str, str] | None,
 ) -> AgentRunResult:
     cfg = backend_config(agent_cfg, "codex")
+    bypass_sandbox = cfg.get("bypass_sandbox", False) is True
     overrides, env, _ = _codex_provider_overrides(agent_cfg)
     if session_env:
         env.update(session_env)
     timeout_ms = int(cfg.get("mcp_timeout_ms", 30000) or 30000)
     overrides.extend(_codex_mcp_overrides(cwd, timeout_ms))
-    overrides.extend(
-        [
-            'approval_policy="never"',
-            'sandbox_mode="workspace-write"',
-            'web_search="disabled"',
-            'sandbox_workspace_write.network_access=false',
-        ]
-    )
+    overrides.append('web_search="disabled"')
+    if not bypass_sandbox:
+        overrides.extend(
+            [
+                'approval_policy="never"',
+                'sandbox_mode="workspace-write"',
+                'sandbox_workspace_write.network_access=false',
+            ]
+        )
 
     binary = str(cfg.get("binary", "") or "codex").strip() or "codex"
     binary_path = Path(binary).expanduser()
@@ -297,15 +299,20 @@ def _run_once_cli(
         env["PATH"] = str(binary_path.parent) + os.pathsep + env.get("PATH", "")
     model = str(backend_value(agent_cfg, "codex", "model", default="gpt-5.4"))
     effort = str(backend_value(agent_cfg, "codex", "effort", default="high") or "high")
+    execution_flag = (
+        "--dangerously-bypass-approvals-and-sandbox"
+        if bypass_sandbox
+        else "--full-auto"
+    )
     args = [binary, "exec"]
     if resume:
-        args.extend(["resume", "--json", "--skip-git-repo-check", "--full-auto"])
+        args.extend(["resume", "--json", "--skip-git-repo-check", execution_flag])
     else:
         args.extend(
             [
                 "--json",
                 "--skip-git-repo-check",
-                "--full-auto",
+                execution_flag,
                 "--cd",
                 cwd,
             ]
@@ -317,7 +324,9 @@ def _run_once_cli(
         args.append(resume)
     else:
         developer = str(
-            agent_cfg.get("system_prompt_append", _DEFAULT_SYSTEM_PROMPT_APPEND)
+            agent_cfg.get(
+                "system_prompt_append", default_system_prompt_append("codex")
+            )
         ).strip()
         if developer:
             prompt = f"{developer}\n\n{prompt}"

@@ -10,6 +10,23 @@ def test_tool_arguments_are_truncated():
     assert len(value["content"]) < 700
 
 
+def test_claude_permission_and_root_acknowledgement_are_backend_scoped(tmp_path):
+    options = sdk._build_options(
+        Config(
+            {
+                "claude": {
+                    "permission_mode": "bypassPermissions",
+                    "env": {"IS_SANDBOX": "1"},
+                }
+            }
+        ),
+        str(tmp_path),
+    )
+
+    assert options.permission_mode == "bypassPermissions"
+    assert options.env["IS_SANDBOX"] == "1"
+
+
 def test_high_demand_is_retryable():
     result = AgentRunResult(
         False,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataflow_evolver.llm.codex_runtime as runtime
 from dataflow_evolver.llm.agent_runtime import build_agent_runtime
-from dataflow_evolver.llm.agent_sdk import AgentRunResult
+from dataflow_evolver.llm.agent_sdk import AgentRunResult, _is_retryable
 from dataflow_evolver.llm.codex_runtime import (
     CodexAgentRuntime,
     normalize_codex_usage,
@@ -86,6 +86,28 @@ def test_cli_jsonl_converts_text_tools_session_and_usage():
     }
 
 
+def test_cli_error_event_is_preserved_when_turn_also_completes():
+    stdout = "\n".join(
+        [
+            '{"type":"thread.started","thread_id":"thread-cli"}',
+            (
+                '{"type":"error","error":{"message":'
+                '"bwrap: No permissions to create a new namespace"}}'
+            ),
+            (
+                '{"type":"turn.completed","usage":'
+                '{"input_tokens":12,"output_tokens":3}}'
+            ),
+        ]
+    )
+
+    result = result_from_codex_cli(stdout, "", exit_code=0)
+
+    assert not result.success
+    assert result.error_type == "CodexCLIError"
+    assert "bwrap" in result.error
+
+
 def test_cli_runtime_uses_configured_binary_provider_and_session_home(
     monkeypatch, tmp_path
 ):
@@ -161,6 +183,55 @@ def test_cli_runtime_uses_configured_binary_provider_and_session_home(
     )
 
 
+def test_cli_runtime_bypass_sandbox_requires_explicit_opt_in(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, args, **kwargs):
+            captured["args"] = args
+
+        def communicate(self, timeout=None):
+            return (
+                "\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"thread-cli"}',
+                        '{"type":"turn.completed","usage":{"input_tokens":1}}',
+                    ]
+                ),
+                "",
+            )
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", FakeProcess)
+    cfg = Config(
+        {
+            "codex": {
+                "model": "gpt-5.4",
+                "effort": "xhigh",
+                "bypass_sandbox": True,
+            }
+        }
+    )
+
+    result = runtime._run_once(
+        "write pipeline",
+        cwd=str(tmp_path),
+        agent_cfg=cfg,
+        resume=None,
+        timeout=30,
+    )
+
+    assert result.success
+    args = captured["args"]
+    assert "--dangerously-bypass-approvals-and-sandbox" in args
+    assert "--full-auto" not in args
+    assert 'sandbox_mode="workspace-write"' not in args
+    assert 'sandbox_workspace_write.network_access=false' not in args
+    assert ".agents/skills/dataflow-dev/templates/operator_api_reference.md" in args[-1]
+    assert ".claude/skills/dataflow-dev" not in args[-1]
+
+
 def test_retry_resumes_codex_thread(monkeypatch, tmp_path):
     calls = []
     results = [
@@ -188,3 +259,16 @@ def test_retry_resumes_codex_thread(monkeypatch, tmp_path):
     assert calls[0] == ("original", None)
     assert calls[1][1] == "thread-retry"
     assert calls[1][0] != "original"
+
+
+def test_upstream_stream_disconnect_is_retryable():
+    result = AgentRunResult(
+        False,
+        error=(
+            "Reconnecting... 1/5 (stream disconnected before completion: "
+            "Upstream request failed)"
+        ),
+        error_type="CodexCLIError",
+    )
+
+    assert _is_retryable(result)

@@ -9,18 +9,15 @@ import time
 from pathlib import Path
 from typing import Any
 
-from dataflow_evolver.llm.agent_credentials import (
-    backend_value,
-    resolve_agent_endpoint,
-)
+from dataflow_evolver.llm.agent_credentials import backend_value, resolve_agent_endpoint
 from dataflow_evolver.llm.agent_sdk import (
     AgentRunResult,
-    _DEFAULT_SYSTEM_PROMPT_APPEND,
     _RESUME_NUDGE,
     _agent_env,
     _is_retryable,
     _record_tool_uses,
     _truncate_arg,
+    default_system_prompt_append,
 )
 from dataflow_evolver.llm.session_state import (
     finalize_agent_session,
@@ -72,28 +69,6 @@ def _operator_mcp(cwd: str, timeout_ms: int) -> dict[str, Any]:
     }
 
 
-def _permissions() -> dict[str, Any]:
-    """Allow implementation tools while denying network data acquisition."""
-    return {
-        "*": "deny",
-        "read": "allow",
-        "edit": "allow",
-        "glob": "allow",
-        "grep": "allow",
-        "list": "allow",
-        "bash": "allow",
-        "lsp": "allow",
-        "todowrite": "allow",
-        "external_directory": "allow",
-        "question": "deny",
-        "task": "deny",
-        "webfetch": "deny",
-        "websearch": "deny",
-        "skill": {"*": "deny", "dataflow-dev": "allow"},
-        "dataflow-operators_*": "allow",
-    }
-
-
 def build_opencode_config(
     agent_cfg: Config,
     *,
@@ -106,6 +81,9 @@ def build_opencode_config(
     provider = model.split("/", 1)[0]
     agent_name = "dataflow-pipeline"
     timeout_ms = int(cfg.get("mcp_timeout_ms", 30000) or 30000)
+    permission = str(cfg.get("permission", "allow") or "allow").lower()
+    if permission not in {"allow", "ask", "deny"}:
+        raise ValueError("agent.opencode.permission must be allow, ask, or deny")
 
     endpoint = resolve_agent_endpoint(agent_cfg, "opencode", provider=provider)
     key_env = endpoint.api_key_env
@@ -118,7 +96,9 @@ def build_opencode_config(
 
     selected_prompt = str(
         system_prompt
-        or agent_cfg.get("system_prompt_append", _DEFAULT_SYSTEM_PROMPT_APPEND)
+        or agent_cfg.get(
+            "system_prompt_append", default_system_prompt_append("opencode")
+        )
     )
     config: dict[str, Any] = {
         "$schema": _CONFIG_SCHEMA,
@@ -129,7 +109,7 @@ def build_opencode_config(
                 "model": model,
                 "prompt": selected_prompt,
                 "steps": int(cfg.get("max_steps", agent_cfg.get("max_turns", 50)) or 50),
-                "permission": _permissions(),
+                "permission": permission,
             }
         },
         "mcp": {"dataflow-operators": _operator_mcp(cwd, timeout_ms)},
@@ -228,7 +208,7 @@ def _run_once(
         command.extend(["--session", resume])
 
     env = os.environ.copy()
-    env.update(_agent_env(agent_cfg))
+    env.update(_agent_env(agent_cfg, "opencode"))
     if session_env:
         env.update(session_env)
     pythonpath = env.get("PYTHONPATH", "")

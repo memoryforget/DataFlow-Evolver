@@ -15,6 +15,10 @@ def test_config_loads_and_expands():
     assert int(cfg.loop.max_iterations) == 4
     assert cfg.agent.backend == "claude"
     assert cfg.agent.setting_sources == ["project"]
+    assert cfg.agent.claude.permission_mode == "bypassPermissions"
+    assert cfg.agent.claude.env.IS_SANDBOX == "1"
+    assert cfg.agent.opencode.permission == "allow"
+    assert cfg.agent.codex.bypass_sandbox is True
     # env default expansion
     assert cfg.llm.api.model_name == "gpt-5.5"
     assert int(cfg.llm.api.max_workers) == 10

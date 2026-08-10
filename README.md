@@ -23,8 +23,9 @@ data/                               local datasets; ignored by Git
 model/                              local models; ignored by Git
 workspace/
   dataflow/                         tracked vendored DataFlow source
-  .claude/skills/dataflow-dev/      canonical Claude/OpenCode coding skill
+  .claude/skills/dataflow-dev/      Claude-native DataFlow coding skill
   .agents/skills/dataflow-dev/      Codex-native copy of the DataFlow skill
+  .opencode/skills/dataflow-dev/    OpenCode-native copy of the DataFlow skill
   cache/das/                        shared embedding cache
   runs/<run_name>/
     manifest.json
@@ -38,9 +39,9 @@ workspace/
 ```
 
 The framework starts Claude, OpenCode, or Codex with `workspace/` as the working
-directory. Claude and OpenCode use the skill under `.claude/skills/`; Codex uses a full
-copy under its native `.agents/skills/` location. The two directories intentionally carry
-the same files, with only their internal discovery-root paths adapted. Native backend
+directory. Each backend uses a full copy under its native project skill location. The
+three directories intentionally carry the same files, with only their internal
+discovery-root paths adapted. Native backend
 state and per-turn token usage are stored under each iteration's `sessions/<backend>/`.
 
 ## Install

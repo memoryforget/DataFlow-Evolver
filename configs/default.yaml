@@ -41,7 +41,6 @@ agent:
   effort: ${DF_AGENT_EFFORT:}
   api_key_env: ${DF_AGENT_API_KEY_ENV:DF_AGENT_API_KEY}
   base_url: ${DF_AGENT_BASE_URL:}
-  permission_mode: bypassPermissions
   setting_sources: [project]
   max_turns: 50
   pipeline_filename: pipeline.py
@@ -54,6 +53,10 @@ agent:
     effort: ${CLAUDE_AGENT_EFFORT:}
     api_key_env: ${CLAUDE_AGENT_API_KEY_ENV:}
     base_url: ${CLAUDE_AGENT_BASE_URL:}
+    permission_mode: bypassPermissions
+    env:
+      # Claude Code requires this acknowledgement when bypassPermissions runs as root.
+      IS_SANDBOX: ${IS_SANDBOX:1}
   opencode:
     binary: ${OPENCODE_BIN:opencode}
     # Empty model means agent.model, then the runtime default. Provider selects
@@ -65,6 +68,8 @@ agent:
     variant: ${OPENCODE_VARIANT:}
     max_steps: ${OPENCODE_MAX_STEPS:50}
     mcp_timeout_ms: ${OPENCODE_MCP_TIMEOUT_MS:30000}
+    # OpenCode-native permission value: allow | ask | deny.
+    permission: allow
   codex:
     # Codex uses the local `codex exec --json` CLI.
     binary: ${CODEX_BIN:codex}
@@ -74,6 +79,8 @@ agent:
     api_key_env: ${CODEX_API_KEY_ENV:}
     base_url: ${CODEX_BASE_URL:}
     mcp_timeout_ms: ${CODEX_MCP_TIMEOUT_MS:30000}
+    # PipelineAgent is expected to execute and inspect generated pipelines on the host.
+    bypass_sandbox: true
 
 loop:
   # Total number of linear Pipeline -> Review iterations.
