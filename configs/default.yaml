@@ -2,8 +2,7 @@
 project:
   workspace_dir: ${DF_WORKSPACE:./workspace}
   # Required. The loop refuses to fall back to from-scratch synthesis.
-  input_dir: ${RAW_DATA_DIR:}
-  input_entry: ${RAW_DATA_ENTRY:}
+  input_path: ${RAW_DATA_PATH:}
   # Use a fresh name for every run; existing non-empty run directories are rejected.
   run_name: ${DF_RUN_NAME:run}
 

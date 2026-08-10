@@ -314,10 +314,7 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
             f"{backend} backend requires {skill_root}/SKILL.md: {workspace}"
         )
 
-    corpus = input_corpus.discover(
-        project.get("input_dir", "") or "",
-        entry_name=str(project.get("input_entry", "") or ""),
-    )
+    corpus = input_corpus.discover(project.get("input_path", "") or "")
 
     task_cfg = cfg.task
     target_schema = _plain_dict(task_cfg.get("target_schema"))

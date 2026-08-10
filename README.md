@@ -65,8 +65,7 @@ The main configuration is `configs/default.yaml`. At minimum, provide the raw da
 review API, unique run name, and task description:
 
 ```bash
-export RAW_DATA_DIR=/path/to/raw-data
-export RAW_DATA_ENTRY=train.jsonl       # optional if discovery is unambiguous
+export RAW_DATA_PATH=/path/to/raw-data/train.jsonl
 export DF_API_URL=https://api.example/v1/chat/completions
 export DF_API_KEY=...
 export DF_API_MAX_WORKERS=10

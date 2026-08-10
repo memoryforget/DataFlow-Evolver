@@ -2,8 +2,7 @@
 # Secrets remain environment-only. Use this file explicitly with --config.
 project:
   workspace_dir: ${DF_WORKSPACE:./workspace}
-  input_dir: ${RAW_DATA_DIR:/vepfs-mlp2/c20250602/500050/lh/xqf/DataFlow-Evolver/input/gsm8k_5k_seed42}
-  input_entry: ${RAW_DATA_ENTRY:gsm8k_train_5k_seed42.jsonl}
+  input_path: ${RAW_DATA_PATH:/vepfs-mlp2/c20250602/500050/lh/xqf/DataFlow-Evolver/input/gsm8k_5k_seed42/gsm8k_train_5k_seed42.jsonl}
   run_name: ${DF_RUN_NAME:gsm8k_5k_seed42_df_gpt54_codex_cli_r3}
 
 task:
