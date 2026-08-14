@@ -15,6 +15,13 @@ from typing import Any
 from dataflow_evolver.agents.pipeline_agent import PipelineAgent
 from dataflow_evolver.agents.review_agent import ReviewAgent
 from dataflow_evolver.core import decontamination, input_corpus
+from dataflow_evolver.core.downstream_eval import (
+    CommandDownstreamEvaluator,
+    DownstreamEvaluationRequest,
+    DownstreamEvaluationResult,
+    DownstreamEvaluatorABC,
+    result_to_dict,
+)
 from dataflow_evolver.core.dataset_quality import (
     DatasetQualityEvaluator,
     OpenAIChatEmbeddingBackend,
@@ -69,6 +76,8 @@ class ReviewOnlyLoop:
         run_name: str,
         max_iterations: int,
         execution_repairs: int = 1,
+        downstream_evaluator: DownstreamEvaluatorABC | None = None,
+        downstream_interval: int = 3,
     ) -> None:
         if max_iterations < 1:
             raise ValueError("loop.max_iterations 必须至少为 1（包含初始流水线）")
@@ -80,8 +89,16 @@ class ReviewOnlyLoop:
         self.run_name = _safe_run_name(run_name)
         self.max_iterations = max_iterations
         self.execution_repairs = max(0, execution_repairs)
+        if downstream_evaluator is not None and downstream_interval < 1:
+            raise ValueError("downstream_eval.interval must be at least 1")
+        self.downstream_evaluator = downstream_evaluator
+        self.downstream_interval = int(downstream_interval)
         self.candidates: list[Candidate] = []
+        self.downstream_evaluations: list[DownstreamEvaluationResult] = []
+        self.latest_downstream_evaluation: DownstreamEvaluationResult | None = None
         self.data_preparation_wall_time_seconds = 0.0
+        self.downstream_evaluation_wall_time_seconds = 0.0
+        self.total_wall_time_seconds = 0.0
 
     @property
     def run_dir(self) -> Path:
@@ -138,6 +155,14 @@ class ReviewOnlyLoop:
             self.candidates.append(candidate)
             self._append_trace(candidate)
 
+            if (
+                self.downstream_evaluator is not None
+                and (iteration + 1) % self.downstream_interval == 0
+                and incumbent is not None
+                and incumbent.dataset_path
+            ):
+                self._run_downstream_checkpoint(iteration + 1, incumbent)
+
             if iteration + 1 >= self.max_iterations:
                 break
             if incumbent is None or incumbent.review is None:
@@ -152,6 +177,7 @@ class ReviewOnlyLoop:
                 parent_code=incumbent.config.code,
                 parent_rationale=incumbent.config.rationale,
                 parent_review=incumbent.review,
+                downstream_feedback=self.latest_downstream_evaluation,
                 evolution_history=self._evolution_history(),
             )
             if config is None:
@@ -159,8 +185,17 @@ class ReviewOnlyLoop:
                 break
 
         best = incumbent or select_best(self.candidates)
+        self.total_wall_time_seconds = round(time.perf_counter() - run_started, 6)
+        self.downstream_evaluation_wall_time_seconds = round(
+            sum(result.wall_time_seconds for result in self.downstream_evaluations), 6
+        )
         self.data_preparation_wall_time_seconds = round(
-            time.perf_counter() - run_started, 6
+            max(
+                0.0,
+                self.total_wall_time_seconds
+                - self.downstream_evaluation_wall_time_seconds,
+            ),
+            6,
         )
         if best is not None:
             self._write_manifest(best)
@@ -236,6 +271,60 @@ class ReviewOnlyLoop:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
+    def _run_downstream_checkpoint(
+        self,
+        checkpoint_iteration: int,
+        incumbent: Candidate,
+    ) -> None:
+        """Evaluate the current incumbent after a configured number of static rounds."""
+        assert self.downstream_evaluator is not None
+        assert incumbent.dataset_path is not None
+        checkpoint_dir = (
+            self.run_dir / "downstream_eval" / f"checkpoint_{checkpoint_iteration:03d}"
+        )
+        request = DownstreamEvaluationRequest(
+            checkpoint_iteration=checkpoint_iteration,
+            incumbent_iteration=incumbent.iteration + 1,
+            dataset_path=str(Path(incumbent.dataset_path).resolve()),
+            pipeline_path=str((incumbent.iteration_dir / "pipeline.py").resolve()),
+            task=self.task,
+            expected_benchmarks=list(self.downstream_evaluator.expected_benchmarks),
+            bad_cases_per_benchmark=self.downstream_evaluator.bad_cases_per_benchmark,
+        )
+        logger.info(
+            "触发下游 SFT/评测检查点：完成轮次=%d incumbent=%s dataset=%s",
+            checkpoint_iteration,
+            incumbent.iteration_dir.name,
+            incumbent.dataset_path,
+        )
+        result = self.downstream_evaluator.run(request, checkpoint_dir)
+        if result.succeeded:
+            previous = next(
+                (item for item in reversed(self.downstream_evaluations) if item.succeeded),
+                None,
+            )
+            if previous is not None:
+                result.score_deltas = {
+                    name: benchmark.score - previous.benchmarks[name].score
+                    for name, benchmark in result.benchmarks.items()
+                    if name in previous.benchmarks
+                }
+        self.downstream_evaluations.append(result)
+        self.latest_downstream_evaluation = result
+        trace_path = self.run_dir / "downstream_evaluations.jsonl"
+        with trace_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(result_to_dict(result), ensure_ascii=False, default=str) + "\n"
+            )
+        if result.succeeded:
+            scores = ", ".join(
+                f"{name}={item.score:.6f}"
+                for name, item in result.benchmarks.items()
+            )
+            logger.info("下游 SFT/评测完成：%s", scores)
+        else:
+            logger.error("下游 SFT/评测失败；保留静态 incumbent 并继续：%s", result.error)
+
     def _evolution_history(self) -> list[dict[str, Any]]:
         """Return compact decisions, not prior pipeline code or full reviews."""
         history: list[dict[str, Any]] = []
@@ -270,11 +359,26 @@ class ReviewOnlyLoop:
             "completed_iterations": len(self.candidates),
             "total_execution_repairs": sum(c.execution_repairs for c in self.candidates),
             "data_preparation_wall_time_seconds": self.data_preparation_wall_time_seconds,
+            "downstream_evaluation_wall_time_seconds": (
+                self.downstream_evaluation_wall_time_seconds
+            ),
+            "total_wall_time_seconds": self.total_wall_time_seconds,
             "selection_rule": "best-so-far incumbent: passed first, then highest review_score",
+            "downstream_evaluation": {
+                "enabled": self.downstream_evaluator is not None,
+                "interval": self.downstream_interval,
+                "completed_checkpoints": len(self.downstream_evaluations),
+                "evaluations": [
+                    result_to_dict(result) for result in self.downstream_evaluations
+                ],
+            },
             "best": _candidate_record(best),
             "evolution_history": self._evolution_history(),
             "all_candidates": [_candidate_record(c) for c in self.candidates],
-            "manual_next_step": "Use best.dataset_path for downstream training/evaluation outside this loop.",
+            "manual_next_step": (
+                "Use best.dataset_path for final downstream training/evaluation. "
+                "Periodic checkpoints are optimization feedback, not the final report."
+            ),
         }
         path = self.run_dir / "manifest.json"
         path.write_text(
@@ -379,6 +483,9 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
         python_exe=str(loop_cfg.get("python_exe", "") or "") or None,
         extra_env=extra_env or None,
     )
+    downstream_evaluator, downstream_interval = _build_downstream_evaluator(
+        cfg.get("downstream_eval") or Config({})
+    )
     return ReviewOnlyLoop(
         pipeline_agent=pipeline_agent,
         executor=executor,
@@ -388,6 +495,8 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
         run_name=str(project.get("run_name", "run") or "run"),
         max_iterations=int(loop_cfg.get("max_iterations", 4)),
         execution_repairs=int(loop_cfg.get("execution_repairs", 1)),
+        downstream_evaluator=downstream_evaluator,
+        downstream_interval=downstream_interval,
     )
 
 
@@ -426,6 +535,33 @@ def _plain_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, Config):
         return dict(value.to_dict())
     return dict(value or {}) if isinstance(value, dict) else {}
+
+
+def _build_downstream_evaluator(
+    value: Config,
+) -> tuple[DownstreamEvaluatorABC | None, int]:
+    """Build the optional process-isolated SFT/evaluation adapter."""
+    interval = int(value.get("interval", 3))
+    if interval < 1:
+        raise ValueError("downstream_eval.interval must be at least 1")
+    if not _as_bool(value.get("enabled", False)):
+        return None, interval
+
+    raw_command = value.get("command", []) or []
+    if not isinstance(raw_command, list):
+        raise ValueError("downstream_eval.command must be a YAML argv list")
+    raw_benchmarks = value.get("benchmarks", []) or []
+    if not isinstance(raw_benchmarks, list):
+        raise ValueError("downstream_eval.benchmarks must be a YAML list")
+    return (
+        CommandDownstreamEvaluator(
+            [str(item) for item in raw_command],
+            expected_benchmarks=[str(item) for item in raw_benchmarks],
+            bad_cases_per_benchmark=int(value.get("bad_cases_per_benchmark", 3)),
+            timeout_sec=int(value.get("timeout_sec", 86400)),
+        ),
+        interval,
+    )
 
 
 def _build_dataset_quality_evaluator(
@@ -576,7 +712,13 @@ def main() -> None:
     print(f"最优数据：{best.dataset_path}")
     print(f"Review score：{best.score:.4f}（passed={best.review.passed}）")
     print(f"运行清单：{loop.run_dir / 'manifest.json'}")
-    print("训练和下游评测未执行；请根据清单中的 best.dataset_path 人工启动。")
+    if loop.downstream_evaluations:
+        print(
+            f"周期性下游 SFT/评测检查点：{len(loop.downstream_evaluations)}；"
+            "最终训练和评测仍应基于 manifest 中的 best.dataset_path 单独执行。"
+        )
+    else:
+        print("训练和下游评测未执行；请根据清单中的 best.dataset_path 人工启动。")
 
 
 if __name__ == "__main__":

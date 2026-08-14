@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from dataflow_evolver.core.downstream_eval import DownstreamEvaluationResult
 from dataflow_evolver.core.input_corpus import InputCorpus
 from dataflow_evolver.core.schemas import (
     PipelineConfig,
@@ -79,6 +80,7 @@ class PipelineAgent:
         parent_code: str | None = None,
         parent_rationale: str | None = None,
         parent_review: ReviewResult | None = None,
+        downstream_feedback: DownstreamEvaluationResult | None = None,
         evolution_history: list[dict[str, Any]] | None = None,
     ) -> PipelineConfig | None:
         """Challenge the incumbent using its review and compact attempt history."""
@@ -95,6 +97,7 @@ class PipelineAgent:
             recommended_categories=recommended,
             parent_rationale=parent_rationale,
             parent_review=parent_review,
+            downstream_feedback=downstream_feedback,
             evolution_history=evolution_history,
         )
         return self._run_and_assemble(prompt, iteration_dir)

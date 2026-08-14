@@ -3,6 +3,10 @@ from pathlib import Path
 
 import pytest
 
+from dataflow_evolver.core.downstream_eval import (
+    DownstreamBenchmarkResult,
+    DownstreamEvaluationResult,
+)
 from dataflow_evolver.core.schemas import PipelineConfig, ReviewResult, TaskSpec
 from dataflow_evolver.engine.execution_wrapper import ExecutionResult
 from dataflow_evolver.main import Candidate, ReviewOnlyLoop, select_best
@@ -28,6 +32,7 @@ class FakePipelineAgent:
         self.feedback = []
         self.parent_codes = []
         self.histories = []
+        self.downstream_feedback = []
         self.repairs = []
 
     def generate_initial(self, **kwargs):
@@ -37,6 +42,7 @@ class FakePipelineAgent:
         self.feedback.append(kwargs["parent_review"])
         self.parent_codes.append(kwargs["parent_code"])
         self.histories.append(kwargs["evolution_history"])
+        self.downstream_feedback.append(kwargs.get("downstream_feedback"))
         return _config(str(len(self.feedback)))
 
     def self_correct(self, iteration_dir, traceback, diagnostics="", failure_stage="execution"):
@@ -86,7 +92,42 @@ class FakeReviewer:
         return self.results.pop(0)
 
 
-def _loop(tmp_path, *, max_iterations=3, execution_repairs=0, failures=0, reviewer=None):
+class FakeDownstreamEvaluator:
+    expected_benchmarks = ["gsm8k"]
+    bad_cases_per_benchmark = 3
+
+    def __init__(self):
+        self.requests = []
+
+    def run(self, request, checkpoint_dir):
+        self.requests.append((request, Path(checkpoint_dir)))
+        return DownstreamEvaluationResult(
+            status="ok",
+            checkpoint_iteration=request.checkpoint_iteration,
+            incumbent_iteration=request.incumbent_iteration,
+            dataset_path=request.dataset_path,
+            model="downstream-model",
+            benchmarks={
+                "gsm8k": DownstreamBenchmarkResult(
+                    score=0.5 + 0.1 * len(self.requests),
+                    metric="accuracy",
+                    incorrect_count=0,
+                    bad_cases=[],
+                )
+            },
+        )
+
+
+def _loop(
+    tmp_path,
+    *,
+    max_iterations=3,
+    execution_repairs=0,
+    failures=0,
+    reviewer=None,
+    downstream_evaluator=None,
+    downstream_interval=3,
+):
     workspace = tmp_path / "workspace"
     return ReviewOnlyLoop(
         pipeline_agent=FakePipelineAgent(), executor=FakeExecutor(failures),
@@ -94,6 +135,8 @@ def _loop(tmp_path, *, max_iterations=3, execution_repairs=0, failures=0, review
         task=TaskSpec("clean raw data", {"instruction": "str", "output": "str"}, []),
         workspace=workspace, run_name="run_a",
         max_iterations=max_iterations, execution_repairs=execution_repairs,
+        downstream_evaluator=downstream_evaluator,
+        downstream_interval=downstream_interval,
     )
 
 
@@ -144,6 +187,37 @@ def test_execution_repairs_are_configurable_and_receive_diagnostics(tmp_path):
     assert manifest["total_execution_repairs"] == 2
     assert manifest["best"]["execution_repairs"] == 2
     assert manifest["best"]["wall_time_seconds"] >= 0.0
+
+
+def test_downstream_evaluation_runs_every_three_rounds_on_current_incumbent(tmp_path):
+    downstream = FakeDownstreamEvaluator()
+    reviewer = FakeReviewer(
+        [_review(score, True, f"review {index}") for index, score in enumerate(
+            [0.4, 0.8, 0.6, 0.7, 0.9, 0.85, 0.88], start=1
+        )]
+    )
+    loop = _loop(
+        tmp_path,
+        max_iterations=7,
+        reviewer=reviewer,
+        downstream_evaluator=downstream,
+    )
+
+    best = loop.run()
+
+    assert best is not None and best.iteration == 4
+    assert [item[0].checkpoint_iteration for item in downstream.requests] == [3, 6]
+    assert [item[0].incumbent_iteration for item in downstream.requests] == [2, 5]
+    feedback = loop.pipeline_agent.downstream_feedback
+    assert feedback[:2] == [None, None]
+    assert [item.checkpoint_iteration for item in feedback[2:5]] == [3, 3, 3]
+    assert feedback[5].checkpoint_iteration == 6
+    assert feedback[5].score_deltas["gsm8k"] == pytest.approx(0.1)
+    manifest = json.loads((loop.run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["downstream_evaluation"]["completed_checkpoints"] == 2
+    assert manifest["downstream_evaluation_wall_time_seconds"] >= 0.0
+    assert manifest["total_wall_time_seconds"] >= manifest["data_preparation_wall_time_seconds"]
+    assert (loop.run_dir / "downstream_evaluations.jsonl").is_file()
 
 
 def test_best_selection_prefers_passed_candidate_before_raw_score(tmp_path):

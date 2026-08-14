@@ -10,6 +10,7 @@ fixed raw data
   -> formal execution
   -> Review Agent evaluates the candidate dataset
   -> accept only if passed/review_score rank improves
+  -> every N rounds, optionally SFT/evaluate the current incumbent in an external process
   -> compact decision outcome enters history; accepted pipeline becomes incumbent
   -> repeat
 ```
@@ -25,6 +26,9 @@ fixed raw data
   `review_score`. The final dataset is the last accepted incumbent, not necessarily the
   final iteration's dataset.
 - `manifest.json` and `iterations.jsonl` live beside the iteration directories.
+- Optional downstream checkpoints run only after static selection, so they always receive
+  the current incumbent rather than the latest challenger. See
+  [`downstream_evaluation.md`](downstream_evaluation.md) for the process protocol.
 
 ## Execution repair
 
@@ -77,6 +81,11 @@ evidence for audit.
 The next Pipeline Agent receives only the four sampled dimensions, duplicate/null/parse/
 contamination rates, delta MMD, normalized Vendi and its delta, NN-cosine p95 and its delta,
 and concrete issues. It does not receive MMD kernel terms or the remaining cosine telemetry.
+
+When periodic downstream evaluation is enabled, the latest validated benchmark scores and
+three complete bad cases per benchmark are added as a separate prompt block. The block is
+reused until the next checkpoint. It is diagnostic feedback and is not mixed into static
+`review_score`.
 
 ## Agent backends and state
 

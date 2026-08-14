@@ -1,0 +1,320 @@
+"""Process-isolated downstream SFT and benchmark evaluation feedback.
+
+The core package intentionally knows nothing about a training framework.  It writes
+one JSON request, invokes a configured command, and validates the JSON result that
+the external environment writes back.
+"""
+from __future__ import annotations
+
+import json
+import math
+import subprocess
+import time
+from abc import ABC, abstractmethod
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Sequence
+
+from dataflow_evolver.core.schemas import TaskSpec
+
+
+@dataclass(frozen=True)
+class DownstreamEvaluationRequest:
+    """Inputs handed to an external SFT/evaluation runner."""
+
+    checkpoint_iteration: int
+    incumbent_iteration: int
+    dataset_path: str
+    pipeline_path: str
+    task: TaskSpec
+    expected_benchmarks: list[str]
+    bad_cases_per_benchmark: int
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["protocol_version"] = 1
+        return payload
+
+
+@dataclass(frozen=True)
+class DownstreamBadCase:
+    question: str
+    model_output: str
+    correct_answer: str
+
+
+@dataclass(frozen=True)
+class DownstreamBenchmarkResult:
+    score: float
+    metric: str
+    incorrect_count: int
+    bad_cases: list[DownstreamBadCase]
+
+
+@dataclass
+class DownstreamEvaluationResult:
+    """Validated feedback, including infrastructure failures as explicit records."""
+
+    status: str
+    checkpoint_iteration: int
+    incumbent_iteration: int
+    dataset_path: str
+    model: str = ""
+    benchmarks: dict[str, DownstreamBenchmarkResult] = field(default_factory=dict)
+    score_deltas: dict[str, float] = field(default_factory=dict)
+    summary: str = ""
+    artifacts: dict[str, str] = field(default_factory=dict)
+    wall_time_seconds: float = 0.0
+    request_path: str = ""
+    result_path: str = ""
+    error: str | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status == "ok"
+
+
+class DownstreamEvaluatorABC(ABC):
+    """Boundary implemented by process-backed or test evaluators."""
+
+    expected_benchmarks: list[str]
+    bad_cases_per_benchmark: int
+
+    @abstractmethod
+    def run(
+        self,
+        request: DownstreamEvaluationRequest,
+        checkpoint_dir: Path,
+    ) -> DownstreamEvaluationResult:
+        raise NotImplementedError
+
+
+class CommandDownstreamEvaluator(DownstreamEvaluatorABC):
+    """Invoke an external runner without importing its training dependencies.
+
+    The configured command is treated as an argv prefix.  The framework appends
+    ``--request <path> --result <path>`` and never invokes a shell.
+    """
+
+    def __init__(
+        self,
+        command: Sequence[str],
+        *,
+        expected_benchmarks: Sequence[str],
+        bad_cases_per_benchmark: int = 3,
+        timeout_sec: int = 86400,
+    ) -> None:
+        self.command = [str(part) for part in command if str(part)]
+        self.expected_benchmarks = [str(name) for name in expected_benchmarks if str(name)]
+        self.bad_cases_per_benchmark = int(bad_cases_per_benchmark)
+        self.timeout_sec = int(timeout_sec)
+        if not self.command:
+            raise ValueError("downstream_eval.command must contain at least one argv item")
+        if not self.expected_benchmarks:
+            raise ValueError("downstream_eval.benchmarks must not be empty")
+        if self.bad_cases_per_benchmark < 1:
+            raise ValueError("downstream_eval.bad_cases_per_benchmark must be at least 1")
+        if self.timeout_sec < 1:
+            raise ValueError("downstream_eval.timeout_sec must be at least 1")
+
+    def run(
+        self,
+        request: DownstreamEvaluationRequest,
+        checkpoint_dir: Path,
+    ) -> DownstreamEvaluationResult:
+        checkpoint_dir = checkpoint_dir.resolve()
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        request_path = checkpoint_dir / "request.json"
+        result_path = checkpoint_dir / "result.json"
+        stdout_path = checkpoint_dir / "stdout.log"
+        stderr_path = checkpoint_dir / "stderr.log"
+        request_path.write_text(
+            json.dumps(request.to_dict(), ensure_ascii=False, sort_keys=True, indent=2),
+            encoding="utf-8",
+        )
+        argv = [
+            *self.command,
+            "--request",
+            str(request_path),
+            "--result",
+            str(result_path),
+        ]
+        started = time.perf_counter()
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=str(checkpoint_dir),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.timeout_sec,
+                check=False,
+            )
+            stdout_path.write_text(completed.stdout or "", encoding="utf-8")
+            stderr_path.write_text(completed.stderr or "", encoding="utf-8")
+            if completed.returncode != 0:
+                return self._failure(
+                    request,
+                    request_path,
+                    result_path,
+                    started,
+                    f"external runner exited with code {completed.returncode}",
+                )
+            if not result_path.is_file():
+                return self._failure(
+                    request,
+                    request_path,
+                    result_path,
+                    started,
+                    "external runner did not create result.json",
+                )
+            raw = json.loads(result_path.read_text(encoding="utf-8"))
+            benchmarks = _validate_result(
+                raw,
+                expected_benchmarks=self.expected_benchmarks,
+                bad_cases_per_benchmark=self.bad_cases_per_benchmark,
+            )
+            return DownstreamEvaluationResult(
+                status="ok",
+                checkpoint_iteration=request.checkpoint_iteration,
+                incumbent_iteration=request.incumbent_iteration,
+                dataset_path=request.dataset_path,
+                model=_nonempty_string(raw.get("model"), "model"),
+                benchmarks=benchmarks,
+                summary=str(raw.get("summary", "") or ""),
+                artifacts=_string_mapping(raw.get("artifacts", {}), "artifacts"),
+                wall_time_seconds=round(time.perf_counter() - started, 6),
+                request_path=str(request_path),
+                result_path=str(result_path),
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout_path.write_text(_process_text(exc.stdout), encoding="utf-8")
+            stderr_path.write_text(_process_text(exc.stderr), encoding="utf-8")
+            return self._failure(
+                request,
+                request_path,
+                result_path,
+                started,
+                f"external runner timed out after {self.timeout_sec}s",
+            )
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            return self._failure(
+                request,
+                request_path,
+                result_path,
+                started,
+                f"invalid downstream evaluation: {exc}",
+            )
+
+    @staticmethod
+    def _failure(
+        request: DownstreamEvaluationRequest,
+        request_path: Path,
+        result_path: Path,
+        started: float,
+        error: str,
+    ) -> DownstreamEvaluationResult:
+        return DownstreamEvaluationResult(
+            status="failed",
+            checkpoint_iteration=request.checkpoint_iteration,
+            incumbent_iteration=request.incumbent_iteration,
+            dataset_path=request.dataset_path,
+            wall_time_seconds=round(time.perf_counter() - started, 6),
+            request_path=str(request_path),
+            result_path=str(result_path),
+            error=error,
+        )
+
+
+def result_to_dict(result: DownstreamEvaluationResult) -> dict[str, Any]:
+    """Serialize nested dataclasses for traces, manifests, and prompt tests."""
+    return asdict(result)
+
+
+def _validate_result(
+    raw: Any,
+    *,
+    expected_benchmarks: Sequence[str],
+    bad_cases_per_benchmark: int,
+) -> dict[str, DownstreamBenchmarkResult]:
+    if not isinstance(raw, dict):
+        raise ValueError("result root must be a JSON object")
+    raw_benchmarks = raw.get("benchmarks")
+    if not isinstance(raw_benchmarks, dict):
+        raise ValueError("benchmarks must be a JSON object")
+    missing = [name for name in expected_benchmarks if name not in raw_benchmarks]
+    if missing:
+        raise ValueError(f"missing benchmark results: {', '.join(missing)}")
+
+    validated: dict[str, DownstreamBenchmarkResult] = {}
+    for name in expected_benchmarks:
+        item = raw_benchmarks[name]
+        if not isinstance(item, dict):
+            raise ValueError(f"benchmark {name!r} must be a JSON object")
+        score = item.get("score")
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            raise ValueError(f"benchmark {name!r} score must be numeric")
+        score = float(score)
+        if not math.isfinite(score):
+            raise ValueError(f"benchmark {name!r} score must be finite")
+        incorrect_count = _nonnegative_int(
+            item.get("incorrect_count"), f"{name}.incorrect_count"
+        )
+        expected_bad_cases = min(bad_cases_per_benchmark, incorrect_count)
+        bad_cases = item.get("bad_cases")
+        if not isinstance(bad_cases, list) or len(bad_cases) != expected_bad_cases:
+            raise ValueError(
+                f"benchmark {name!r} must contain exactly {expected_bad_cases} bad_cases "
+                f"(min({bad_cases_per_benchmark}, incorrect_count={incorrect_count}))"
+            )
+        validated[name] = DownstreamBenchmarkResult(
+            score=score,
+            metric=_nonempty_string(item.get("metric"), f"{name}.metric"),
+            incorrect_count=incorrect_count,
+            bad_cases=[_validate_bad_case(name, index, value) for index, value in enumerate(bad_cases)],
+        )
+    return validated
+
+
+def _validate_bad_case(name: str, index: int, raw: Any) -> DownstreamBadCase:
+    if not isinstance(raw, dict):
+        raise ValueError(f"{name}.bad_cases[{index}] must be a JSON object")
+    return DownstreamBadCase(
+        question=_nonempty_string(raw.get("question"), f"{name}.bad_cases[{index}].question"),
+        model_output=_nonempty_string(
+            raw.get("model_output"), f"{name}.bad_cases[{index}].model_output"
+        ),
+        correct_answer=_nonempty_string(
+            raw.get("correct_answer"), f"{name}.bad_cases[{index}].correct_answer"
+        ),
+    )
+
+
+def _nonempty_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value
+
+
+def _nonnegative_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    return value
+
+
+def _string_mapping(value: Any, field_name: str) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or any(
+        not isinstance(key, str) or not isinstance(item, str)
+        for key, item in value.items()
+    ):
+        raise ValueError(f"{field_name} must map strings to strings")
+    return dict(value)
+
+
+def _process_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value

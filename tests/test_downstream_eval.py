@@ -1,0 +1,182 @@
+import json
+import sys
+from pathlib import Path
+
+from dataflow_evolver.core.downstream_eval import (
+    CommandDownstreamEvaluator,
+    DownstreamBadCase,
+    DownstreamBenchmarkResult,
+    DownstreamEvaluationRequest,
+    DownstreamEvaluationResult,
+)
+from dataflow_evolver.core.schemas import TaskSpec
+from dataflow_evolver.llm.prompts import _downstream_feedback_block
+from dataflow_evolver.main import _build_downstream_evaluator
+from dataflow_evolver.utils.config import Config
+
+
+def _request(tmp_path: Path) -> DownstreamEvaluationRequest:
+    return DownstreamEvaluationRequest(
+        checkpoint_iteration=3,
+        incumbent_iteration=2,
+        dataset_path=str(tmp_path / "candidate.jsonl"),
+        pipeline_path=str(tmp_path / "pipeline.py"),
+        task=TaskSpec("math SFT", {"instruction": "str", "output": "str"}, []),
+        expected_benchmarks=["gsm8k", "math500"],
+        bad_cases_per_benchmark=3,
+    )
+
+
+def _runner(
+    tmp_path: Path,
+    *,
+    bad_case_count: int = 3,
+    incorrect_count: int | None = None,
+) -> Path:
+    script = tmp_path / "runner.py"
+    reported_incorrect = bad_case_count if incorrect_count is None else incorrect_count
+    script.write_text(
+        f"""
+import argparse
+import json
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--request', required=True)
+parser.add_argument('--result', required=True)
+args = parser.parse_args()
+request = json.loads(Path(args.request).read_text(encoding='utf-8'))
+assert request['checkpoint_iteration'] == 3
+cases = [
+    {{'question': f'question {{i}}', 'model_output': f'wrong output {{i}}',
+      'correct_answer': f'answer {{i}}'}}
+    for i in range({bad_case_count})
+]
+result = {{
+    'model': 'Qwen2.5-4B-Base',
+    'benchmarks': {{
+        'gsm8k': {{'score': 0.61, 'metric': 'accuracy',
+                   'incorrect_count': {reported_incorrect}, 'bad_cases': cases}},
+        'math500': {{'score': 0.32, 'metric': 'accuracy',
+                    'incorrect_count': {reported_incorrect}, 'bad_cases': cases}},
+    }},
+    'summary': 'algebra and counting remain weak',
+    'artifacts': {{'checkpoint': '/external/checkpoint'}},
+}}
+Path(args.result).write_text(json.dumps(result), encoding='utf-8')
+""".strip(),
+        encoding="utf-8",
+    )
+    return script
+
+
+def test_command_evaluator_uses_json_protocol_and_validates_results(tmp_path):
+    evaluator = CommandDownstreamEvaluator(
+        [sys.executable, str(_runner(tmp_path))],
+        expected_benchmarks=["gsm8k", "math500"],
+        bad_cases_per_benchmark=3,
+        timeout_sec=30,
+    )
+
+    result = evaluator.run(_request(tmp_path), tmp_path / "checkpoint_003")
+
+    assert result.succeeded
+    assert result.model == "Qwen2.5-4B-Base"
+    assert result.benchmarks["gsm8k"].score == 0.61
+    assert len(result.benchmarks["math500"].bad_cases) == 3
+    assert Path(result.request_path).is_file()
+    assert Path(result.result_path).is_file()
+    assert (tmp_path / "checkpoint_003/stdout.log").is_file()
+    request = json.loads(Path(result.request_path).read_text(encoding="utf-8"))
+    assert request["protocol_version"] == 1
+    assert request["dataset_path"].endswith("candidate.jsonl")
+
+
+def test_command_evaluator_accepts_fewer_cases_when_fewer_answers_are_wrong(tmp_path):
+    evaluator = CommandDownstreamEvaluator(
+        [sys.executable, str(_runner(tmp_path, bad_case_count=2))],
+        expected_benchmarks=["gsm8k", "math500"],
+        bad_cases_per_benchmark=3,
+        timeout_sec=30,
+    )
+
+    result = evaluator.run(_request(tmp_path), tmp_path / "checkpoint_003")
+
+    assert result.succeeded
+    assert result.benchmarks["gsm8k"].incorrect_count == 2
+    assert len(result.benchmarks["gsm8k"].bad_cases) == 2
+
+
+def test_command_evaluator_rejects_missing_cases_when_more_answers_are_wrong(tmp_path):
+    evaluator = CommandDownstreamEvaluator(
+        [
+            sys.executable,
+            str(_runner(tmp_path, bad_case_count=2, incorrect_count=8)),
+        ],
+        expected_benchmarks=["gsm8k", "math500"],
+        bad_cases_per_benchmark=3,
+        timeout_sec=30,
+    )
+
+    result = evaluator.run(_request(tmp_path), tmp_path / "checkpoint_003")
+
+    assert not result.succeeded
+    assert "exactly 3 bad_cases" in (result.error or "")
+
+
+def test_prompt_keeps_complete_bad_cases_and_marks_them_as_diagnostics():
+    full_output = "reasoning line 1\n" + ("very long reasoning; " * 100) + "\nfinal"
+    result = DownstreamEvaluationResult(
+        status="ok",
+        checkpoint_iteration=3,
+        incumbent_iteration=2,
+        dataset_path="/run/iteration_002/output.jsonl",
+        model="Qwen2.5-4B-Base",
+        benchmarks={
+            "gsm8k": DownstreamBenchmarkResult(
+                score=0.5,
+                metric="accuracy",
+                incorrect_count=3,
+                bad_cases=[
+                    DownstreamBadCase(
+                        question=f"question {index}",
+                        model_output=full_output,
+                        correct_answer=f"answer {index}",
+                    )
+                    for index in range(3)
+                ],
+            )
+        },
+    )
+
+    prompt = _downstream_feedback_block(result)
+
+    assert full_output in prompt
+    assert "gsm8k: accuracy=0.500000" in prompt
+    assert prompt.count("Model output:") == 3
+    assert "不是可复制进训练数据的新数据源" in prompt
+
+
+def test_downstream_config_is_disabled_without_loading_external_dependencies():
+    evaluator, interval = _build_downstream_evaluator(
+        Config({"enabled": False, "interval": 3})
+    )
+    assert evaluator is None
+    assert interval == 3
+
+
+def test_downstream_config_requires_argv_and_benchmark_lists():
+    config = Config(
+        {
+            "enabled": True,
+            "interval": 3,
+            "command": "python runner.py",
+            "benchmarks": ["gsm8k"],
+        }
+    )
+    try:
+        _build_downstream_evaluator(config)
+    except ValueError as exc:
+        assert "YAML argv list" in str(exc)
+    else:
+        raise AssertionError("string commands must not be passed through a shell")

@@ -1,6 +1,7 @@
 """Prompts for the fixed-corpus PipelineAgent -> ReviewAgent feedback loop."""
 from __future__ import annotations
 
+from dataflow_evolver.core.downstream_eval import DownstreamEvaluationResult
 from dataflow_evolver.core.input_corpus import InputCorpus
 from dataflow_evolver.core.schemas import ReviewResult, TaskSpec
 from dataflow_evolver.llm.skill_paths import skill_root_for_backend
@@ -34,7 +35,7 @@ Entry file: {entry_path}
    不要自行执行 `pipeline.py`（包括 compile-only 或 smoke test）；框架会在 Agent 返回后依次执行
    确定性的 artifact 校验、compile 预检和正式运行。
 
-{recommendation_block}{init_block}{parent_block}{review_block}{history_block}
+{recommendation_block}{init_block}{parent_block}{review_block}{downstream_block}{history_block}
 约束：无头自动化运行，禁止 AskUserQuestion 与 git/gh 子流程。MCP 仅用于查看 DataFlow 算子源码，
 不能用于获取新数据。"""
 
@@ -135,6 +136,7 @@ def build_pipeline_prompt(
     recommended_categories: dict | None = None,
     parent_rationale: str | None = None,
     parent_review: ReviewResult | None = None,
+    downstream_feedback: DownstreamEvaluationResult | None = None,
     evolution_history: list[dict] | None = None,
     is_init: bool = False,
 ) -> str:
@@ -157,6 +159,7 @@ def build_pipeline_prompt(
         review_block=(
             _parent_quality_block(parent_review) if parent_review is not None else ""
         ),
+        downstream_block=_downstream_feedback_block(downstream_feedback),
         history_block=_history_block(evolution_history),
     )
 
@@ -277,6 +280,55 @@ def _history_block(history: list[dict] | None) -> str:
             f"- iter {item.get('iteration')} [{item.get('outcome')}], score={score_text}, "
             f"ops={operators}, decision={item.get('decision') or 'none'}, issues={issues}"
         )
+    return "\n".join(lines) + "\n"
+
+
+def _downstream_feedback_block(
+    feedback: DownstreamEvaluationResult | None,
+) -> str:
+    if feedback is None:
+        return ""
+    if not feedback.succeeded:
+        return (
+            "【下游 SFT/评测检查点】外部评测未成功，因此本轮没有可用的下游质量信号。\n"
+            f"失败原因：{feedback.error or 'unknown error'}。不要根据基础设施失败臆测数据问题。\n"
+        )
+
+    lines = [
+        "【当前最佳 incumbent 的下游 SFT/评测反馈——本轮必须分析并回应】",
+        f"检查点：完成第 {feedback.checkpoint_iteration} 轮后；"
+        f"被评测 incumbent：第 {feedback.incumbent_iteration} 轮；"
+        f"下游模型：{feedback.model}",
+        "以下 bad cases 是诊断证据，不是可复制进训练数据的新数据源。禁止复述、硬编码或"
+        "针对这些 benchmark 题目构造答案；应归纳能力缺口并改进 raw-data pipeline。",
+    ]
+    for benchmark_name, benchmark in feedback.benchmarks.items():
+        delta = feedback.score_deltas.get(benchmark_name)
+        delta_text = f", delta_vs_previous={delta:+.6f}" if delta is not None else ""
+        lines.append(
+            f"\n### {benchmark_name}: {benchmark.metric}={benchmark.score:.6f}{delta_text}; "
+            f"incorrect_count={benchmark.incorrect_count}"
+        )
+        for index, case in enumerate(benchmark.bad_cases, start=1):
+            # Deliberately do not truncate any of the three fields.  The external
+            # result contract limits the number of cases instead of clipping evidence.
+            lines.extend(
+                [
+                    f"Bad case {index}",
+                    "Question:",
+                    case.question,
+                    "Model output:",
+                    case.model_output,
+                    "Correct answer:",
+                    case.correct_answer,
+                ]
+            )
+    if feedback.summary:
+        lines.extend(["\n外部评测摘要：", feedback.summary])
+    lines.append(
+        "请把各 benchmark 的共同与特有失败模式映射到可执行的过滤、重写、增强、难度或覆盖策略，"
+        "并在 decision.json 的 reason 中说明哪些改动由该反馈触发。"
+    )
     return "\n".join(lines) + "\n"
 
 

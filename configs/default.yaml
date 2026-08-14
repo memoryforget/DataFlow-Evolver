@@ -88,6 +88,18 @@ loop:
   execution_repairs: ${DF_EXECUTION_REPAIRS:1}
   python_exe: ${DF_AGENT_PYTHON:}
 
+# Optional process-isolated SFT/evaluation feedback. After every N static Review
+# iterations, the framework evaluates the current best-so-far dataset. The command
+# runs in its own environment and receives appended `--request` and `--result` paths.
+downstream_eval:
+  enabled: ${DF_DOWNSTREAM_EVAL_ENABLED:false}
+  interval: ${DF_DOWNSTREAM_EVAL_INTERVAL:3}
+  command: []
+  benchmarks: []
+  # Maximum retained cases; actual count is min(this value, result.incorrect_count).
+  bad_cases_per_benchmark: 3
+  timeout_sec: ${DF_DOWNSTREAM_EVAL_TIMEOUT_SEC:86400}
+
 review:
   sample_size: ${DF_REVIEW_SAMPLE_SIZE:80}
   sample_seed: 42
