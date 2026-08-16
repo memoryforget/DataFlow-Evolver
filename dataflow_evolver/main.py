@@ -115,9 +115,16 @@ class ReviewOnlyLoop:
             )
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
+        if (
+            self.downstream_evaluator is not None
+            and self.downstream_evaluator.baseline_enabled
+        ):
+            self._run_downstream_baseline()
+
         config = self.pipeline_agent.generate_initial(
             task=self.task,
             iteration_dir=self._iteration_dir(0),
+            downstream_feedback=self.latest_downstream_evaluation,
         )
         if config is None:
             logger.error("初始 PipelineAgent 未产出有效流水线。")
@@ -290,6 +297,8 @@ class ReviewOnlyLoop:
             task=self.task,
             expected_benchmarks=list(self.downstream_evaluator.expected_benchmarks),
             bad_cases_per_benchmark=self.downstream_evaluator.bad_cases_per_benchmark,
+            stage="periodic",
+            training_performed=True,
         )
         logger.info(
             "触发下游 SFT/评测检查点：完成轮次=%d incumbent=%s dataset=%s",
@@ -298,6 +307,31 @@ class ReviewOnlyLoop:
             incumbent.dataset_path,
         )
         result = self.downstream_evaluator.run(request, checkpoint_dir)
+        self._record_downstream_result(result)
+
+    def _run_downstream_baseline(self) -> None:
+        """Evaluate the untrained downstream model before generating iteration zero."""
+        assert self.downstream_evaluator is not None
+        request = DownstreamEvaluationRequest(
+            checkpoint_iteration=0,
+            incumbent_iteration=None,
+            dataset_path=None,
+            pipeline_path=None,
+            task=self.task,
+            expected_benchmarks=list(self.downstream_evaluator.expected_benchmarks),
+            bad_cases_per_benchmark=self.downstream_evaluator.bad_cases_per_benchmark,
+            stage="baseline",
+            training_performed=False,
+        )
+        checkpoint_dir = self.run_dir / "downstream_eval" / "checkpoint_000"
+        logger.info(
+            "触发第 0 轮下游诊断：不训练模型，直接评测外部 runner 的固定诊断集",
+        )
+        result = self.downstream_evaluator.run(request, checkpoint_dir)
+        self._record_downstream_result(result)
+
+    def _record_downstream_result(self, result: DownstreamEvaluationResult) -> None:
+        """Persist one result and compute deltas without mixing it into review_score."""
         if result.succeeded:
             previous = next(
                 (item for item in reversed(self.downstream_evaluations) if item.succeeded),
@@ -308,6 +342,20 @@ class ReviewOnlyLoop:
                     name: benchmark.score - previous.benchmarks[name].score
                     for name, benchmark in result.benchmarks.items()
                     if name in previous.benchmarks
+                }
+            baseline = next(
+                (
+                    item
+                    for item in self.downstream_evaluations
+                    if item.succeeded and item.stage == "baseline"
+                ),
+                None,
+            )
+            if baseline is not None and result.stage != "baseline":
+                result.score_deltas_vs_baseline = {
+                    name: benchmark.score - baseline.benchmarks[name].score
+                    for name, benchmark in result.benchmarks.items()
+                    if name in baseline.benchmarks
                 }
         self.downstream_evaluations.append(result)
         self.latest_downstream_evaluation = result
@@ -368,6 +416,17 @@ class ReviewOnlyLoop:
                 "enabled": self.downstream_evaluator is not None,
                 "interval": self.downstream_interval,
                 "completed_checkpoints": len(self.downstream_evaluations),
+                "completed_periodic_checkpoints": sum(
+                    item.stage == "periodic" for item in self.downstream_evaluations
+                ),
+                "baseline_enabled": bool(
+                    self.downstream_evaluator is not None
+                    and self.downstream_evaluator.baseline_enabled
+                ),
+                "baseline_succeeded": any(
+                    item.stage == "baseline" and item.succeeded
+                    for item in self.downstream_evaluations
+                ),
                 "evaluations": [
                     result_to_dict(result) for result in self.downstream_evaluations
                 ],
@@ -553,12 +612,14 @@ def _build_downstream_evaluator(
     raw_benchmarks = value.get("benchmarks", []) or []
     if not isinstance(raw_benchmarks, list):
         raise ValueError("downstream_eval.benchmarks must be a YAML list")
+    baseline_cfg = value.get("baseline") or Config({})
     return (
         CommandDownstreamEvaluator(
             [str(item) for item in raw_command],
             expected_benchmarks=[str(item) for item in raw_benchmarks],
             bad_cases_per_benchmark=int(value.get("bad_cases_per_benchmark", 3)),
             timeout_sec=int(value.get("timeout_sec", 86400)),
+            baseline_enabled=_as_bool(baseline_cfg.get("enabled", False)),
         ),
         interval,
     )

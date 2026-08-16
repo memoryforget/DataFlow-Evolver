@@ -294,19 +294,38 @@ def _downstream_feedback_block(
             f"失败原因：{feedback.error or 'unknown error'}。不要根据基础设施失败臆测数据问题。\n"
         )
 
+    if feedback.stage == "baseline":
+        title = "【第 0 轮下游模型诊断——初始流水线必须分析并回应】"
+        checkpoint = (
+            "检查点：迭代开始前；未进行 SFT；"
+            f"下游模型：{feedback.model}"
+        )
+    else:
+        title = "【当前最佳 incumbent 的下游 SFT/评测反馈——本轮必须分析并回应】"
+        checkpoint = (
+            f"检查点：完成第 {feedback.checkpoint_iteration} 轮后；"
+            f"被评测 incumbent：第 {feedback.incumbent_iteration} 轮；"
+            f"下游模型：{feedback.model}"
+        )
+
     lines = [
-        "【当前最佳 incumbent 的下游 SFT/评测反馈——本轮必须分析并回应】",
-        f"检查点：完成第 {feedback.checkpoint_iteration} 轮后；"
-        f"被评测 incumbent：第 {feedback.incumbent_iteration} 轮；"
-        f"下游模型：{feedback.model}",
+        title,
+        checkpoint,
         "以下 bad cases 是诊断证据，不是可复制进训练数据的新数据源。禁止复述、硬编码或"
         "针对这些 benchmark 题目构造答案；应归纳能力缺口并改进 raw-data pipeline。",
     ]
     for benchmark_name, benchmark in feedback.benchmarks.items():
         delta = feedback.score_deltas.get(benchmark_name)
         delta_text = f", delta_vs_previous={delta:+.6f}" if delta is not None else ""
+        baseline_delta = feedback.score_deltas_vs_baseline.get(benchmark_name)
+        baseline_delta_text = (
+            f", delta_vs_untrained_baseline={baseline_delta:+.6f}"
+            if baseline_delta is not None
+            else ""
+        )
         lines.append(
-            f"\n### {benchmark_name}: {benchmark.metric}={benchmark.score:.6f}{delta_text}; "
+            f"\n### {benchmark_name}: {benchmark.metric}={benchmark.score:.6f}"
+            f"{delta_text}{baseline_delta_text}; "
             f"incorrect_count={benchmark.incorrect_count}"
         )
         for index, case in enumerate(benchmark.bad_cases, start=1):

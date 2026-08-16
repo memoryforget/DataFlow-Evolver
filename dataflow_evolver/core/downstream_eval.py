@@ -23,16 +23,18 @@ class DownstreamEvaluationRequest:
     """Inputs handed to an external SFT/evaluation runner."""
 
     checkpoint_iteration: int
-    incumbent_iteration: int
-    dataset_path: str
-    pipeline_path: str
+    incumbent_iteration: int | None
+    dataset_path: str | None
+    pipeline_path: str | None
     task: TaskSpec
     expected_benchmarks: list[str]
     bad_cases_per_benchmark: int
+    stage: str = "periodic"
+    training_performed: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        payload["protocol_version"] = 1
+        payload["protocol_version"] = 2
         return payload
 
 
@@ -57,11 +59,14 @@ class DownstreamEvaluationResult:
 
     status: str
     checkpoint_iteration: int
-    incumbent_iteration: int
-    dataset_path: str
+    incumbent_iteration: int | None
+    dataset_path: str | None
+    stage: str = "periodic"
+    training_performed: bool = True
     model: str = ""
     benchmarks: dict[str, DownstreamBenchmarkResult] = field(default_factory=dict)
     score_deltas: dict[str, float] = field(default_factory=dict)
+    score_deltas_vs_baseline: dict[str, float] = field(default_factory=dict)
     summary: str = ""
     artifacts: dict[str, str] = field(default_factory=dict)
     wall_time_seconds: float = 0.0
@@ -79,6 +84,7 @@ class DownstreamEvaluatorABC(ABC):
 
     expected_benchmarks: list[str]
     bad_cases_per_benchmark: int
+    baseline_enabled: bool = False
 
     @abstractmethod
     def run(
@@ -103,11 +109,13 @@ class CommandDownstreamEvaluator(DownstreamEvaluatorABC):
         expected_benchmarks: Sequence[str],
         bad_cases_per_benchmark: int = 3,
         timeout_sec: int = 86400,
+        baseline_enabled: bool = False,
     ) -> None:
         self.command = [str(part) for part in command if str(part)]
         self.expected_benchmarks = [str(name) for name in expected_benchmarks if str(name)]
         self.bad_cases_per_benchmark = int(bad_cases_per_benchmark)
         self.timeout_sec = int(timeout_sec)
+        self.baseline_enabled = bool(baseline_enabled)
         if not self.command:
             raise ValueError("downstream_eval.command must contain at least one argv item")
         if not self.expected_benchmarks:
@@ -180,6 +188,8 @@ class CommandDownstreamEvaluator(DownstreamEvaluatorABC):
                 checkpoint_iteration=request.checkpoint_iteration,
                 incumbent_iteration=request.incumbent_iteration,
                 dataset_path=request.dataset_path,
+                stage=request.stage,
+                training_performed=request.training_performed,
                 model=_nonempty_string(raw.get("model"), "model"),
                 benchmarks=benchmarks,
                 summary=str(raw.get("summary", "") or ""),
@@ -220,6 +230,8 @@ class CommandDownstreamEvaluator(DownstreamEvaluatorABC):
             checkpoint_iteration=request.checkpoint_iteration,
             incumbent_iteration=request.incumbent_iteration,
             dataset_path=request.dataset_path,
+            stage=request.stage,
+            training_performed=request.training_performed,
             wall_time_seconds=round(time.perf_counter() - started, 6),
             request_path=str(request_path),
             result_path=str(result_path),
@@ -268,11 +280,15 @@ def _validate_result(
                 f"benchmark {name!r} must contain exactly {expected_bad_cases} bad_cases "
                 f"(min({bad_cases_per_benchmark}, incorrect_count={incorrect_count}))"
             )
+        metric = _nonempty_string(item.get("metric"), f"{name}.metric")
         validated[name] = DownstreamBenchmarkResult(
             score=score,
-            metric=_nonempty_string(item.get("metric"), f"{name}.metric"),
+            metric=metric,
             incorrect_count=incorrect_count,
-            bad_cases=[_validate_bad_case(name, index, value) for index, value in enumerate(bad_cases)],
+            bad_cases=[
+                _validate_bad_case(name, index, value)
+                for index, value in enumerate(bad_cases)
+            ],
         )
     return validated
 

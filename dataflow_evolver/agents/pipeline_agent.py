@@ -58,6 +58,7 @@ class PipelineAgent:
         self,
         task: TaskSpec,
         iteration_dir: Path,
+        downstream_feedback: DownstreamEvaluationResult | None = None,
     ) -> PipelineConfig | None:
         """Build the first pipeline over the fixed raw corpus."""
         iteration_dir = iteration_dir.resolve()
@@ -68,6 +69,7 @@ class PipelineAgent:
             iteration_dir=str(iteration_dir),
             llm_block=self.llm_block,
             recommended_categories=_recommend_categories(task.task_description),
+            downstream_feedback=downstream_feedback,
             is_init=True,
         )
         return self._run_and_assemble(prompt, iteration_dir, phase="generate_initial")

@@ -88,7 +88,9 @@ def test_command_evaluator_uses_json_protocol_and_validates_results(tmp_path):
     assert Path(result.result_path).is_file()
     assert (tmp_path / "checkpoint_003/stdout.log").is_file()
     request = json.loads(Path(result.request_path).read_text(encoding="utf-8"))
-    assert request["protocol_version"] == 1
+    assert request["protocol_version"] == 2
+    assert request["stage"] == "periodic"
+    assert request["training_performed"] is True
     assert request["dataset_path"].endswith("candidate.jsonl")
 
 
@@ -122,6 +124,28 @@ def test_command_evaluator_rejects_missing_cases_when_more_answers_are_wrong(tmp
 
     assert not result.succeeded
     assert "exactly 3 bad_cases" in (result.error or "")
+
+
+def test_baseline_request_is_eval_only_and_has_no_candidate_paths(tmp_path):
+    request = DownstreamEvaluationRequest(
+        checkpoint_iteration=0,
+        incumbent_iteration=None,
+        dataset_path=None,
+        pipeline_path=None,
+        task=TaskSpec("math SFT", {"instruction": "str", "output": "str"}, []),
+        expected_benchmarks=["aime24"],
+        bad_cases_per_benchmark=3,
+        stage="baseline",
+        training_performed=False,
+    )
+
+    payload = request.to_dict()
+
+    assert payload["protocol_version"] == 2
+    assert payload["checkpoint_iteration"] == 0
+    assert payload["training_performed"] is False
+    assert payload["dataset_path"] is None
+    assert payload["pipeline_path"] is None
 
 
 def test_prompt_keeps_complete_bad_cases_and_marks_them_as_diagnostics():
@@ -180,3 +204,21 @@ def test_downstream_config_requires_argv_and_benchmark_lists():
         assert "YAML argv list" in str(exc)
     else:
         raise AssertionError("string commands must not be passed through a shell")
+
+
+def test_downstream_config_exposes_baseline_policy():
+    evaluator, interval = _build_downstream_evaluator(
+        Config(
+            {
+                "enabled": True,
+                "interval": 3,
+                "command": [sys.executable, "runner.py"],
+                "benchmarks": ["gsm8k", "aime24"],
+                "baseline": {"enabled": True},
+            }
+        )
+    )
+
+    assert interval == 3
+    assert evaluator is not None
+    assert evaluator.baseline_enabled is True

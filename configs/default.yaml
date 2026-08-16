@@ -96,6 +96,11 @@ downstream_eval:
   interval: ${DF_DOWNSTREAM_EVAL_INTERVAL:3}
   command: []
   benchmarks: []
+  # Optional checkpoint 0: evaluate the untrained downstream model before the
+  # first PipelineAgent call. The external runner receives stage=baseline and
+  # must skip SFT because dataset_path and pipeline_path are null.
+  baseline:
+    enabled: ${DF_DOWNSTREAM_BASELINE_ENABLED:false}
   # Maximum retained cases; actual count is min(this value, result.incorrect_count).
   bad_cases_per_benchmark: 3
   timeout_sec: ${DF_DOWNSTREAM_EVAL_TIMEOUT_SEC:86400}

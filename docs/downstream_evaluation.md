@@ -6,6 +6,8 @@ candidate. After every configured number of completed iterations, the current
 best-so-far incumbent dataset is exported to an external command for SFT and evaluation:
 
 ```text
+checkpoint 0 -> evaluate the untrained downstream model on the fixed diagnostic split
+             -> PipelineAgent receives baseline scores and bad cases
 iteration 1 -> static Review -> incumbent update
 iteration 2 -> static Review -> incumbent update
 iteration 3 -> static Review -> incumbent update
@@ -32,6 +34,8 @@ downstream_eval:
     - /opt/conda/envs/downstream/bin/python
     - /absolute/path/to/run_sft_and_eval.py
   benchmarks: [gsm8k, math, math500, aime]
+  baseline:
+    enabled: true
   bad_cases_per_benchmark: 3  # maximum retained per benchmark
   timeout_sec: 86400
 ```
@@ -48,10 +52,23 @@ they are not copied into DataFlow Evolver's YAML.
 
 ## Request contract
 
-`request.json` contains protocol version 1, the one-based checkpoint and incumbent
-iterations, absolute candidate dataset and pipeline paths, the task contract, expected
-benchmark names, and the required bad-case count. The runner must train from exactly the
-supplied `dataset_path`; it must not select the last iteration by convention.
+`request.json` contains protocol version 2, the checkpoint stage, task contract,
+expected benchmark names, and required bad-case count.
+
+At checkpoint 0, `stage` is `baseline`, `training_performed` is false, and incumbent,
+dataset, and pipeline paths are null. The runner must skip SFT and directly evaluate its
+configured untrained model. Periodic requests use `stage=periodic`, set
+`training_performed=true`, and provide absolute incumbent dataset and pipeline paths. The
+runner must train from exactly the supplied `dataset_path`; it must not select the last
+iteration by convention.
+
+Diagnostic datasets must be materialized before the DataFlow Evolver run. A single
+external command may dispatch to a different evaluator for every benchmark, following
+the same pattern as Qwen2.5-Math. Dataset paths, prompts, chat templates, decoding
+parameters, sample counts, answer extractors, graders, and metric names belong to that
+external configuration rather than this request protocol. The runner must reuse the
+same prepared diagnostic files at every checkpoint and should write their manifest and
+evaluation-config paths into `artifacts` for auditability.
 
 ## Result contract
 
@@ -86,14 +103,16 @@ The command exits with code 0 and writes one JSON object to `result.json`:
   },
   "summary": "optional cross-benchmark diagnosis",
   "artifacts": {
-    "checkpoint": "/absolute/path/to/model/checkpoint"
+    "checkpoint": "/absolute/path/to/model/checkpoint",
+    "diagnostic_manifest": "/absolute/path/to/diagnostic_manifest.json",
+    "evaluation_config": "/absolute/path/to/evaluation_config.yaml"
   }
 }
 ```
 
 Every configured benchmark must appear. `score` must be finite, `metric` and all bad-case
 fields must be non-empty strings, and `incorrect_count` must be a non-negative integer.
-Each benchmark must contain exactly
+Each benchmark is validated independently and must contain exactly
 `min(bad_cases_per_benchmark, incorrect_count)` bad cases. This distinguishes a nearly
 perfect model with fewer available failures from an incomplete collector. DataFlow Evolver
 never truncates question, model output, or correct answer text before giving it to
@@ -111,7 +130,9 @@ workspace/runs/<run_name>/downstream_eval/checkpoint_NNN/
 
 Validated records are also appended to `downstream_evaluations.jsonl` and included in
 `manifest.json`. From the second successful checkpoint onward, the framework records and
-prompts with per-benchmark score deltas against the previous successful checkpoint. A
+prompts with per-benchmark score deltas against the previous successful checkpoint. When
+a baseline exists, every periodic result also records deltas against the untrained
+baseline. A
 timeout, non-zero exit, missing file, malformed JSON, or contract
 violation becomes a structured failed evaluation. The static incumbent remains valid and
 evolution continues; the prompt explicitly identifies the signal as unavailable instead
@@ -124,5 +145,14 @@ or hard-coding them into generated training data. Even with that guard, repeated
 the final test split for adaptive pipeline evolution is benchmark leakage at the system
 selection level. For a defensible experiment, use fixed development/feedback splits at
 periodic checkpoints and run untouched final splits only once after evolution. If the
-same split is intentionally used for both, report it as an optimization-set result rather
-than an unbiased final evaluation.
+same split is intentionally used for both, the full-set score may be reported only as a
+diagnostic-inclusive secondary result, not as an unbiased held-out result. Exact or
+semantic decontamination of generated SFT records does not remove this adaptive model-
+selection leakage.
+
+Metrics may differ by benchmark. For example, an external runner may use greedy accuracy
+for one task and pass@k for another. DataFlow Evolver preserves each returned `metric`
+name and score without forcing a global decoding policy. The external configuration must
+define what `incorrect_count` means under that metric and must retain one deterministically
+selected, complete failed trajectory per bad case rather than concatenating every sampled
+output into the PipelineAgent prompt.

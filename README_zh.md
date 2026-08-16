@@ -169,6 +169,8 @@ downstream_eval:
     - /opt/conda/envs/downstream/bin/python
     - /absolute/path/to/run_sft_and_eval.py
   benchmarks: [gsm8k, math, math500, aime]
+  baseline:
+    enabled: true  # 第 0 轮仅评测未训练模型，不执行 SFT
   bad_cases_per_benchmark: 3  # 上限；实际错误少于 3 时允许返回更少
   timeout_sec: 86400
 ```
