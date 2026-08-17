@@ -95,3 +95,28 @@ def test_pipeline_prompt_uses_fixed_input_path_and_forbids_external_data(tmp_pat
     assert "fixed raw" in prompt or "固定语料" in prompt
     assert "不允许联网拉取外部数据" in prompt
     assert "photosynthesis" in prompt
+
+
+def test_pipeline_prompt_allows_only_validated_prefix_cache_reuse(tmp_path):
+    source = _write_jsonl(tmp_path / "data.jsonl", [{"text": "algebra"}])
+    corpus = input_corpus.discover(source)
+    parent_code = 'CACHE_PATH = "/workspace/runs/run/iteration_001/cache"'
+
+    prompt = build_pipeline_prompt(
+        PROFILE,
+        corpus,
+        "run/iteration_002",
+        parent_code=parent_code,
+    )
+
+    assert "连续前缀中间 JSONL" in prompt
+    assert "源码、初始化参数、`run()` 参数、字段流" in prompt
+    assert "模型、prompt 和 serving" in prompt
+    assert "父轮对应 step JSONL 存在且可解析" in prompt
+    assert "从 raw input 完整执行的 fallback" in prompt
+    assert "该步及其所有下游步骤都必须重算" in prompt
+    assert "不要仅因为类名相同就认定算子等价" in prompt
+    assert "suffix storage" in prompt
+    assert "first_entry_file_name" in prompt
+    assert "不能再次调用已复用的前缀算子" in prompt
+    assert "DF_PREFIX_CACHE_REUSE hit|miss" in prompt

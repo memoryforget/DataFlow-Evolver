@@ -335,7 +335,7 @@ class LazyFileStorage(DataFlowStorage):
             else:
                 raise ValueError(f"Unsupported data type: {type(data[0]) if data else 'empty list'}")
         elif isinstance(data, pd.DataFrame):
-            dataframe = data.applymap(clean_surrogates)
+            dataframe = data.map(clean_surrogates)
         else:
             raise ValueError(f"Unsupported data type: {type(data)}")
 

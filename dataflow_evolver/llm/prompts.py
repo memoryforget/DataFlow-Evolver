@@ -38,6 +38,17 @@ Entry file: {entry_path}
    `if os.environ.get('DF_COMPILE_ONLY'): sys.exit(0)` → `pipeline.forward()` 排列。只写入所需产物，
    不要自行执行 `pipeline.py`（包括 compile-only 或 smoke test）；框架会在 Agent 返回后依次执行
    确定性的 artifact 校验、compile 预检和正式运行。
+9. 从上一轮流水线演化时，优先复用可证明完全未变化的连续前缀中间 JSONL，避免重复执行昂贵
+   的确定性算子或 LLM 算子。只有同时满足以下条件才允许复用：raw Entry file 及其内容未变；
+   前缀中每个算子的源码、初始化参数、`run()` 参数、字段流，以及所用模型、prompt 和 serving
+   参数均未变；父轮对应 step JSONL 存在且可解析。任一条件无法确认时必须从 raw input 重算。
+   复用实现必须保留从 raw input 完整执行的 fallback，不能让最终 Pipeline 永久依赖父轮目录；
+   也不能把父轮最终数据伪装成新的 raw input。请在 `decision.json.reason` 中记录复用截止 step、
+   父轮缓存路径、验证条件与 fallback。缓存命中时，必须用父轮该 step JSONL 作为 suffix storage
+   的 `first_entry_file_name`，并且只调用变化步骤及其下游算子，不能再次调用已复用的前缀算子；
+   缓存未命中时则从 raw input 执行完整 Pipeline。两条分支都要打印一行
+   `DF_PREFIX_CACHE_REUSE hit|miss cutoff=<step> source=<path>`，使框架日志可以审计是否真正跳过。
+   只要某一步发生变化，该步及其所有下游步骤都必须重算。
 
 {recommendation_block}{init_block}{parent_block}{review_block}{downstream_block}{history_block}
 约束：无头自动化运行，禁止 AskUserQuestion 与 git/gh 子流程。MCP 仅用于查看 DataFlow 算子源码，
@@ -206,6 +217,11 @@ def _parent_block(code: str | None, rationale: str | None) -> str:
         )
     if rationale:
         lines.append(f"上一轮设计理由：{rationale}")
+    if code:
+        lines.append(
+            "上一轮代码中的绝对 cache_path 可用于定位该轮逐步 JSONL。先比较连续前缀，再决定"
+            "是否启用上面的受约束缓存复用；不要仅因为类名相同就认定算子等价。"
+        )
     return "\n".join(lines) + "\n"
 
 
