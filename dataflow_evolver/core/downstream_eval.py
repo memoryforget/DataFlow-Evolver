@@ -34,14 +34,15 @@ class DownstreamEvaluationRequest:
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        payload["protocol_version"] = 2
+        payload["protocol_version"] = 3
         return payload
 
 
 @dataclass(frozen=True)
 class DownstreamBadCase:
     question: str
-    model_output: str
+    model_response: str
+    parsed_answer: str
     correct_answer: str
 
 
@@ -298,8 +299,11 @@ def _validate_bad_case(name: str, index: int, raw: Any) -> DownstreamBadCase:
         raise ValueError(f"{name}.bad_cases[{index}] must be a JSON object")
     return DownstreamBadCase(
         question=_nonempty_string(raw.get("question"), f"{name}.bad_cases[{index}].question"),
-        model_output=_nonempty_string(
-            raw.get("model_output"), f"{name}.bad_cases[{index}].model_output"
+        model_response=_nonempty_string(
+            raw.get("model_response"), f"{name}.bad_cases[{index}].model_response"
+        ),
+        parsed_answer=_string(
+            raw.get("parsed_answer"), f"{name}.bad_cases[{index}].parsed_answer"
         ),
         correct_answer=_nonempty_string(
             raw.get("correct_answer"), f"{name}.bad_cases[{index}].correct_answer"
@@ -310,6 +314,12 @@ def _validate_bad_case(name: str, index: int, raw: Any) -> DownstreamBadCase:
 def _nonempty_string(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
+    return value
+
+
+def _string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
     return value
 
 

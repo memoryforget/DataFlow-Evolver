@@ -48,7 +48,8 @@ args = parser.parse_args()
 request = json.loads(Path(args.request).read_text(encoding='utf-8'))
 assert request['checkpoint_iteration'] == 3
 cases = [
-    {{'question': f'question {{i}}', 'model_output': f'wrong output {{i}}',
+    {{'question': f'question {{i}}', 'model_response': f'wrong output {{i}}',
+      'parsed_answer': f'wrong parsed answer {{i}}',
       'correct_answer': f'answer {{i}}'}}
     for i in range({bad_case_count})
 ]
@@ -83,12 +84,15 @@ def test_command_evaluator_uses_json_protocol_and_validates_results(tmp_path):
     assert result.succeeded
     assert result.model == "Qwen2.5-4B-Base"
     assert result.benchmarks["gsm8k"].score == 0.61
+    assert result.benchmarks["gsm8k"].bad_cases[0].parsed_answer == (
+        "wrong parsed answer 0"
+    )
     assert len(result.benchmarks["math500"].bad_cases) == 3
     assert Path(result.request_path).is_file()
     assert Path(result.result_path).is_file()
     assert (tmp_path / "checkpoint_003/stdout.log").is_file()
     request = json.loads(Path(result.request_path).read_text(encoding="utf-8"))
-    assert request["protocol_version"] == 2
+    assert request["protocol_version"] == 3
     assert request["stage"] == "periodic"
     assert request["training_performed"] is True
     assert request["dataset_path"].endswith("candidate.jsonl")
@@ -141,7 +145,7 @@ def test_baseline_request_is_eval_only_and_has_no_candidate_paths(tmp_path):
 
     payload = request.to_dict()
 
-    assert payload["protocol_version"] == 2
+    assert payload["protocol_version"] == 3
     assert payload["checkpoint_iteration"] == 0
     assert payload["training_performed"] is False
     assert payload["dataset_path"] is None
@@ -164,7 +168,8 @@ def test_prompt_keeps_complete_bad_cases_and_marks_them_as_diagnostics():
                 bad_cases=[
                     DownstreamBadCase(
                         question=f"question {index}",
-                        model_output=full_output,
+                        model_response=full_output,
+                        parsed_answer=f"parsed {index}",
                         correct_answer=f"answer {index}",
                     )
                     for index in range(3)
@@ -177,7 +182,8 @@ def test_prompt_keeps_complete_bad_cases_and_marks_them_as_diagnostics():
 
     assert full_output in prompt
     assert "gsm8k: accuracy=0.500000" in prompt
-    assert prompt.count("Model output:") == 3
+    assert prompt.count("Model response:") == 3
+    assert prompt.count("Parsed answer:") == 3
     assert "不是可复制进训练数据的新数据源" in prompt
 
 

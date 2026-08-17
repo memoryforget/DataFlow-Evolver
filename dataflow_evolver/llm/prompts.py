@@ -329,15 +329,17 @@ def _downstream_feedback_block(
             f"incorrect_count={benchmark.incorrect_count}"
         )
         for index, case in enumerate(benchmark.bad_cases, start=1):
-            # Deliberately do not truncate any of the three fields.  The external
+            # Deliberately do not truncate any of the four fields.  The external
             # result contract limits the number of cases instead of clipping evidence.
             lines.extend(
                 [
                     f"Bad case {index}",
                     "Question:",
                     case.question,
-                    "Model output:",
-                    case.model_output,
+                    "Model response:",
+                    case.model_response,
+                    "Parsed answer:",
+                    case.parsed_answer or "[empty; evaluator extracted no answer]",
                     "Correct answer:",
                     case.correct_answer,
                 ]

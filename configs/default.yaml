@@ -80,7 +80,7 @@ agent:
 
 loop:
   # Total number of linear Pipeline -> Review iterations.
-  max_iterations: ${DF_MAX_ITERATIONS:4}
+  max_iterations: ${DF_MAX_ITERATIONS:5}
   # Deterministic framework-owned preflight; the Agent never executes pipeline.py itself.
   compile_timeout_sec: ${DF_COMPILE_TIMEOUT_SEC:120}
   execution_timeout_sec: ${DF_EXECUTION_TIMEOUT_SEC:1200}
@@ -91,9 +91,10 @@ loop:
 # Optional process-isolated SFT/evaluation feedback. After every N static Review
 # iterations, the framework evaluates the current best-so-far dataset. The command
 # runs in its own environment and receives appended `--request` and `--result` paths.
+# With the default five iterations, interval=2 creates checkpoints after iterations 2 and 4.
 downstream_eval:
   enabled: ${DF_DOWNSTREAM_EVAL_ENABLED:false}
-  interval: ${DF_DOWNSTREAM_EVAL_INTERVAL:3}
+  interval: ${DF_DOWNSTREAM_EVAL_INTERVAL:2}
   command: []
   benchmarks: []
   # Optional checkpoint 0: evaluate the untrained downstream model before the

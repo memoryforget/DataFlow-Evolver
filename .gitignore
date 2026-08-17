@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+build/
 .pytest_cache/
 .env
 
@@ -11,6 +12,10 @@ input/*
 logs/
 hf_cache/
 artifacts/
+downstream_runtime/
+configs/downstream_math_runtime.local.yaml
+scripts/downstream/vendor/qwen25_math/latex2sympy/gen/*.interp
+scripts/downstream/vendor/qwen25_math/latex2sympy/gen/*.tokens
 
 # Local experiment records and one-off comparison assets.
 archive/

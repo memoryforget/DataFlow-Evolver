@@ -79,7 +79,7 @@ export DF_API_URL=https://api.example/v1/chat/completions
 export DF_API_KEY=...
 export DF_API_MAX_WORKERS=10
 export DF_RUN_NAME=experiment_001
-export DF_MAX_ITERATIONS=4
+export DF_MAX_ITERATIONS=5
 export DF_EXECUTION_REPAIRS=1
 export DF_COMPILE_TIMEOUT_SEC=120
 export DF_AGENT_PYTHON="$(command -v python)"
@@ -194,7 +194,7 @@ dependencies are installed in DataFlow Evolver.
 ```yaml
 downstream_eval:
   enabled: true
-  interval: 3
+  interval: 2
   command:
     - /opt/conda/envs/downstream/bin/python
     - /absolute/path/to/run_sft_and_eval.py

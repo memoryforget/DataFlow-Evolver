@@ -10,10 +10,14 @@ checkpoint 0 -> evaluate the untrained downstream model on the fixed diagnostic 
              -> PipelineAgent receives baseline scores and bad cases
 iteration 1 -> static Review -> incumbent update
 iteration 2 -> static Review -> incumbent update
-iteration 3 -> static Review -> incumbent update
             -> external SFT + benchmark evaluation of that incumbent
             -> validated scores and complete bad cases
-iteration 4 -> PipelineAgent receives static Review + downstream feedback
+iteration 3 -> PipelineAgent receives static Review + downstream feedback
+            -> static Review -> incumbent update
+iteration 4 -> static Review -> incumbent update
+            -> external SFT + benchmark evaluation of that incumbent
+iteration 5 -> PipelineAgent receives the latest downstream feedback
+            -> final static Review and incumbent update
 ```
 
 The downstream score is diagnostic feedback. It does not replace static `review_score`
@@ -29,7 +33,7 @@ packages, and benchmark dependencies remain outside this project's environment.
 ```yaml
 downstream_eval:
   enabled: true
-  interval: 3
+  interval: 2
   command:
     - /opt/conda/envs/downstream/bin/python
     - /absolute/path/to/run_sft_and_eval.py
@@ -52,7 +56,7 @@ they are not copied into DataFlow Evolver's YAML.
 
 ## Request contract
 
-`request.json` contains protocol version 2, the checkpoint stage, task contract,
+`request.json` contains protocol version 3, the checkpoint stage, task contract,
 expected benchmark names, and required bad-case count.
 
 At checkpoint 0, `stage` is `baseline`, `training_performed` is false, and incumbent,
@@ -85,17 +89,20 @@ The command exits with code 0 and writes one JSON object to `result.json`:
       "bad_cases": [
         {
           "question": "complete benchmark question",
-          "model_output": "complete model output",
+          "model_response": "complete raw model response",
+          "parsed_answer": "answer extracted by the benchmark evaluator",
           "correct_answer": "complete reference answer"
         },
         {
           "question": "...",
-          "model_output": "...",
+          "model_response": "...",
+          "parsed_answer": "...",
           "correct_answer": "..."
         },
         {
           "question": "...",
-          "model_output": "...",
+          "model_response": "...",
+          "parsed_answer": "...",
           "correct_answer": "..."
         }
       ]
@@ -110,13 +117,17 @@ The command exits with code 0 and writes one JSON object to `result.json`:
 }
 ```
 
-Every configured benchmark must appear. `score` must be finite, `metric` and all bad-case
-fields must be non-empty strings, and `incorrect_count` must be a non-negative integer.
+Every configured benchmark must appear. `score` must be finite, `metric`, `question`,
+`model_response`, and `correct_answer` must be non-empty strings, and `incorrect_count`
+must be a non-negative integer. `parsed_answer` must be a string but may be empty when
+the benchmark evaluator could not extract an answer.
 Each benchmark is validated independently and must contain exactly
 `min(bad_cases_per_benchmark, incorrect_count)` bad cases. This distinguishes a nearly
 perfect model with fewer available failures from an incomplete collector. DataFlow Evolver
-never truncates question, model output, or correct answer text before giving it to
-PipelineAgent.
+never truncates question, raw model response, parsed answer, or correct answer text before
+giving it to PipelineAgent. The protocol intentionally omits a per-case `score` (every
+retained case is already incorrect) and `format_compliant` (the Qwen2.5-Math parser has no
+single format-compliance contract across benchmarks).
 
 Each checkpoint is auditable under:
 

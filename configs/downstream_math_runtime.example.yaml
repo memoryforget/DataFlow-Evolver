@@ -1,0 +1,74 @@
+# Copy this file into an ignored runtime directory and replace the path variables.
+base_model: $DFE_BASE_MODEL
+
+sft:
+  llamafactory_cli: $DFE_SFT_CONDA/bin/llamafactory-cli
+  cuda_visible_devices: 0,1,2,3,4,5,6,7
+  timeout_sec: 86400
+  user_field: instruction
+  assistant_field: output
+  fail_on_truncation: false
+  trainer:
+    deepspeed: $DFE_REPO/configs/deepspeed/ds_z2_config.json
+    template: qwen
+    cutoff_len: 4096
+    packing: false
+    preprocessing_num_workers: 16
+    dataloader_num_workers: 4
+    per_device_train_batch_size: 2
+    gradient_accumulation_steps: 4
+    learning_rate: 1.0e-5
+    num_train_epochs: 3.0
+    lr_scheduler_type: cosine
+    warmup_ratio: 0.1
+    bf16: true
+    tf32: true
+    flash_attn: sdpa
+    disable_gradient_checkpointing: false
+    optim: adamw_torch_fused
+    logging_steps: 1
+    save_strategy: "no"
+    save_only_model: true
+    plot_loss: true
+    overwrite_output_dir: true
+    report_to: none
+    seed: 42
+    data_seed: 42
+    ddp_timeout: 180000000
+
+evaluation:
+  python: $DFE_EVAL_CONDA/bin/python
+  diagnostic_manifest: $DFE_DIAGNOSTIC_ROOT/manifest.json
+  cuda_visible_devices: "0"
+  timeout_sec: 86400
+  groups:
+    - name: greedy_core
+      data_dir: $DFE_DIAGNOSTIC_ROOT/shared_data
+      benchmarks:
+        gsm8k: gsm8k
+        math: math
+        minerva_math: minerva_math
+        gaokao2024_mix: gaokao2024_mix
+        olympiadbench: olympiadbench
+      metric: accuracy
+      prompt_type: qwen25-math-cot
+      temperature: 0.0
+      top_p: 1.0
+      n_sampling: 1
+      max_tokens_per_call: 16384
+      seed: 0
+      apply_chat_template: false
+    - name: sampled_competition
+      data_dir: $DFE_DIAGNOSTIC_ROOT/shared_data
+      benchmarks:
+        amc23: amc23
+        aime24: aime24
+        aime25: aime25
+      metric: pass@32
+      prompt_type: qwen25-math-cot
+      temperature: 0.6
+      top_p: 1.0
+      n_sampling: 32
+      max_tokens_per_call: 16384
+      seed: 0
+      apply_chat_template: false

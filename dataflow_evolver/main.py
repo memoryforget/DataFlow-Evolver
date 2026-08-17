@@ -77,7 +77,7 @@ class ReviewOnlyLoop:
         max_iterations: int,
         execution_repairs: int = 1,
         downstream_evaluator: DownstreamEvaluatorABC | None = None,
-        downstream_interval: int = 3,
+        downstream_interval: int = 2,
     ) -> None:
         if max_iterations < 1:
             raise ValueError("loop.max_iterations 必须至少为 1（包含初始流水线）")
@@ -552,7 +552,7 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
         task=task,
         workspace=workspace,
         run_name=str(project.get("run_name", "run") or "run"),
-        max_iterations=int(loop_cfg.get("max_iterations", 4)),
+        max_iterations=int(loop_cfg.get("max_iterations", 5)),
         execution_repairs=int(loop_cfg.get("execution_repairs", 1)),
         downstream_evaluator=downstream_evaluator,
         downstream_interval=downstream_interval,
@@ -600,7 +600,7 @@ def _build_downstream_evaluator(
     value: Config,
 ) -> tuple[DownstreamEvaluatorABC | None, int]:
     """Build the optional process-isolated SFT/evaluation adapter."""
-    interval = int(value.get("interval", 3))
+    interval = int(value.get("interval", 2))
     if interval < 1:
         raise ValueError("downstream_eval.interval must be at least 1")
     if not _as_bool(value.get("enabled", False)):
