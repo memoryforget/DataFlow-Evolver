@@ -5,6 +5,7 @@ import os
 import subprocess
 import time
 from collections.abc import Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from statistics import median
 from typing import Any
@@ -308,7 +309,8 @@ def evaluate_model(
         raise RuntimeConfigError(f"vendored Qwen2.5-Math evaluator not found: {script}")
     python = _string(evaluation.get("python"), "evaluation.python")
     global_cuda = _string(
-        evaluation.get("cuda_visible_devices", "0"), "evaluation.cuda_visible_devices"
+        evaluation.get("cuda_visible_devices", "0"),
+        "evaluation.cuda_visible_devices",
     )
     timeout_sec = _positive_int(
         evaluation.get("timeout_sec", 86400), "evaluation.timeout_sec"
@@ -333,6 +335,36 @@ def evaluate_model(
         group_output = output_root / group_name
         group_output.mkdir(parents=True, exist_ok=True)
         parser_names = list(labels_to_parsers.values())
+        cuda_visible_devices = _string(
+            group_map.get("cuda_visible_devices", global_cuda),
+            f"{group_name}.cuda_visible_devices",
+        )
+        data_parallel_size = _positive_int(
+            group_map.get(
+                "data_parallel_size", evaluation.get("data_parallel_size", 1)
+            ),
+            f"{group_name}.data_parallel_size",
+        )
+        tensor_parallel_size = _positive_int(
+            group_map.get(
+                "tensor_parallel_size", evaluation.get("tensor_parallel_size", 1)
+            ),
+            f"{group_name}.tensor_parallel_size",
+        )
+        pipeline_parallel_size = _positive_int(
+            group_map.get(
+                "pipeline_parallel_size",
+                evaluation.get("pipeline_parallel_size", 1),
+            ),
+            f"{group_name}.pipeline_parallel_size",
+        )
+        visible_devices = _validate_evaluation_parallelism(
+            cuda_visible_devices,
+            data_parallel_size=data_parallel_size,
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+            field_name=f"{group_name}.cuda_visible_devices",
+        )
         argv = [
             python,
             str(script),
@@ -342,8 +374,6 @@ def evaluate_model(
             str(data_dir.resolve()),
             "--model_name_or_path",
             str(model_path.resolve()),
-            "--output_dir",
-            str(group_output.resolve()),
             "--prompt_type",
             _string(
                 group_map.get("prompt_type", "qwen25-math-cot"),
@@ -374,38 +404,79 @@ def evaluate_model(
                     f"{group_name}.max_tokens_per_call",
                 )
             ),
+            "--max_model_len",
+            str(
+                _positive_int(
+                    group_map.get("max_model_len", 32768),
+                    f"{group_name}.max_model_len",
+                )
+            ),
+            "--data_parallel_size",
+            str(data_parallel_size),
+            "--tensor_parallel_size",
+            str(tensor_parallel_size),
+            "--pipeline_parallel_size",
+            str(pipeline_parallel_size),
             "--use_vllm",
             "--save_outputs",
             "--overwrite",
         ]
         if bool(group_map.get("apply_chat_template", False)):
             argv.append("--apply_chat_template")
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = _string(
-            group_map.get("cuda_visible_devices", global_cuda),
-            f"{group_name}.cuda_visible_devices",
-        )
-        env["TOKENIZERS_PARALLELISM"] = "false"
-        run_logged(
-            argv,
-            cwd=evaluation_root,
-            env=env,
-            stdout_path=group_output / "stdout.log",
-            stderr_path=group_output / "stderr.log",
-            timeout_sec=timeout_sec,
-        )
+        devices_per_replica = tensor_parallel_size * pipeline_parallel_size
+        shard_outputs: list[Path] = []
+        with ThreadPoolExecutor(max_workers=data_parallel_size) as executor:
+            futures = []
+            for rank in range(data_parallel_size):
+                shard_output = group_output / f"shard_{rank:03d}"
+                shard_output.mkdir(parents=True, exist_ok=True)
+                shard_outputs.append(shard_output)
+                start = rank * devices_per_replica
+                rank_devices = visible_devices[start : start + devices_per_replica]
+                rank_env = os.environ.copy()
+                rank_env["CUDA_VISIBLE_DEVICES"] = ",".join(rank_devices)
+                rank_env["TOKENIZERS_PARALLELISM"] = "false"
+                rank_argv = [
+                    *argv,
+                    "--output_dir",
+                    str(shard_output.resolve()),
+                    "--data_parallel_rank",
+                    str(rank),
+                ]
+                futures.append(
+                    executor.submit(
+                        run_logged,
+                        rank_argv,
+                        cwd=evaluation_root,
+                        env=rank_env,
+                        stdout_path=shard_output / "stdout.log",
+                        stderr_path=shard_output / "stderr.log",
+                        timeout_sec=timeout_sec,
+                    )
+                )
+            for future in futures:
+                future.result()
         metric = _string(group_map.get("metric", "accuracy"), f"{group_name}.metric")
         n_sampling = _positive_int(
             group_map.get("n_sampling", 1), f"{group_name}.n_sampling"
         )
         for label, parser_name in labels_to_parsers.items():
-            records_path = _single_output_jsonl(group_output / parser_name)
+            records_path = group_output / parser_name / "merged.jsonl"
+            _merge_evaluation_shards(
+                shard_outputs,
+                parser_name=parser_name,
+                destination=records_path,
+            )
             records = _read_jsonl(records_path)
             results[label] = summarize_qwen_records(
                 records,
                 metric=metric,
                 n_sampling=n_sampling,
                 bad_cases_per_benchmark=bad_cases_per_benchmark,
+                max_tokens_per_call=_positive_int(
+                    group_map.get("max_tokens_per_call", 16384),
+                    f"{group_name}.max_tokens_per_call",
+                ),
             )
 
     return {label: results[label] for label in expected}, {
@@ -430,15 +501,18 @@ def summarize_qwen_records(
     metric: str,
     n_sampling: int,
     bad_cases_per_benchmark: int,
+    max_tokens_per_call: int = 16384,
 ) -> dict[str, Any]:
     if not records:
         raise RuntimeConfigError("Qwen evaluator produced an empty result file")
     correctness: list[bool] = []
-    failures: list[dict[str, str]] = []
+    failures: list[dict[str, Any]] = []
     for index, record in enumerate(records):
         scores = record.get("score")
         outputs = record.get("code")
         parsed_answers = record.get("pred")
+        finish_reasons = record.get("finish_reason")
+        output_token_counts = record.get("output_token_count")
         if not isinstance(scores, list) or len(scores) != n_sampling:
             raise RuntimeConfigError(
                 f"Qwen result {index} has {len(scores) if isinstance(scores, list) else 'invalid'} "
@@ -451,6 +525,18 @@ def summarize_qwen_records(
         if not isinstance(parsed_answers, list) or len(parsed_answers) != n_sampling:
             raise RuntimeConfigError(
                 f"Qwen result {index} has invalid parsed answers"
+            )
+        if finish_reasons is None:
+            finish_reasons = [""] * n_sampling
+        if not isinstance(finish_reasons, list) or len(finish_reasons) != n_sampling:
+            raise RuntimeConfigError(
+                f"Qwen result {index} has invalid finish reasons"
+            )
+        if output_token_counts is None:
+            output_token_counts = [None] * n_sampling
+        if not isinstance(output_token_counts, list) or len(output_token_counts) != n_sampling:
+            raise RuntimeConfigError(
+                f"Qwen result {index} has invalid output token counts"
             )
         if metric == "accuracy":
             correct = bool(scores[0])
@@ -470,12 +556,24 @@ def summarize_qwen_records(
             parsed_answer = _render_text(
                 parsed_answers[0], "parsed answer", empty_sentinel=""
             )
+            finish_reason = str(finish_reasons[0] or "")
+            raw_token_count = output_token_counts[0]
+            response_token_count = (
+                int(raw_token_count) if raw_token_count is not None else None
+            )
+            length_truncated = finish_reason == "length" or (
+                response_token_count is not None
+                and response_token_count >= max_tokens_per_call - 1
+            )
             failures.append(
                 {
                     "question": question,
                     "model_response": response,
                     "parsed_answer": parsed_answer,
                     "correct_answer": reference,
+                    "response_token_count": response_token_count,
+                    "finish_reason": finish_reason,
+                    "length_truncated": length_truncated,
                 }
             )
     score = sum(correctness) / len(correctness)
@@ -546,6 +644,19 @@ def _single_output_jsonl(directory: Path) -> Path:
     return candidates[0]
 
 
+def _merge_evaluation_shards(
+    shard_outputs: Iterable[Path], *, parser_name: str, destination: Path
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("w", encoding="utf-8", newline="\n") as output_handle:
+        for shard_output in shard_outputs:
+            shard_path = _single_output_jsonl(shard_output / parser_name)
+            with shard_path.open(encoding="utf-8") as input_handle:
+                for line in input_handle:
+                    if line.strip():
+                        output_handle.write(line.rstrip("\n") + "\n")
+
+
 def _percentile(ordered: list[int], quantile: float) -> float:
     if len(ordered) == 1:
         return float(ordered[0])
@@ -565,6 +676,31 @@ def _prepend_executable_dir(env: dict[str, str], executable: str) -> None:
         if current_path
         else executable_dir
     )
+
+
+def _validate_evaluation_parallelism(
+    cuda_visible_devices: str,
+    *,
+    data_parallel_size: int,
+    tensor_parallel_size: int,
+    pipeline_parallel_size: int,
+    field_name: str,
+) -> list[str]:
+    devices = [device.strip() for device in cuda_visible_devices.split(",")]
+    if any(not device for device in devices):
+        raise RuntimeConfigError(f"{field_name} contains an empty GPU identifier")
+    if len(set(devices)) != len(devices):
+        raise RuntimeConfigError(f"{field_name} contains duplicate GPU identifiers")
+    required = (
+        data_parallel_size * tensor_parallel_size * pipeline_parallel_size
+    )
+    if len(devices) != required:
+        raise RuntimeConfigError(
+            f"{field_name} exposes {len(devices)} GPUs, but evaluation parallelism "
+            f"requires data_parallel_size * tensor_parallel_size * "
+            f"pipeline_parallel_size = {required}"
+        )
+    return devices
 
 
 def _expand_environment(value: Any) -> Any:

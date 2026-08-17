@@ -34,6 +34,7 @@ def parse_args():
     parser.add_argument("--n_sampling", default=1, type=int)
     parser.add_argument("--top_p", default=1, type=float)
     parser.add_argument("--max_tokens_per_call", default=2048, type=int)
+    parser.add_argument("--max_model_len", default=32768, type=int)
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--use_vllm", action="store_true")
     parser.add_argument("--save_outputs", action="store_true")
@@ -46,6 +47,9 @@ def parse_args():
         help="Apply chat template to prompt.",
     )
     parser.add_argument("--pipeline_parallel_size", type=int, default=1)
+    parser.add_argument("--tensor_parallel_size", type=int, default=1)
+    parser.add_argument("--data_parallel_size", type=int, default=1)
+    parser.add_argument("--data_parallel_rank", type=int, default=0)
     parser.add_argument(
         "--adapt_few_shot",
         action="store_true",
@@ -73,6 +77,17 @@ def prepare_data(data_name, args):
 
     # select start and end
     examples = examples[args.start : len(examples) if args.end == -1 else args.end]
+
+    # Split the selected examples into contiguous shards. Contiguous ranges let the
+    # parent process restore the original order by concatenating rank outputs.
+    if not 0 <= args.data_parallel_rank < args.data_parallel_size:
+        raise ValueError(
+            f"invalid data-parallel rank {args.data_parallel_rank} for "
+            f"size {args.data_parallel_size}"
+        )
+    shard_start = len(examples) * args.data_parallel_rank // args.data_parallel_size
+    shard_end = len(examples) * (args.data_parallel_rank + 1) // args.data_parallel_size
+    examples = examples[shard_start:shard_end]
 
     # get out_file name
     dt_string = datetime.now().strftime("%m-%d_%H-%M")
@@ -107,14 +122,28 @@ def prepare_data(data_name, args):
 
 def setup(args):
     # load model
-    available_gpus = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+    available_gpus = [
+        device.strip()
+        for device in os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+        if device.strip()
+    ]
     if args.use_vllm:
+        required_gpus = (
+            args.tensor_parallel_size * args.pipeline_parallel_size
+        )
+        if len(available_gpus) != required_gpus:
+            raise ValueError(
+                f"CUDA_VISIBLE_DEVICES exposes {len(available_gpus)} GPUs, but "
+                f"TP={args.tensor_parallel_size}, PP={args.pipeline_parallel_size} "
+                f"requires {required_gpus} per data-parallel worker"
+            )
         llm = LLM(
             model=args.model_name_or_path,
-            tensor_parallel_size=len(available_gpus) // args.pipeline_parallel_size,
+            tensor_parallel_size=args.tensor_parallel_size,
             pipeline_parallel_size=args.pipeline_parallel_size,
             trust_remote_code=True,
             seed=args.seed,
+            max_model_len=args.max_model_len,
         )
         tokenizer = None
         if args.apply_chat_template:
@@ -213,6 +242,24 @@ def main(llm, tokenizer, data_name, args):
                 sample[key] = example[key]
         samples.append(sample)
 
+    if not samples and not processed_samples:
+        result_json = {
+            "num_samples": 0,
+            "num_scores": 0,
+            "timeout_samples": 0,
+            "empty_samples": 0,
+            "acc": 0.0,
+            "time_use_in_second": 0.0,
+            "time_use_in_minite": "0:00",
+        }
+        if args.save_outputs:
+            save_jsonl([], out_file)
+        with open(
+            out_file.replace(".jsonl", f"_{args.prompt_type}_metrics.json"), "w"
+        ) as f:
+            json.dump(result_json, f, indent=4)
+        return result_json
+
     # repeat n times
     input_prompts = [
         sample["prompt"] for sample in samples for _ in range(args.n_sampling)
@@ -228,6 +275,8 @@ def main(llm, tokenizer, data_name, args):
         ]
     remain_prompts = input_prompts
     remain_prompts = [(i, prompt) for i, prompt in enumerate(remain_prompts)]
+    finish_reasons = [""] * len(input_prompts)
+    output_token_counts = [0] * len(input_prompts)
     end_prompts = []
 
     max_func_call = 1 if args.prompt_type in ["cot", "pal"] else 4
@@ -278,6 +327,13 @@ def main(llm, tokenizer, data_name, args):
             outputs = sorted(
                 outputs, key=lambda x: int(x.request_id)
             )  # sort outputs by request_id
+            output_metadata = [
+                (
+                    str(output.outputs[0].finish_reason or ""),
+                    len(output.outputs[0].token_ids or []),
+                )
+                for output in outputs
+            ]
             outputs = [output.outputs[0].text for output in outputs]
         else:
             outputs = generate_completions(
@@ -288,13 +344,19 @@ def main(llm, tokenizer, data_name, args):
                 batch_size=16,
                 stop_id_sequences=stop_words,
             )
+            output_metadata = [("", 0)] * len(outputs)
 
         assert len(outputs) == len(current_prompts)
 
         # process all outputs
         remain_prompts = []
         remain_codes = []
-        for (i, query), output in zip(current_prompts, outputs):
+        for (i, query), output, (finish_reason, output_token_count) in zip(
+            current_prompts, outputs, output_metadata
+        ):
+            if finish_reason:
+                finish_reasons[i] = finish_reason
+            output_token_counts[i] += output_token_count
             output = output.rstrip()
             query += output
             if args.prompt_type == "pal":
@@ -354,6 +416,12 @@ def main(llm, tokenizer, data_name, args):
     for i, sample in enumerate(samples):
         code = codes[i * args.n_sampling : (i + 1) * args.n_sampling]
         result = results[i * args.n_sampling : (i + 1) * args.n_sampling]
+        sample_finish_reasons = finish_reasons[
+            i * args.n_sampling : (i + 1) * args.n_sampling
+        ]
+        sample_output_token_counts = output_token_counts[
+            i * args.n_sampling : (i + 1) * args.n_sampling
+        ]
         preds = [item[0] for item in result]
         reports = [item[1] for item in result]
         for j in range(len(preds)):
@@ -372,7 +440,15 @@ def main(llm, tokenizer, data_name, args):
                 )
 
         sample.pop("prompt")
-        sample.update({"code": code, "pred": preds, "report": reports})
+        sample.update(
+            {
+                "code": code,
+                "pred": preds,
+                "report": reports,
+                "finish_reason": sample_finish_reasons,
+                "output_token_count": sample_output_token_counts,
+            }
+        )
         all_samples.append(sample)
 
     # add processed samples

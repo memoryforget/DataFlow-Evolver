@@ -124,8 +124,13 @@ the benchmark evaluator could not extract an answer.
 Each benchmark is validated independently and must contain exactly
 `min(bad_cases_per_benchmark, incorrect_count)` bad cases. This distinguishes a nearly
 perfect model with fewer available failures from an incomplete collector. DataFlow Evolver
-never truncates question, raw model response, parsed answer, or correct answer text before
-giving it to PipelineAgent. The protocol intentionally omits a per-case `score` (every
+never truncates question, raw model response, parsed answer, or correct answer in the
+auditable `result.json`. To keep Agent context bounded, the prompt contains response
+length/termination metadata plus deterministic head/tail excerpts and the full result
+path; PipelineAgent can read the complete response from that file when needed. Runners
+may additionally return `response_token_count`, `finish_reason`, and
+`length_truncated`; these fields identify outputs that exhausted the generation budget
+without clipping the retained evidence. The protocol intentionally omits a per-case `score` (every
 retained case is already incorrect) and `format_compliant` (the Qwen2.5-Math parser has no
 single format-compliance contract across benchmarks).
 

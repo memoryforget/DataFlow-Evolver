@@ -152,13 +152,14 @@ def test_baseline_request_is_eval_only_and_has_no_candidate_paths(tmp_path):
     assert payload["pipeline_path"] is None
 
 
-def test_prompt_keeps_complete_bad_cases_and_marks_them_as_diagnostics():
-    full_output = "reasoning line 1\n" + ("very long reasoning; " * 100) + "\nfinal"
+def test_prompt_projects_long_bad_cases_and_links_complete_evidence():
+    full_output = "BEGIN-REASONING\n" + ("very long reasoning; " * 1000) + "\nFINAL-ANSWER"
     result = DownstreamEvaluationResult(
         status="ok",
         checkpoint_iteration=3,
         incumbent_iteration=2,
         dataset_path="/run/iteration_002/output.jsonl",
+        result_path="/run/downstream_eval/checkpoint_003/result.json",
         model="Qwen2.5-4B-Base",
         benchmarks={
             "gsm8k": DownstreamBenchmarkResult(
@@ -171,6 +172,9 @@ def test_prompt_keeps_complete_bad_cases_and_marks_them_as_diagnostics():
                         model_response=full_output,
                         parsed_answer=f"parsed {index}",
                         correct_answer=f"answer {index}",
+                        response_token_count=16383,
+                        finish_reason="length",
+                        length_truncated=True,
                     )
                     for index in range(3)
                 ],
@@ -180,9 +184,17 @@ def test_prompt_keeps_complete_bad_cases_and_marks_them_as_diagnostics():
 
     prompt = _downstream_feedback_block(result)
 
-    assert full_output in prompt
+    assert full_output not in prompt
+    assert "BEGIN-REASONING" in prompt
+    assert "FINAL-ANSWER" in prompt
+    assert "chars omitted from prompt" in prompt
+    assert "/run/downstream_eval/checkpoint_003/result.json" in prompt
+    assert "tokens=16383" in prompt
+    assert "length_truncated=true" in prompt
+    assert "possible_runaway_generation=true" in prompt
+    assert result.benchmarks["gsm8k"].bad_cases[0].model_response == full_output
     assert "gsm8k: accuracy=0.500000" in prompt
-    assert prompt.count("Model response:") == 3
+    assert prompt.count("Model response (bounded prompt projection):") == 3
     assert prompt.count("Parsed answer:") == 3
     assert "不是可复制进训练数据的新数据源" in prompt
 

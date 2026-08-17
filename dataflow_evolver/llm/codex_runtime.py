@@ -331,14 +331,17 @@ def _run_once_cli(
         ).strip()
         if developer:
             prompt = f"{developer}\n\n{prompt}"
-    args.append(prompt)
+    # Codex accepts ``-`` as an explicit request to read the prompt from stdin.
+    # Passing a large downstream-feedback prompt as one argv item can exceed
+    # Linux MAX_ARG_STRLEN before the Codex process is even started.
+    args.append("-")
 
     try:
         process = subprocess.Popen(
             args,
             cwd=cwd,
             env=env,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -353,7 +356,10 @@ def _run_once_cli(
             error_type=type(exc).__name__,
         )
     try:
-        stdout, stderr = process.communicate(timeout=timeout if timeout > 0 else None)
+        stdout, stderr = process.communicate(
+            input=prompt,
+            timeout=timeout if timeout > 0 else None,
+        )
         return result_from_codex_cli(
             stdout,
             stderr,

@@ -7,6 +7,10 @@ from dataflow_evolver.core.schemas import ReviewResult, TaskSpec
 from dataflow_evolver.llm.skill_paths import skill_root_for_backend
 
 
+_BAD_CASE_RESPONSE_HEAD_CHARS = 1200
+_BAD_CASE_RESPONSE_TAIL_CHARS = 1800
+
+
 PIPELINE_PROMPT = """为下述目标编写一条完整、可直接运行的 DataFlow 流水线（含自定义算子）。
 
 Target: {target}
@@ -313,6 +317,11 @@ def _downstream_feedback_block(
         checkpoint,
         "以下 bad cases 是诊断证据，不是可复制进训练数据的新数据源。禁止复述、硬编码或"
         "针对这些 benchmark 题目构造答案；应归纳能力缺口并改进 raw-data pipeline。",
+        (
+            "完整、未截断的下游证据保存在："
+            f"{feedback.result_path or '[external result path not provided]'}。"
+            "下面只提供有界首尾摘录；如需确认完整推理，使用文件工具读取该结果文件。"
+        ),
     ]
     for benchmark_name, benchmark in feedback.benchmarks.items():
         delta = feedback.score_deltas.get(benchmark_name)
@@ -329,15 +338,31 @@ def _downstream_feedback_block(
             f"incorrect_count={benchmark.incorrect_count}"
         )
         for index, case in enumerate(benchmark.bad_cases, start=1):
-            # Deliberately do not truncate any of the four fields.  The external
-            # result contract limits the number of cases instead of clipping evidence.
+            response_projection, omitted_chars = _project_bad_case_response(
+                case.model_response
+            )
+            token_count = (
+                str(case.response_token_count)
+                if case.response_token_count is not None
+                else "unknown"
+            )
+            finish_reason = case.finish_reason or "unknown"
+            runaway = "true" if case.length_truncated else "false"
             lines.extend(
                 [
                     f"Bad case {index}",
                     "Question:",
                     case.question,
-                    "Model response:",
-                    case.model_response,
+                    (
+                        "Response metadata: "
+                        f"chars={len(case.model_response)}, tokens={token_count}, "
+                        f"finish_reason={finish_reason}, "
+                        f"length_truncated={str(case.length_truncated).lower()}, "
+                        f"possible_runaway_generation={runaway}, "
+                        f"prompt_omitted_chars={omitted_chars}"
+                    ),
+                    "Model response (bounded prompt projection):",
+                    response_projection,
                     "Parsed answer:",
                     case.parsed_answer or "[empty; evaluator extracted no answer]",
                     "Correct answer:",
@@ -351,6 +376,23 @@ def _downstream_feedback_block(
         "并在 decision.json 的 reason 中说明哪些改动由该反馈触发。"
     )
     return "\n".join(lines) + "\n"
+
+
+def _project_bad_case_response(response: str) -> tuple[str, int]:
+    """Render bounded evidence while keeping the full response in result.json."""
+    limit = _BAD_CASE_RESPONSE_HEAD_CHARS + _BAD_CASE_RESPONSE_TAIL_CHARS
+    if len(response) <= limit:
+        return response, 0
+    omitted = len(response) - limit
+    marker = (
+        f"\n\n...[{omitted} chars omitted from prompt; read the full result file]...\n\n"
+    )
+    return (
+        response[:_BAD_CASE_RESPONSE_HEAD_CHARS]
+        + marker
+        + response[-_BAD_CASE_RESPONSE_TAIL_CHARS:],
+        omitted,
+    )
 
 
 def _recommendation_block(recommended: dict | None) -> str:

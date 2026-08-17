@@ -11,9 +11,13 @@ import yaml
 SCRIPT_ROOT = Path(__file__).resolve().parents[1] / "scripts/downstream"
 sys.path.insert(0, str(SCRIPT_ROOT))
 
+import math_runtime
 from math_runtime import (
     RuntimeConfigError,
+    _merge_evaluation_shards,
     _prepend_executable_dir,
+    _validate_evaluation_parallelism,
+    evaluate_model,
     load_request,
     normalize_sft_dataset,
     summarize_qwen_records,
@@ -91,8 +95,38 @@ def test_pass_at_k_and_bad_cases_are_computed_per_question() -> None:
             "model_response": "bad-a",
             "parsed_answer": "wrong-a",
             "correct_answer": "2",
+            "response_token_count": None,
+            "finish_reason": "",
+            "length_truncated": False,
         }
     ]
+
+
+def test_length_limited_generation_is_marked_without_clipping_response() -> None:
+    long_response = "reasoning " * 1000
+    result = summarize_qwen_records(
+        [
+            {
+                "question": "q",
+                "gt": "7",
+                "code": [long_response],
+                "pred": ["6"],
+                "score": [False],
+                "finish_reason": ["length"],
+                "output_token_count": [16383],
+            }
+        ],
+        metric="accuracy",
+        n_sampling=1,
+        bad_cases_per_benchmark=3,
+        max_tokens_per_call=16384,
+    )
+
+    bad_case = result["bad_cases"][0]
+    assert bad_case["model_response"] == long_response
+    assert bad_case["response_token_count"] == 16383
+    assert bad_case["finish_reason"] == "length"
+    assert bad_case["length_truncated"] is True
 
 
 def test_empty_failed_generation_is_explicit_not_silently_dropped() -> None:
@@ -139,6 +173,10 @@ def test_sampled_competitions_share_one_seeded_pass_at_32_group() -> None:
         / "configs/downstream_math_runtime.example.yaml"
     )
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["evaluation"]["cuda_visible_devices"] == "0,1,2,3"
+    assert config["evaluation"]["data_parallel_size"] == 4
+    assert config["evaluation"]["tensor_parallel_size"] == 1
+    assert config["evaluation"]["pipeline_parallel_size"] == 1
     groups = config["evaluation"]["groups"]
     sampled = next(group for group in groups if group["name"] == "sampled_competition")
 
@@ -150,6 +188,7 @@ def test_sampled_competitions_share_one_seeded_pass_at_32_group() -> None:
     assert sampled["metric"] == "pass@32"
     assert sampled["n_sampling"] == 32
     assert sampled["seed"] == 0
+    assert sampled["max_model_len"] == 32768
 
 
 def test_vendored_evaluator_forwards_seed_to_vllm() -> None:
@@ -157,3 +196,137 @@ def test_vendored_evaluator_forwards_seed_to_vllm() -> None:
     source = evaluator.read_text(encoding="utf-8")
 
     assert "seed=args.seed" in source
+    assert "max_model_len=args.max_model_len" in source
+    assert "--data_parallel_rank" in source
+    assert "examples[shard_start:shard_end]" in source
+    assert "data_parallel_size=args.data_parallel_size" not in source
+    assert '"num_samples": 0' in source
+    assert "tensor_parallel_size=args.tensor_parallel_size" in source
+    assert '"finish_reason"' in source
+    assert '"output_token_count"' in source
+
+
+def test_evaluation_parallelism_requires_exact_gpu_topology() -> None:
+    devices = _validate_evaluation_parallelism(
+        "0,1,2,3",
+        data_parallel_size=4,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        field_name="evaluation.cuda_visible_devices",
+    )
+    assert devices == ["0", "1", "2", "3"]
+
+    with pytest.raises(RuntimeConfigError, match="requires.*4"):
+        _validate_evaluation_parallelism(
+            "0,1,2",
+            data_parallel_size=4,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            field_name="evaluation.cuda_visible_devices",
+        )
+
+
+def test_evaluation_shards_merge_in_rank_order(tmp_path: Path) -> None:
+    shards = []
+    for rank, records in enumerate(
+        ([{"idx": 0}, {"idx": 1}], [{"idx": 2}], [{"idx": 3}, {"idx": 4}])
+    ):
+        shard = tmp_path / f"shard_{rank:03d}"
+        benchmark = shard / "gsm8k"
+        benchmark.mkdir(parents=True)
+        (benchmark / "part.jsonl").write_text(
+            "".join(json.dumps(record) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        shards.append(shard)
+
+    destination = tmp_path / "merged/gsm8k.jsonl"
+    _merge_evaluation_shards(
+        shards, parser_name="gsm8k", destination=destination
+    )
+
+    assert [json.loads(line)["idx"] for line in destination.read_text().splitlines()] == [
+        0,
+        1,
+        2,
+        3,
+        4,
+    ]
+
+
+def test_evaluate_model_runs_four_single_gpu_workers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    config_path = tmp_path / "runtime.yaml"
+    config_path.touch()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.touch()
+    calls: list[tuple[int, str, list[str]]] = []
+
+    def fake_run_logged(argv: list[str], **kwargs: object) -> float:
+        rank = int(argv[argv.index("--data_parallel_rank") + 1])
+        output_dir = Path(argv[argv.index("--output_dir") + 1]) / "gsm8k"
+        output_dir.mkdir(parents=True)
+        (output_dir / "part.jsonl").write_text(
+            json.dumps(
+                {
+                    "idx": rank,
+                    "question": f"q{rank}",
+                    "gt": str(rank),
+                    "code": [str(rank)],
+                    "pred": [str(rank)],
+                    "score": [True],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        env = kwargs["env"]
+        assert isinstance(env, dict)
+        calls.append((rank, env["CUDA_VISIBLE_DEVICES"], argv))
+        return 0.0
+
+    monkeypatch.setattr(math_runtime, "run_logged", fake_run_logged)
+    config = {
+        "config_path": str(config_path),
+        "evaluation": {
+            "python": "python",
+            "diagnostic_manifest": str(manifest_path),
+            "cuda_visible_devices": "0,1,2,3",
+            "data_parallel_size": 4,
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "groups": [
+                {
+                    "name": "core",
+                    "data_dir": str(data_dir),
+                    "benchmarks": {"gsm8k": "gsm8k"},
+                    "metric": "accuracy",
+                    "n_sampling": 1,
+                }
+            ],
+        },
+    }
+
+    results, _ = evaluate_model(
+        tmp_path / "model",
+        ["gsm8k"],
+        3,
+        config,
+        tmp_path / "runtime",
+    )
+
+    assert results["gsm8k"]["score"] == 1.0
+    ordered_calls = sorted(calls)
+    assert [(rank, gpu) for rank, gpu, _ in ordered_calls] == [
+        (0, "0"),
+        (1, "1"),
+        (2, "2"),
+        (3, "3"),
+    ]
+    assert all(
+        argv[argv.index("--data_parallel_size") + 1] == "4"
+        for _, _, argv in ordered_calls
+    )

@@ -39,7 +39,11 @@ sft:
 evaluation:
   python: $DFE_EVAL_CONDA/bin/python
   diagnostic_manifest: $DFE_DIAGNOSTIC_ROOT/manifest.json
-  cuda_visible_devices: "0"
+  # Four independent 7B replicas. Keep GPU 7 free when it hosts DAS embeddings.
+  cuda_visible_devices: "0,1,2,3"
+  data_parallel_size: 4
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
   timeout_sec: 86400
   groups:
     - name: greedy_core
@@ -56,6 +60,7 @@ evaluation:
       top_p: 1.0
       n_sampling: 1
       max_tokens_per_call: 16384
+      max_model_len: 32768
       seed: 0
       apply_chat_template: false
     - name: sampled_competition
@@ -70,5 +75,6 @@ evaluation:
       top_p: 1.0
       n_sampling: 32
       max_tokens_per_call: 16384
+      max_model_len: 32768
       seed: 0
       apply_chat_template: false

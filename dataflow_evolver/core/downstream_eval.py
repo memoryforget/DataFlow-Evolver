@@ -44,6 +44,9 @@ class DownstreamBadCase:
     model_response: str
     parsed_answer: str
     correct_answer: str
+    response_token_count: int | None = None
+    finish_reason: str = ""
+    length_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -308,6 +311,17 @@ def _validate_bad_case(name: str, index: int, raw: Any) -> DownstreamBadCase:
         correct_answer=_nonempty_string(
             raw.get("correct_answer"), f"{name}.bad_cases[{index}].correct_answer"
         ),
+        response_token_count=_optional_nonnegative_int(
+            raw.get("response_token_count"),
+            f"{name}.bad_cases[{index}].response_token_count",
+        ),
+        finish_reason=_string(
+            raw.get("finish_reason", ""), f"{name}.bad_cases[{index}].finish_reason"
+        ),
+        length_truncated=_bool(
+            raw.get("length_truncated", False),
+            f"{name}.bad_cases[{index}].length_truncated",
+        ),
     )
 
 
@@ -320,6 +334,18 @@ def _nonempty_string(value: Any, field_name: str) -> str:
 def _string(value: Any, field_name: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field_name} must be a string")
+    return value
+
+
+def _optional_nonnegative_int(value: Any, field_name: str) -> int | None:
+    if value is None:
+        return None
+    return _nonnegative_int(value, field_name)
+
+
+def _bool(value: Any, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a boolean")
     return value
 
 

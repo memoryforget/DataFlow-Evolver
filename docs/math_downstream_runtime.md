@@ -73,9 +73,18 @@ in `UPSTREAM.md`; no external Qwen2.5-Math checkout is required at runtime.
 The suite contains GSM8K, MATH, AMC23, AIME24, AIME25, Minerva Math,
 Gaokao2024-Mix, and the Qwen OlympiadBench subset. Core benchmarks use deterministic
 greedy accuracy. Small competition sets use `pass@32` with temperature 0.6. Every group
-uses `max_tokens_per_call=16384`. The `qwen25-math-cot` prompt already contains Qwen
+uses `max_tokens_per_call=16384` and explicitly caps the vLLM context with
+`max_model_len=32768`. The `qwen25-math-cot` prompt already contains Qwen
 ChatML markers, so `apply_chat_template` is false; enabling it would double-wrap the
 prompt.
+
+For the 7B downstream model, evaluation defaults to four independent vLLM worker
+processes (`data_parallel_size=4`, `tensor_parallel_size=1`) on GPUs 0-3. Each process
+holds one complete model copy and evaluates a deterministic contiguous input shard; the
+runtime concatenates rank outputs back into source order. This avoids vLLM's unsupported
+single-process offline-DP path. The runtime validates that `cuda_visible_devices` contains exactly
+`data_parallel_size * tensor_parallel_size * pipeline_parallel_size` GPUs, so listing
+four devices cannot silently turn into tensor parallelism.
 
 ## Runtime configuration
 
@@ -115,4 +124,5 @@ remain ignored by Git.
 
 If an embedding server occupies one GPU during evolution, exclude that GPU from
 `sft.cuda_visible_devices`. The default example lists all eight GPUs and assumes they are
-free; the external runner does not stop or restart unrelated GPU services.
+free. Evaluation uses GPUs 0-3 by default and therefore leaves GPU 7 available for the
+embedding server. The external runner does not stop or restart unrelated GPU services.

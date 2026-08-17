@@ -120,7 +120,8 @@ def test_cli_runtime_uses_configured_binary_provider_and_session_home(
             captured["args"] = args
             captured["kwargs"] = kwargs
 
-        def communicate(self, timeout=None):
+        def communicate(self, input=None, timeout=None):
+            captured["stdin_prompt"] = input
             captured["timeout"] = timeout
             return (
                 "\n".join(
@@ -175,7 +176,9 @@ def test_cli_runtime_uses_configured_binary_provider_and_session_home(
     )
     assert "model_providers.openai-custom.supports_websockets=false" in args
     assert any(item.startswith("mcp_servers.dataflow-operators.command=") for item in args)
-    assert args[-1].startswith("developer guard\n\nwrite pipeline")
+    assert args[-1] == "-"
+    assert captured["stdin_prompt"].startswith("developer guard\n\nwrite pipeline")
+    assert captured["kwargs"]["stdin"] is runtime.subprocess.PIPE
     assert captured["kwargs"]["env"]["CODEX_API_KEY"] == "generic-key"
     assert captured["kwargs"]["env"]["OPENAI_API_KEY"] == "generic-key"
     assert captured["kwargs"]["env"]["CODEX_HOME"].endswith("sessions/codex")
@@ -214,7 +217,8 @@ def test_cli_runtime_bypass_sandbox_requires_explicit_opt_in(monkeypatch, tmp_pa
         def __init__(self, args, **kwargs):
             captured["args"] = args
 
-        def communicate(self, timeout=None):
+        def communicate(self, input=None, timeout=None):
+            captured["stdin_prompt"] = input
             return (
                 "\n".join(
                     [
@@ -250,8 +254,11 @@ def test_cli_runtime_bypass_sandbox_requires_explicit_opt_in(monkeypatch, tmp_pa
     assert "--full-auto" not in args
     assert 'sandbox_mode="workspace-write"' not in args
     assert 'sandbox_workspace_write.network_access=false' not in args
-    assert ".agents/skills/dataflow-dev/templates/operator_api_reference.md" in args[-1]
-    assert ".claude/skills/dataflow-dev" not in args[-1]
+    assert args[-1] == "-"
+    assert ".agents/skills/dataflow-dev/templates/operator_api_reference.md" in captured[
+        "stdin_prompt"
+    ]
+    assert ".claude/skills/dataflow-dev" not in captured["stdin_prompt"]
 
 
 def test_retry_resumes_codex_thread(monkeypatch, tmp_path):
