@@ -39,6 +39,30 @@ def _request(payload, url="https://api.example/v1/chat/completions"):
     )
 
 
+def test_review_serving_normalizes_env_expanded_numeric_strings(monkeypatch):
+    captured = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+    serving = APILLMServing(
+        api_url="https://api.example/v1/chat/completions",
+        model_name="review-model",
+        api_key="secret",
+        max_workers="10",
+        temperature="0.7",
+        request_timeout="600",
+        max_retries="3",
+    )
+
+    assert serving.max_workers == 10
+    assert serving.temperature == 0.7
+    assert captured["timeout"] == 600.0
+    assert captured["max_retries"] == 3
+
+
 def test_normalize_usage_supports_openai_and_anthropic_fields():
     assert normalize_usage(
         {

@@ -27,6 +27,11 @@ class APILLMServing_request(LLMServingABC):
                  max_retries: int = 5,
                  connect_timeout: float = 10.0,
                  read_timeout: float = 120.0,
+                 reasoning_field: str = "reasoning",
+                 include_reasoning: bool = True,
+                 reasoning_output_format: str = "think_answer",
+                 require_finish_reason_stop: bool = False,
+                 require_reasoning_and_content: bool = False,
                  **configs : dict
                  ):
         # Get API key from environment variable or config
@@ -35,6 +40,15 @@ class APILLMServing_request(LLMServingABC):
         # self.temperature = temperature
         self.max_workers = max_workers
         self.max_retries = max_retries
+        self.reasoning_field = reasoning_field
+        self.include_reasoning = include_reasoning
+        self.reasoning_output_format = reasoning_output_format
+        self.require_finish_reason_stop = require_finish_reason_stop
+        self.require_reasoning_and_content = require_reasoning_and_content
+        if self.reasoning_output_format not in {"think", "think_answer"}:
+            raise ValueError(
+                "reasoning_output_format must be 'think' or 'think_answer'"
+            )
 
         self.timeout = (connect_timeout, read_timeout)  # (connect timeout, read timeout)
         # check for deprecated timeout
@@ -73,26 +87,56 @@ class APILLMServing_request(LLMServingABC):
         }
 
 
-    def format_response(self, response: dict, is_embedding: bool = False) -> str:
+    def format_response(self, response: dict, is_embedding: bool = False):
         """Format API response, supporting both embedding and chat completion modes"""
         
         # Handle embedding requests
         if is_embedding:
             return response.get('data', [{}])[0].get('embedding', [])
         
-        # Extract message content
-        message = response.get('choices', [{}])[0].get('message', {})
-        content = message.get('content', '')
+        choice = response.get('choices', [{}])[0]
+        message = choice.get('message', {})
+        finish_reason = choice.get('finish_reason')
+        content = message.get('content') or ''
+
+        if self.require_finish_reason_stop and finish_reason != "stop":
+            self.logger.warning(
+                "Discarding incomplete chat response: finish_reason=%r",
+                finish_reason,
+            )
+            return None
         
         # Return directly if content is already in think/answer format
         if re.search(r'<think>.*?</think>.*?<answer>.*?</answer>', content, re.DOTALL):
             return content
         
-        # Check for reasoning_content
-        reasoning_content = message.get('reasoning_content')
+        # OpenAI-compatible reasoning servers use both `reasoning` and
+        # `reasoning_content`; prefer the configured field but accept either.
+        reasoning_content = (
+            message.get(self.reasoning_field)
+            or message.get('reasoning')
+            or message.get('reasoning_content')
+        )
+
+        if self.require_reasoning_and_content and (
+            not isinstance(reasoning_content, str)
+            or not reasoning_content.strip()
+            or not isinstance(content, str)
+            or not content.strip()
+        ):
+            self.logger.warning(
+                "Discarding incomplete reasoning response: reasoning=%s content=%s",
+                bool(isinstance(reasoning_content, str) and reasoning_content.strip()),
+                bool(isinstance(content, str) and content.strip()),
+            )
+            return None
         
-        # Wrap with think/answer tags if reasoning_content exists and is not empty
-        if reasoning_content:
+        # Preserve the teacher reasoning for explicit CoT distillation.
+        if self.include_reasoning and reasoning_content:
+            reasoning_content = reasoning_content.strip()
+            content = content.strip()
+            if self.reasoning_output_format == "think":
+                return f"<think>\n{reasoning_content}\n</think>\n\n{content}"
             return f"<think>{reasoning_content}</think>\n<answer>{content}</answer>"
         
         return content

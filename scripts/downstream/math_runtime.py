@@ -315,6 +315,26 @@ def evaluate_model(
     timeout_sec = _positive_int(
         evaluation.get("timeout_sec", 86400), "evaluation.timeout_sec"
     )
+    configured_cache_root = Path(
+        _string(
+            evaluation.get(
+                "local_cache_root", "/tmp/dataflow-evolver-vllm-evaluation"
+            ),
+            "evaluation.local_cache_root",
+        )
+    ).expanduser()
+    local_cache_root = configured_cache_root.resolve()
+    try:
+        local_cache_root.relative_to("/tmp")
+    except ValueError as exc:
+        raise RuntimeConfigError(
+            "evaluation.local_cache_root must resolve under /tmp so vLLM compile "
+            f"caches stay on node-local storage: {local_cache_root}"
+        ) from exc
+    evaluation_env = _string_mapping(
+        evaluation.get("env", {}), "evaluation.env"
+    )
+    process_cache_root = local_cache_root / f"runtime_{os.getpid()}"
 
     results: dict[str, Any] = {}
     output_root = runtime_dir / "evaluation"
@@ -434,8 +454,27 @@ def evaluate_model(
                 start = rank * devices_per_replica
                 rank_devices = visible_devices[start : start + devices_per_replica]
                 rank_env = os.environ.copy()
+                rank_env.update(evaluation_env)
                 rank_env["CUDA_VISIBLE_DEVICES"] = ",".join(rank_devices)
                 rank_env["TOKENIZERS_PARALLELISM"] = "false"
+                rank_cache_root = (
+                    process_cache_root
+                    / f"group_{group_index:03d}"
+                    / f"rank_{rank:03d}"
+                )
+                rank_cache_dirs = {
+                    "XDG_CACHE_HOME": rank_cache_root / "xdg",
+                    "VLLM_CACHE_ROOT": rank_cache_root / "vllm",
+                    "TORCHINDUCTOR_CACHE_DIR": rank_cache_root / "torchinductor",
+                    "TRITON_CACHE_DIR": rank_cache_root / "triton",
+                    "CUDA_CACHE_PATH": rank_cache_root / "cuda",
+                    "TORCH_EXTENSIONS_DIR": rank_cache_root / "torch_extensions",
+                }
+                for cache_dir in rank_cache_dirs.values():
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                rank_env.update(
+                    {name: str(path) for name, path in rank_cache_dirs.items()}
+                )
                 rank_argv = [
                     *argv,
                     "--output_dir",
@@ -576,13 +615,76 @@ def summarize_qwen_records(
                     "length_truncated": length_truncated,
                 }
             )
+    failure_counts = _count_bad_case_categories(failures)
+    bad_cases = _select_stratified_bad_cases(
+        failures,
+        limit=bad_cases_per_benchmark,
+    )
     score = sum(correctness) / len(correctness)
     return {
         "score": score,
         "metric": metric,
         "incorrect_count": len(failures),
-        "bad_cases": failures[: min(bad_cases_per_benchmark, len(failures))],
+        **failure_counts,
+        "bad_cases": bad_cases,
     }
+
+
+def _bad_case_category(case: dict[str, Any]) -> str:
+    finish_reason = str(case.get("finish_reason") or "")
+    if bool(case.get("length_truncated")) or finish_reason not in {"", "stop"}:
+        return "runaway"
+    if not str(case.get("parsed_answer") or "").strip():
+        return "parse_failure"
+    return "wrong_answer"
+
+
+def _count_bad_case_categories(
+    failures: list[dict[str, Any]],
+) -> dict[str, int]:
+    counts = {
+        "wrong_answer_count": 0,
+        "parse_failure_count": 0,
+        "runaway_count": 0,
+    }
+    for case in failures:
+        counts[f"{_bad_case_category(case)}_count"] += 1
+    return counts
+
+
+def _select_stratified_bad_cases(
+    failures: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Prefer wrong answers, then parse failures, then runaway generations."""
+    if limit <= 0 or not failures:
+        return []
+
+    buckets = {
+        category: [
+            case for case in failures if _bad_case_category(case) == category
+        ]
+        for category in ("wrong_answer", "parse_failure", "runaway")
+    }
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[int] = set()
+
+    def take(category: str, count: int) -> None:
+        for case in buckets[category]:
+            if len(selected) >= limit or count <= 0:
+                return
+            if id(case) not in selected_ids:
+                selected.append(case)
+                selected_ids.add(id(case))
+                count -= 1
+
+    take("wrong_answer", 2)
+    take("parse_failure", 1)
+    take("runaway", 1)
+    for category in ("wrong_answer", "parse_failure", "runaway"):
+        take(category, limit - len(selected))
+    return selected
 
 
 def run_logged(

@@ -27,7 +27,6 @@ from dataflow_evolver.llm.prompts import (
     build_pipeline_prompt,
     build_selfcorrect_prompt,
 )
-from dataflow_evolver.llm.skill_paths import skill_root_for_backend
 from dataflow_evolver.utils.config import Config
 from dataflow_evolver.utils.logging import get_logger
 
@@ -49,7 +48,6 @@ class PipelineAgent:
         self.pipeline_filename = agent_cfg.get("pipeline_filename", "pipeline.py")
         self.llm_block = llm_block
         self.backend = str(agent_cfg.get("backend", "claude") or "claude").strip().lower()
-        self.skill_root = skill_root_for_backend(self.backend)
         self.runtime = runtime or build_agent_runtime(agent_cfg)
         self.logger = get_logger(f"agents.{self.name}")
 
@@ -118,7 +116,6 @@ class PipelineAgent:
             traceback,
             diagnostics,
             failure_stage=failure_stage,
-            skill_root=self.skill_root,
         )
         return self._run_and_assemble(
             prompt,

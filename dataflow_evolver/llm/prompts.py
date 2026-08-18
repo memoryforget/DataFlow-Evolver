@@ -4,11 +4,10 @@ from __future__ import annotations
 from dataflow_evolver.core.downstream_eval import DownstreamEvaluationResult
 from dataflow_evolver.core.input_corpus import InputCorpus
 from dataflow_evolver.core.schemas import ReviewResult, TaskSpec
-from dataflow_evolver.llm.skill_paths import skill_root_for_backend
-
-
 _BAD_CASE_RESPONSE_HEAD_CHARS = 1200
 _BAD_CASE_RESPONSE_TAIL_CHARS = 1800
+_RUNAWAY_RESPONSE_HEAD_CHARS = 500
+_RUNAWAY_RESPONSE_TAIL_CHARS = 500
 
 
 PIPELINE_PROMPT = """为下述目标编写一条完整、可直接运行的 DataFlow 流水线（含自定义算子）。
@@ -38,18 +37,6 @@ Entry file: {entry_path}
    `if os.environ.get('DF_COMPILE_ONLY'): sys.exit(0)` → `pipeline.forward()` 排列。只写入所需产物，
    不要自行执行 `pipeline.py`（包括 compile-only 或 smoke test）；框架会在 Agent 返回后依次执行
    确定性的 artifact 校验、compile 预检和正式运行。
-9. 从上一轮流水线演化时，优先复用可证明完全未变化的连续前缀中间 JSONL，避免重复执行昂贵
-   的确定性算子或 LLM 算子。只有同时满足以下条件才允许复用：raw Entry file 及其内容未变；
-   前缀中每个算子的源码、初始化参数、`run()` 参数、字段流，以及所用模型、prompt 和 serving
-   参数均未变；父轮对应 step JSONL 存在且可解析。任一条件无法确认时必须从 raw input 重算。
-   复用实现必须保留从 raw input 完整执行的 fallback，不能让最终 Pipeline 永久依赖父轮目录；
-   也不能把父轮最终数据伪装成新的 raw input。请在 `decision.json.reason` 中记录复用截止 step、
-   父轮缓存路径、验证条件与 fallback。缓存命中时，必须用父轮该 step JSONL 作为 suffix storage
-   的 `first_entry_file_name`，并且只调用变化步骤及其下游算子，不能再次调用已复用的前缀算子；
-   缓存未命中时则从 raw input 执行完整 Pipeline。两条分支都要打印一行
-   `DF_PREFIX_CACHE_REUSE hit|miss cutoff=<step> source=<path>`，使框架日志可以审计是否真正跳过。
-   只要某一步发生变化，该步及其所有下游步骤都必须重算。
-
 {recommendation_block}{init_block}{parent_block}{review_block}{downstream_block}{history_block}
 约束：无头自动化运行，禁止 AskUserQuestion 与 git/gh 子流程。MCP 仅用于查看 DataFlow 算子源码，
 不能用于获取新数据。"""
@@ -62,13 +49,11 @@ DECISION_SYNC_NOTE = """如果修复改变了算子、字段流或设计取舍�
 PIPELINE_SELFCORRECT_PROMPT = """流水线 `{iteration_dir}/pipeline.py` 未通过框架检查。
 失败阶段：`{failure_stage}`。
 
-请先读取
-`{skill_root}/diagnostics/known_issues.md`，再对照 DataFlow 源码定位并修复。
-
-可查阅：
+请根据具体错误栈定向对照以下 DataFlow 源码定位并修复：
+- `dataflow/core/operator.py` 中的 `OperatorABC`
+- `dataflow/pipeline/Pipeline.py` 中的 `PipelineABC`
 - `dataflow/utils/storage.py`
 - `dataflow/serving/api_llm_serving_request.py`
-- `dataflow/core/operator.py`
 - `{iteration_dir}/operators/`
 
 只修改 `pipeline.py`、`operators/` 和必要的 `decision.json`，不要自行执行 `pipeline.py`、
@@ -183,14 +168,12 @@ def build_selfcorrect_prompt(
     traceback: str,
     diagnostics: str = "not available",
     failure_stage: str = "execution",
-    skill_root: str | None = None,
 ) -> str:
     return PIPELINE_SELFCORRECT_PROMPT.format(
         iteration_dir=iteration_dir,
         failure_stage=failure_stage,
         traceback=traceback,
         diagnostics=diagnostics,
-        skill_root=skill_root or skill_root_for_backend("claude"),
         decision_sync_note=DECISION_SYNC_NOTE.format(iteration_dir=iteration_dir),
     )
 
@@ -219,8 +202,18 @@ def _parent_block(code: str | None, rationale: str | None) -> str:
         lines.append(f"上一轮设计理由：{rationale}")
     if code:
         lines.append(
-            "上一轮代码中的绝对 cache_path 可用于定位该轮逐步 JSONL。先比较连续前缀，再决定"
-            "是否启用上面的受约束缓存复用；不要仅因为类名相同就认定算子等价。"
+            "【父轮算子代码与中间数据复用】上一轮 pipeline 中的绝对 `cache_path` 可定位父轮目录："
+            "其同级 `operators/` 保存算子源码，`cache/` 保存逐步 JSONL。优先复制完全未变化的算子"
+            "源码到当前 `{iteration_dir}/operators/`，并复用这些算子形成的连续前缀 step JSONL；"
+            "尤其不要重复调用未变化的 LLM 算子。缓存命中时，用父轮最后一个可复用 step JSONL"
+            "作为 suffix storage 的 `first_entry_file_name`，只运行首个变化步骤及其下游。\n"
+            "只有 raw Entry file 内容，以及连续前缀每个算子的源码、初始化参数、`run()` 参数、"
+            "字段流、模型、prompt 和 serving 参数都相同，且父轮 step JSONL 存在可解析时才允许命中。"
+            "任一条件不能确认就从 raw input 完整重算；某一步变化时，该步及其下游全部重算。当前轮"
+            "必须包含复用算子的源码副本并保留 raw-input fallback，禁止跨 iteration import 或把父轮"
+            "最终数据伪装成 raw input。\n"
+            "在 `decision.json.reason` 记录复用算子、截止 step、父轮缓存、验证条件和 fallback。"
+            "命中或未命中都打印 `DF_PREFIX_CACHE_REUSE hit|miss cutoff=<step> source=<path>`。"
         )
     return "\n".join(lines) + "\n"
 
@@ -333,11 +326,8 @@ def _downstream_feedback_block(
         checkpoint,
         "以下 bad cases 是诊断证据，不是可复制进训练数据的新数据源。禁止复述、硬编码或"
         "针对这些 benchmark 题目构造答案；应归纳能力缺口并改进 raw-data pipeline。",
-        (
-            "完整、未截断的下游证据保存在："
-            f"{feedback.result_path or '[external result path not provided]'}。"
-            "下面只提供有界首尾摘录；如需确认完整推理，使用文件工具读取该结果文件。"
-        ),
+        "完整、未截断的结果由框架单独保留用于人工审计；PipelineAgent 不要读取完整 result.json。"
+        "下面提供的有界投影已经是本轮允许使用的全部下游诊断证据。",
     ]
     for benchmark_name, benchmark in feedback.benchmarks.items():
         delta = feedback.score_deltas.get(benchmark_name)
@@ -351,11 +341,26 @@ def _downstream_feedback_block(
         lines.append(
             f"\n### {benchmark_name}: {benchmark.metric}={benchmark.score:.6f}"
             f"{delta_text}{baseline_delta_text}; "
-            f"incorrect_count={benchmark.incorrect_count}"
+            f"incorrect_count={benchmark.incorrect_count}; "
+            f"wrong_answer_count={benchmark.wrong_answer_count}; "
+            f"parse_failure_count={benchmark.parse_failure_count}; "
+            f"runaway_count={benchmark.runaway_count}"
         )
         for index, case in enumerate(benchmark.bad_cases, start=1):
+            is_runaway = case.length_truncated or case.finish_reason not in {
+                "",
+                "stop",
+            }
+            case_type = (
+                "generation_runaway"
+                if is_runaway
+                else "parse_failure"
+                if not case.parsed_answer.strip()
+                else "wrong_answer"
+            )
             response_projection, omitted_chars = _project_bad_case_response(
-                case.model_response
+                case.model_response,
+                length_truncated=is_runaway,
             )
             token_count = (
                 str(case.response_token_count)
@@ -371,6 +376,7 @@ def _downstream_feedback_block(
                     case.question,
                     (
                         "Response metadata: "
+                        f"case_type={case_type}, "
                         f"chars={len(case.model_response)}, tokens={token_count}, "
                         f"finish_reason={finish_reason}, "
                         f"length_truncated={str(case.length_truncated).lower()}, "
@@ -394,9 +400,23 @@ def _downstream_feedback_block(
     return "\n".join(lines) + "\n"
 
 
-def _project_bad_case_response(response: str) -> tuple[str, int]:
+def _project_bad_case_response(
+    response: str,
+    *,
+    length_truncated: bool = False,
+) -> tuple[str, int]:
     """Render bounded evidence while keeping the full response in result.json."""
-    limit = _BAD_CASE_RESPONSE_HEAD_CHARS + _BAD_CASE_RESPONSE_TAIL_CHARS
+    head_chars = (
+        _RUNAWAY_RESPONSE_HEAD_CHARS
+        if length_truncated
+        else _BAD_CASE_RESPONSE_HEAD_CHARS
+    )
+    tail_chars = (
+        _RUNAWAY_RESPONSE_TAIL_CHARS
+        if length_truncated
+        else _BAD_CASE_RESPONSE_TAIL_CHARS
+    )
+    limit = head_chars + tail_chars
     if len(response) <= limit:
         return response, 0
     omitted = len(response) - limit
@@ -404,9 +424,9 @@ def _project_bad_case_response(response: str) -> tuple[str, int]:
         f"\n\n...[{omitted} chars omitted from prompt; read the full result file]...\n\n"
     )
     return (
-        response[:_BAD_CASE_RESPONSE_HEAD_CHARS]
+        response[:head_chars]
         + marker
-        + response[-_BAD_CASE_RESPONSE_TAIL_CHARS:],
+        + response[-tail_chars:],
         omitted,
     )
 

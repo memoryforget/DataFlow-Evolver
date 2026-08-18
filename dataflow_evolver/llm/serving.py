@@ -106,15 +106,19 @@ class APILLMServing(LLMServingABC):
         from openai import OpenAI  # 惰性导入，避免无谓依赖
 
         self.model_name = model_name
-        self.max_workers = max_workers
-        self.temperature = temperature
+        # Environment placeholders are expanded as strings by Config. Normalize
+        # numeric values at this boundary before passing them to OpenAI/httpx.
+        self.max_workers = int(max_workers)
+        self.temperature = float(temperature)
+        normalized_timeout = float(request_timeout)
+        normalized_retries = int(max_retries)
         base_url = _to_base_url(api_url)
         # timeout / max_retries 交给 openai 客户端：网络抖动在 HTTP 层自动退避重试（见 review H1）
         self._client = OpenAI(
             base_url=base_url,
             api_key=api_key or "EMPTY",
-            timeout=request_timeout,
-            max_retries=max_retries,
+            timeout=normalized_timeout,
+            max_retries=normalized_retries,
         )
         logger.info("APILLMServing 就绪：model=%s base_url=%s", model_name, base_url)
 

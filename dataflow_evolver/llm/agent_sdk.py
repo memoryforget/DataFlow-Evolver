@@ -23,7 +23,6 @@ from dataflow_evolver.llm.session_state import (
     finalize_agent_session,
     prepare_agent_session_store,
 )
-from dataflow_evolver.llm.skill_paths import skill_root_for_backend
 from dataflow_evolver.utils.config import Config
 from dataflow_evolver.utils.logging import get_logger
 
@@ -57,10 +56,13 @@ _SYSTEM_PROMPT_APPEND_TEMPLATE = (
     "You write DataFlow pipelines with custom operators that process the fixed raw corpus.\n"
     "Do not fetch or download external datasets. Network calls are allowed only for the configured LLM serving API.\n\n"
 
-    "## CRITICAL: Read API Reference FIRST\n"
-    "Before writing ANY code, you MUST read:\n"
-    "1. `{skill_root}/templates/operator_api_reference.md` - Complete operator example with correct APIs\n"
-    "2. `{skill_root}/diagnostics/known_issues.md` - Common API errors and fixes\n\n"
+    "## Authoritative DataFlow API Sources\n"
+    "The prompt below already contains the required API contract. Do not preload broad documentation. "
+    "Only when a concrete interface is unclear, inspect the exact symbol at these workspace-relative paths:\n"
+    "- `dataflow/core/operator.py` -> `OperatorABC`\n"
+    "- `dataflow/pipeline/Pipeline.py` -> `PipelineABC`\n"
+    "- `dataflow/utils/storage.py` -> `FileStorage`\n"
+    "- `dataflow/serving/api_llm_serving_request.py` -> `APILLMServing_request`\n\n"
 
     "Key facts you'll learn:\n"
     "- FileStorage.write() takes ONLY ONE argument: `storage.write(df)`\n"
@@ -79,7 +81,7 @@ _SYSTEM_PROMPT_APPEND_TEMPLATE = (
     "- Do NOT use @OPERATOR_REGISTRY.register() — custom ops skip registry\n"
     "- Each operator in its own file under operators/ in the iteration directory\n\n"
 
-    "## Critical API Examples (Copy from operator_api_reference.md):\n"
+    "## Critical API Examples\n"
     "```python\n"
     "# FileStorage API - ONLY ONE ARGUMENT\n"
     "def run(self, storage, input_key='text', output_key='result'):\n"
@@ -135,13 +137,8 @@ _SYSTEM_PROMPT_APPEND_TEMPLATE = (
     "Then write your own operators following those patterns.\n\n"
 
     "## Error Fixing Strategy\n"
-    "If compile/execution fails:\n"
-    "1. Read `{skill_root}/diagnostics/known_issues.md`\n"
-    "2. Match error message to Issue #001-#011\n"
-    "3. Apply the exact fix from the Issue\n"
-    "4. If not in known_issues, check DataFlow source code:\n"
-    "   - `dataflow/serving/api_llm_serving_request.py` for LLM API\n"
-    "   - `dataflow/utils/storage.py` for FileStorage API\n\n"
+    "If compile/execution fails, use the concrete traceback to inspect only the relevant source symbol above, "
+    "then fix the current iteration artifacts in place.\n\n"
 
     "## Constraints\n"
     "- Headless: no AskUserQuestion, no git/gh subflows.\n"
@@ -156,10 +153,8 @@ _SYSTEM_PROMPT_APPEND_TEMPLATE = (
 
 
 def default_system_prompt_append(backend: str) -> str:
-    """Render shared PipelineAgent guidance with the backend's native skill root."""
-    return _SYSTEM_PROMPT_APPEND_TEMPLATE.replace(
-        "{skill_root}", skill_root_for_backend(backend)
-    )
+    """Return shared PipelineAgent guidance for every supported backend."""
+    return _SYSTEM_PROMPT_APPEND_TEMPLATE
 
 
 

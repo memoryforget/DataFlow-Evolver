@@ -54,6 +54,9 @@ class DownstreamBenchmarkResult:
     score: float
     metric: str
     incorrect_count: int
+    wrong_answer_count: int
+    parse_failure_count: int
+    runaway_count: int
     bad_cases: list[DownstreamBadCase]
 
 
@@ -277,6 +280,32 @@ def _validate_result(
         incorrect_count = _nonnegative_int(
             item.get("incorrect_count"), f"{name}.incorrect_count"
         )
+        count_fields = (
+            "wrong_answer_count",
+            "parse_failure_count",
+            "runaway_count",
+        )
+        present_count_fields = [field in item for field in count_fields]
+        if any(present_count_fields) and not all(present_count_fields):
+            raise ValueError(
+                f"benchmark {name!r} must provide all bad-case category counts"
+            )
+        if all(present_count_fields):
+            category_counts = {
+                field: _nonnegative_int(item.get(field), f"{name}.{field}")
+                for field in count_fields
+            }
+            if sum(category_counts.values()) != incorrect_count:
+                raise ValueError(
+                    f"benchmark {name!r} bad-case category counts must sum to "
+                    f"incorrect_count={incorrect_count}"
+                )
+        else:
+            category_counts = {
+                "wrong_answer_count": incorrect_count,
+                "parse_failure_count": 0,
+                "runaway_count": 0,
+            }
         expected_bad_cases = min(bad_cases_per_benchmark, incorrect_count)
         bad_cases = item.get("bad_cases")
         if not isinstance(bad_cases, list) or len(bad_cases) != expected_bad_cases:
@@ -289,6 +318,9 @@ def _validate_result(
             score=score,
             metric=metric,
             incorrect_count=incorrect_count,
+            wrong_answer_count=category_counts["wrong_answer_count"],
+            parse_failure_count=category_counts["parse_failure_count"],
+            runaway_count=category_counts["runaway_count"],
             bad_cases=[
                 _validate_bad_case(name, index, value)
                 for index, value in enumerate(bad_cases)

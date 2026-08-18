@@ -706,11 +706,17 @@ def _resolve_pipeline_llm(cfg_llm: Config) -> dict[str, dict[str, Any]]:
             value = section.get(key, None) if section is not None else None
             return api.get(key, default) if value is None else value
 
+        serving_kwargs = section.get("serving_kwargs", {}) if section is not None else {}
+        if isinstance(serving_kwargs, Config):
+            serving_kwargs = serving_kwargs.to_dict()
+        if not isinstance(serving_kwargs, dict):
+            raise ValueError("llm.pipeline_llm.*.serving_kwargs must be an object")
         return {
             "api_url": _normalize_pipeline_api_url(pick("api_url")),
             "model_name": pick("model_name"),
             "api_key": pick("api_key", ""),
             "max_workers": pick("max_workers", 10),
+            "serving_kwargs": dict(serving_kwargs),
         }
 
     if sections is None:
@@ -743,7 +749,12 @@ def _pipeline_runtime_contract(
         env_name = f"DF_PIPELINE_API_KEY_{purpose.upper()}"
         lines.append(
             f"   [{purpose}] model={item['model_name']}, api_url={item['api_url']}, "
-            f"key_name_of_api_key={env_name}, max_workers={item['max_workers']}"
+            f"key_name_of_api_key={env_name}, max_workers={item['max_workers']}, "
+            f"serving_kwargs={json.dumps(item.get('serving_kwargs', {}), ensure_ascii=False)}"
+        )
+        lines.append(
+            f"      构造 APILLMServing_request 时必须把 [{purpose}] serving_kwargs "
+            "逐项作为构造函数关键字参数传入，不得丢弃。"
         )
         if item.get("api_key"):
             env[env_name] = str(item["api_key"])
