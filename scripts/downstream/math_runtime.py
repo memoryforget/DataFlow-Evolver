@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import subprocess
 import time
 from collections.abc import Iterable, Mapping
@@ -657,7 +658,7 @@ def _select_stratified_bad_cases(
     *,
     limit: int,
 ) -> list[dict[str, Any]]:
-    """Prefer wrong answers, then parse failures, then runaway generations."""
+    """Randomly cover categories by priority, then fill remaining slots."""
     if limit <= 0 or not failures:
         return []
 
@@ -667,6 +668,9 @@ def _select_stratified_bad_cases(
         ]
         for category in ("wrong_answer", "parse_failure", "runaway")
     }
+    rng = random.Random(42)
+    for bucket in buckets.values():
+        rng.shuffle(bucket)
     selected: list[dict[str, Any]] = []
     selected_ids: set[int] = set()
 
@@ -679,9 +683,8 @@ def _select_stratified_bad_cases(
                 selected_ids.add(id(case))
                 count -= 1
 
-    take("wrong_answer", 2)
-    take("parse_failure", 1)
-    take("runaway", 1)
+    for category in ("wrong_answer", "parse_failure", "runaway"):
+        take(category, 1)
     for category in ("wrong_answer", "parse_failure", "runaway"):
         take(category, limit - len(selected))
     return selected
