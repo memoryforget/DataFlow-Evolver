@@ -4,19 +4,20 @@ from dataflow_evolver.agents.review_agent import _sample_jsonl
 from dataflow_evolver.llm.prompts import build_selfcorrect_prompt
 
 
-def test_exec_repair_prompt_syncs_decision():
+def test_exec_repair_prompt_syncs_decision_without_source_browsing():
     prompt = build_selfcorrect_prompt(
         "/workspace/runs/run/iteration_004",
         "Traceback: boom",
         failure_stage="compile",
-        skill_root=".agents/skills/dataflow-dev",
     )
     assert "/workspace/runs/run/iteration_004/decision.json" in prompt
     assert "ops` / `field_flow` / `reason" in prompt
     assert "失败阶段：`compile`" in prompt
     assert "不要自行执行" in prompt
-    assert ".agents/skills/dataflow-dev/diagnostics/known_issues.md" in prompt
-    assert ".claude/skills/dataflow-dev" not in prompt
+    assert "dataflow-evolver-pipeline" in prompt
+    assert "dataflow/core/operator.py" not in prompt
+    assert "api_llm_serving_request.py" not in prompt
+    assert "当前 iteration" in prompt
 
 
 def test_stale_decision_warns_after_execution_repair(tmp_path, monkeypatch, caplog):

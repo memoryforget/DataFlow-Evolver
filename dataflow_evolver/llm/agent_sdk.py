@@ -52,105 +52,17 @@ _TRANSIENT_MARKERS = (
     "stream disconnected", "upstream request failed",
 )
 
-_SYSTEM_PROMPT_APPEND_TEMPLATE = (
-    "You write DataFlow pipelines with custom operators that process the fixed raw corpus.\n"
-    "Do not fetch or download external datasets. Network calls are allowed only for the configured LLM serving API.\n\n"
+_SYSTEM_PROMPT_APPEND_TEMPLATE = """
+You are the DataFlow-Evolver Pipeline Agent. Activate the project skill
+`dataflow-evolver-pipeline` and treat it as the authoritative API/runtime
+contract. Generate custom local operators and one bounded pipeline for the task.
 
-    "## Authoritative DataFlow API Sources\n"
-    "The prompt below already contains the required API contract. Do not preload broad documentation. "
-    "Only when a concrete interface is unclear, inspect the exact symbol at these workspace-relative paths:\n"
-    "- `dataflow/core/operator.py` -> `OperatorABC`\n"
-    "- `dataflow/pipeline/Pipeline.py` -> `PipelineABC`\n"
-    "- `dataflow/utils/storage.py` -> `FileStorage`\n"
-    "- `dataflow/serving/api_llm_serving_request.py` -> `APILLMServing_request`\n\n"
-
-    "Key facts you'll learn:\n"
-    "- FileStorage.write() takes ONLY ONE argument: `storage.write(df)`\n"
-    "- LLM serving uses: `self.llm_serving.generate_from_input(user_inputs=list[str], system_prompt=str)`\n"
-    "- Operator run() must return list of output keys: `return ['output_key']`\n"
-    "- Handle None responses: `[r if r is not None else '' for r in responses]`\n\n"
-
-    "## Step 1: Design Custom Operators\n"
-    "For each processing step, write a dedicated operator class:\n"
-    "- `from dataflow.core import OperatorABC`\n"
-    "- Inherit OperatorABC, call super().__init__()\n"
-    "- run(self, storage, input_*='col', output_*='col') -> list[str]\n"
-    "- Inside run: df = storage.read('dataframe') → process → storage.write(df)\n"
-    "- LLM operators: accept llm_serving in __init__, store as self.llm_serving\n"
-    "- Add get_desc(lang='zh') staticmethod (zh/en)\n"
-    "- Do NOT use @OPERATOR_REGISTRY.register() — custom ops skip registry\n"
-    "- Each operator in its own file under operators/ in the iteration directory\n\n"
-
-    "## Critical API Examples\n"
-    "```python\n"
-    "# FileStorage API - ONLY ONE ARGUMENT\n"
-    "def run(self, storage, input_key='text', output_key='result'):\n"
-    "    df = storage.read('dataframe')\n"
-    "    # ... process ...\n"
-    "    storage.write(df)  # ✓ Correct - ONE argument only\n"
-    "    return [output_key]  # ✓ Must return output keys\n\n"
-
-    "# LLM Serving API - use generate_from_input()\n"
-    "def __init__(self, llm_serving, ...):\n"
-    "    super().__init__()\n"
-    "    self.llm_serving = llm_serving  # Must be named llm_serving\n\n"
-
-    "def run(self, storage, input_key='text', output_key='result'):\n"
-    "    df = storage.read('dataframe')\n"
-    "    user_inputs = df[input_key].tolist()  # list[str]\n"
-    "    \n"
-    "    # ✓ Correct API call\n"
-    "    responses = self.llm_serving.generate_from_input(\n"
-    "        user_inputs=user_inputs,\n"
-    "        system_prompt='You are a helpful assistant'\n"
-    "    )\n"
-    "    \n"
-    "    # Handle None responses (API failures)\n"
-    "    df[output_key] = [r if r is not None else '' for r in responses]\n"
-    "    storage.write(df)\n"
-    "    return [output_key]\n"
-    "```\n\n"
-
-    "## Step 2: Write Pipeline\n"
-    "- Import custom operators from local operators/ directory\n"
-    "- `from dataflow.pipeline import PipelineABC`\n"
-    "- Operator instances as member vars (self.op_stepN) for compile() detection\n"
-    "- forward(): self.op_stepN.run(storage=self.storage.step(), ...)\n"
-    "- Write pipeline.py + decision.json to the iteration directory\n"
-    "- Self-contained with `if __name__ == '__main__':` entry\n\n"
-
-    "## Step 3: Framework Compile Contract (MANDATORY)\n"
-    "Write the main entry in this exact order:\n"
-    "    pipeline = MyPipeline(...)\n"
-    "    pipeline.compile()\n"
-    "    if os.environ.get('DF_COMPILE_ONLY'): sys.exit(0)\n"
-    "    pipeline.forward()\n"
-    "Do NOT execute pipeline.py, compile-only checks, or smoke tests yourself. "
-    "The framework validates the artifact and runs compile preflight and formal execution after you return.\n\n"
-
-    "## MCP Reference (Use for Implementation Patterns)\n"
-    "The dataflow-operators MCP exposes existing reasoning/math operators with FULL SOURCE CODE.\n"
-    "Use get_operator_detail(name='ReasoningAnswerGenerator') to study:\n"
-    "- Prompt construction patterns (see source_code field)\n"
-    "- LLM call conventions\n"
-    "- Response parsing techniques\n"
-    "Then write your own operators following those patterns.\n\n"
-
-    "## Error Fixing Strategy\n"
-    "If compile/execution fails, use the concrete traceback to inspect only the relevant source symbol above, "
-    "then fix the current iteration artifacts in place.\n\n"
-
-    "## Constraints\n"
-    "- Headless: no AskUserQuestion, no git/gh subflows.\n"
-    "- Correct imports: `from dataflow.core import OperatorABC`,\n"
-    "  `from dataflow.pipeline import PipelineABC`,\n"
-    "  `from dataflow.utils.storage import FileStorage`,\n"
-    "  `from dataflow.serving import APILLMServing_request`\n"
-    "- Handle LLM parse failures gracefully (skip bad rows, don't crash)\n"
-    "- Strip <think> tags for non-CoT target fields\n"
-    "- If compile/import fails, Read source to debug — fix in place.\n"
-)
-
+Use this specialized skill, the supplied task context, parent artifacts,
+diagnostics, and dynamic serving configuration as the complete contract. Keep all
+inspection scoped to the current iteration artifacts. Do not execute or benchmark
+the generated pipeline; the framework owns compile and execution. Write the
+requested artifact promptly and return without exploratory validation.
+"""
 
 def default_system_prompt_append(backend: str) -> str:
     """Return shared PipelineAgent guidance for every supported backend."""
@@ -238,7 +150,7 @@ def _build_options(
 
     - tools：用 claude_code 预设放开**全部内置工具**（不再用 allowed_tools 白名单限制）。
     - system_prompt：保留 claude_code 预设，仅 **append** 我们的 DataFlow 指令（不覆盖系统提示）。
-    - mcp_servers：只挂 dataflow-operators，用于读取实现参考；不提供任何外部取数工具。
+    - mcp_servers：不挂载 DataFlow operator MCP；Pipeline API 契约由专用 skill 提供。
     - max_turns：单次 SDK 运行的最大轮数（默认 50）。
     - resume：非空则续跑指定会话（载入其历史对话），用于瞬时失败后接着上次进度跑，
       不 fork（继续同一会话 id，把新 turn 追加进去）。
@@ -252,10 +164,6 @@ def _build_options(
     要求的 ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL，并保留旧环境变量回退。
     """
     from claude_agent_sdk import ClaudeAgentOptions
-
-    from dataflow_evolver.llm.mcp_operators import operator_mcp_server
-
-    mcp_servers: dict[str, Any] = {"dataflow-operators": operator_mcp_server}
 
     append_text = agent_cfg.get(
         "system_prompt_append", default_system_prompt_append("claude")
@@ -282,7 +190,7 @@ def _build_options(
         setting_sources=list(agent_cfg.get("setting_sources", ["project"])),
         skills="all",
         max_turns=agent_cfg.get("max_turns", 50),
-        mcp_servers=mcp_servers,
+        mcp_servers={},
         resume=resume,
         effort=effort,
         thinking=thinking,

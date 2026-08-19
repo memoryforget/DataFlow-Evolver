@@ -57,8 +57,8 @@ def test_cli_jsonl_converts_text_tools_session_and_usage():
             '{"type":"turn.started"}',
             (
                 '{"type":"item.completed","item":{"id":"item-1",'
-                '"type":"mcp_tool_call","server":"dataflow-operators",'
-                '"tool":"list_operators"}}'
+                '"type":"mcp_tool_call","server":"example-server",'
+                '"tool":"example-tool"}}'
             ),
             (
                 '{"type":"item.completed","item":{"id":"item-2",'
@@ -76,7 +76,7 @@ def test_cli_jsonl_converts_text_tools_session_and_usage():
     assert result.success
     assert result.session_id == "thread-cli"
     assert result.result_text == "done"
-    assert result.tool_uses[0]["name"] == "dataflow-operators_list_operators"
+    assert result.tool_uses[0]["name"] == "example-server_example-tool"
     assert result.usage == {
         "input_tokens": 12,
         "cached_input_tokens": 2,
@@ -175,7 +175,7 @@ def test_cli_runtime_uses_configured_binary_provider_and_session_home(
         for item in args
     )
     assert "model_providers.openai-custom.supports_websockets=false" in args
-    assert any(item.startswith("mcp_servers.dataflow-operators.command=") for item in args)
+    assert not any("mcp_servers." in item for item in args)
     assert args[-1] == "-"
     assert captured["stdin_prompt"].startswith("developer guard\n\nwrite pipeline")
     assert captured["kwargs"]["stdin"] is runtime.subprocess.PIPE
@@ -255,10 +255,8 @@ def test_cli_runtime_bypass_sandbox_requires_explicit_opt_in(monkeypatch, tmp_pa
     assert 'sandbox_mode="workspace-write"' not in args
     assert 'sandbox_workspace_write.network_access=false' not in args
     assert args[-1] == "-"
-    assert ".agents/skills/dataflow-dev/templates/operator_api_reference.md" in captured[
-        "stdin_prompt"
-    ]
-    assert ".claude/skills/dataflow-dev" not in captured["stdin_prompt"]
+    assert "dataflow-evolver-pipeline" in captured["stdin_prompt"]
+    assert "current iteration artifacts" in captured["stdin_prompt"]
 
 
 def test_retry_resumes_codex_thread(monkeypatch, tmp_path):

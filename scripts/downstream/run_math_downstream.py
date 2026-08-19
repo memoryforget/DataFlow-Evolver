@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import time
 from pathlib import Path
 
@@ -24,6 +26,19 @@ def main() -> None:
     config = load_yaml(args.config.resolve())
     config["config_path"] = str(args.config.resolve())
     runtime_dir = args.result.resolve().parent / "runtime"
+
+    if request["stage"] == "baseline":
+        reuse_path = os.environ.get("DF_DOWNSTREAM_BASELINE_RESULT", "").strip()
+        if reuse_path:
+            source = Path(reuse_path).expanduser().resolve()
+            if not source.is_file():
+                raise FileNotFoundError(
+                    f"DF_DOWNSTREAM_BASELINE_RESULT does not exist: {source}"
+                )
+            args.result.resolve().parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, args.result.resolve())
+            return
+
     runtime_dir.mkdir(parents=True, exist_ok=True)
 
     artifacts: dict[str, str] = {}

@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -59,16 +58,6 @@ def _model(agent_cfg: Config) -> str:
     return raw if "/" in raw else f"{provider}/{raw}"
 
 
-def _operator_mcp(cwd: str, timeout_ms: int) -> dict[str, Any]:
-    return {
-        "type": "local",
-        "command": [sys.executable, "-m", "dataflow_evolver.llm.mcp_stdio"],
-        "enabled": True,
-        "timeout": timeout_ms,
-        "environment": {"DF_WORKSPACE": cwd},
-    }
-
-
 def build_opencode_config(
     agent_cfg: Config,
     *,
@@ -80,7 +69,6 @@ def build_opencode_config(
     model = _model(agent_cfg)
     provider = model.split("/", 1)[0]
     agent_name = "dataflow-pipeline"
-    timeout_ms = int(cfg.get("mcp_timeout_ms", 30000) or 30000)
     permission = str(cfg.get("permission", "allow") or "allow").lower()
     if permission not in {"allow", "ask", "deny"}:
         raise ValueError("agent.opencode.permission must be allow, ask, or deny")
@@ -112,7 +100,6 @@ def build_opencode_config(
                 "permission": permission,
             }
         },
-        "mcp": {"dataflow-operators": _operator_mcp(cwd, timeout_ms)},
     }
     if options:
         config["provider"] = {provider: {"options": options}}

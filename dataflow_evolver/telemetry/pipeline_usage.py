@@ -1,6 +1,6 @@
 """Capture and aggregate LLM token usage from generated pipeline HTTP calls.
 
-The vendored DataFlow ``APILLMServing_request`` formats successful JSON responses into
+The official DataFlow HTTP serving formats successful JSON responses into
 plain strings and discards the raw ``usage`` object.  Generated operators therefore cannot
 report exact token counts after the fact.  This module instruments ``requests.Session`` in
 the pipeline subprocess, before DataFlow creates its sessions, and records only metadata

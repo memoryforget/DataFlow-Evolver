@@ -27,6 +27,8 @@ from dataflow_evolver.utils.logging import get_logger
 
 logger = get_logger("engine.execution")
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 
 @dataclass
 class ExecutionResult:
@@ -59,9 +61,9 @@ class ExecutionWrapperABC(ABC):
 class SubprocessExecutionWrapper(ExecutionWrapperABC):
     """Run a generated pipeline from the canonical Agent workspace.
 
-    ``workspace_dir`` contains the project skill and vendored DataFlow code. Each
-    ``iteration_dir`` below it contains generated code, sessions, diagnostics, and
-    review output.
+    ``workspace_dir`` contains Agent artifacts, while DataFlow is imported from
+    the installed ``open-dataflow`` package. Each ``iteration_dir`` contains the
+    generated local operators, pipeline, sessions, diagnostics, and review output.
     """
 
     def __init__(
@@ -111,16 +113,19 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
             )
 
         env = {**os.environ, **self.extra_env}
-        # The script directory enters sys.path, but vendored DataFlow lives in workspace_dir.
-        # 不补这一项，每个节点首跑必定 ModuleNotFoundError('dataflow')，只能靠自纠回合补
-        # sys.path，白烧一次 Agent 往返与一次自纠额度。
+        # Generated code may import Evolver's compatibility adapter, but DataFlow itself
+        # resolves from the installed open-dataflow package.
         prev_pp = env.get("PYTHONPATH", "")
+        inherited_paths = []
+        for item in (p for p in prev_pp.split(os.pathsep) if p):
+            try:
+                if Path(item).resolve() == self.workspace_dir:
+                    continue
+            except OSError:
+                pass
+            inherited_paths.append(item)
         env["PYTHONPATH"] = os.pathsep.join(
-            [
-                str(self.workspace_dir),
-                str(BOOTSTRAP_DIR),
-                *(p for p in prev_pp.split(os.pathsep) if p),
-            ]
+            [str(PROJECT_ROOT), str(BOOTSTRAP_DIR), *inherited_paths]
         )
         if env_overrides:
             env.update(env_overrides)
@@ -160,7 +165,7 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
         try:
             compile_proc = subprocess.run(
                 [self.python_exe, str(pipeline_path)],
-                cwd=str(self.workspace_dir),
+                cwd=str(iteration_dir),
                 capture_output=True,
                 text=True,
                 timeout=self.compile_timeout_sec,
@@ -209,7 +214,7 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
         try:
             proc = subprocess.run(
                 [self.python_exe, str(pipeline_path)],
-                cwd=str(self.workspace_dir),
+                cwd=str(iteration_dir),
                 capture_output=True,
                 text=True,
                 timeout=self.timeout_sec,

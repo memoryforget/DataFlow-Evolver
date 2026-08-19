@@ -4,14 +4,14 @@ version = "0.1.0"
 description = "Fixed-corpus DataFlow pipeline evolution with direct ReviewAgent feedback"
 requires-python = ">=3.10"
 dependencies = [
+    "open-dataflow==1.0.10",
     "numpy>=1.24",
     "openai>=1.0",
     "pyyaml>=6.0",
     "pydantic>=2.0",
 ]
 
-# DataFlow is vendored under workspace/dataflow rather than installed as a package. Generated
-# pipelines still require its runtime dependencies below.
+# DataFlow runtime and its transitive dependencies are provided by open-dataflow.
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
@@ -23,54 +23,6 @@ agent = [
     # claude-agent-sdk 依赖 mcp -> pydantic>=2.11，与 llamafactory 冲突
     # 编排层单独装，不要和 SFT / eval 混装
     "claude-agent-sdk>=0.2",
-]
-agent-runtime = [
-    # --- 运行 vendored DataFlow 流水线所需（装在 dfe-review 环境）---
-    # torch 仅为满足导入，编排进程不做 GPU 计算 —— 装 CPU-only 轮子即可（~200MB 而非 ~2.5GB）：
-    #   pip install torch --index-url https://download.pytorch.org/whl/cpu
-    "torch>=2.5",
-    "transformers>=5.6",
-    "huggingface_hub>=1.0",
-    "librosa>=0.11",              # localmodel_lalm_serving 顶层 import
-    "google-api-python-client>=2.0",  # google_api_serving 顶层 from googleapiclient import discovery
-    "google-cloud-aiplatform>=1.55",  # api_google_vertexai_serving 在模块级硬 raise ImportError
-    "google-cloud-bigquery>=3.0",
-    "google-genai>=1.0",
-    "fsspec>=2024.0",
-    "pillow>=10.0",
-    # 存储 / API serving / 日志
-    "requests>=2.31",
-    "pandas>=2.0",
-    "colorlog>=6.0",
-    "rich>=13.0",
-    "nltk",
-    "spacy",
-    "presidio-analyzer",
-    "presidio-anonymizer",
-    "langkit",
-    "fasttext",                   # 无轮子时从源码编译，pip 会自动取 pybind11
-    "datasets",
-    "evaluate",
-    "math-verify",
-    "tiktoken",
-    "trafilatura",
-    "chonkie",
-    "PyMySQL",
-    "PyMuPDF",
-    "pypdf",
-    "rapidfuzz",
-    "datasketch",
-    "simhash",
-    "xxhash",
-    "word2number",
-    "contractions",
-    "symspellpy",
-    "vendi-score",
-    "colorama",
-    "appdirs",
-    "json5",
-    # langkit 内部仍 import pkg_resources，该模块在 setuptools 81+ 已移除
-    "setuptools<81",
 ]
 serving-vllm = [
     # 可选：仅当把 ReviewAgent 的 llm.backend 设为 vllm 时才需要。

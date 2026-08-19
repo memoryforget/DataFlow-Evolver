@@ -5,7 +5,6 @@ import json
 import os
 import signal
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -33,14 +32,6 @@ from dataflow_evolver.utils.config import Config
 from dataflow_evolver.utils.logging import get_logger
 
 logger = get_logger("llm.codex_runtime")
-
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_OPERATOR_TOOLS = (
-    "list_operator_categories",
-    "recommend_operator_categories",
-    "list_operators",
-    "get_operator_detail",
-)
 
 
 def _jsonable(value: Any) -> Any:
@@ -162,26 +153,6 @@ def _codex_provider_overrides(
     return overrides, env, provider
 
 
-def _codex_mcp_overrides(cwd: str, timeout_ms: int) -> list[str]:
-    pythonpath = str(_PROJECT_ROOT)
-    inherited = os.environ.get("PYTHONPATH", "")
-    if inherited:
-        pythonpath += os.pathsep + inherited
-    server = "mcp_servers.dataflow-operators"
-    return [
-        f"{server}.command={json.dumps(sys.executable)}",
-        f"{server}.args={json.dumps(['-m', 'dataflow_evolver.llm.mcp_stdio'])}",
-        f"{server}.cwd={json.dumps(str(_PROJECT_ROOT))}",
-        (
-            f"{server}.env={{DF_WORKSPACE={json.dumps(cwd)},"
-            f"PYTHONPATH={json.dumps(pythonpath)}}}"
-        ),
-        f"{server}.startup_timeout_ms={timeout_ms}",
-        f"{server}.tool_timeout_sec={max(timeout_ms / 1000.0, 1.0)}",
-        f"{server}.enabled_tools={json.dumps(list(_OPERATOR_TOOLS))}",
-    ]
-
-
 def result_from_codex_cli(
     stdout: str,
     stderr: str,
@@ -282,8 +253,6 @@ def _run_once_cli(
     overrides, env, _ = _codex_provider_overrides(agent_cfg)
     if session_env:
         env.update(session_env)
-    timeout_ms = int(cfg.get("mcp_timeout_ms", 30000) or 30000)
-    overrides.extend(_codex_mcp_overrides(cwd, timeout_ms))
     overrides.append('web_search="disabled"')
     if not bypass_sandbox:
         overrides.extend(

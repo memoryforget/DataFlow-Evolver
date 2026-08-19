@@ -468,8 +468,6 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
     """Build the pipeline-review loop from the default YAML contract."""
     project = cfg.project
     workspace = Path(project.workspace_dir).resolve()
-    if not (workspace / "dataflow").is_dir():
-        raise FileNotFoundError(f"project.workspace_dir 缺少 vendored dataflow：{workspace}")
     backend = str(cfg.agent.get("backend", "claude") or "claude").strip().lower()
     skill_root = skill_root_for_backend(backend)
     if not (workspace / skill_root / "SKILL.md").is_file():
@@ -743,7 +741,7 @@ def _normalize_pipeline_api_url(value: Any) -> Any:
 def _pipeline_runtime_contract(
     pipeline_llm: dict[str, dict[str, Any]],
 ) -> tuple[str, dict[str, str]]:
-    lines = ["   按用途区分的 Pipeline 算子 LLM Serving："]
+    lines = ["   按用途区分的 Pipeline 算子 LLM Serving（配置决定模型与响应策略）："]
     env: dict[str, str] = {}
     for purpose, item in pipeline_llm.items():
         env_name = f"DF_PIPELINE_API_KEY_{purpose.upper()}"
@@ -753,8 +751,8 @@ def _pipeline_runtime_contract(
             f"serving_kwargs={json.dumps(item.get('serving_kwargs', {}), ensure_ascii=False)}"
         )
         lines.append(
-            f"      构造 APILLMServing_request 时必须把 [{purpose}] serving_kwargs "
-            "逐项作为构造函数关键字参数传入，不得丢弃。"
+            f"      使用 from dataflow_evolver.compat import EvolverAPILLMServing；"
+            f"构造服务时必须把 [{purpose}] serving_kwargs 逐项作为关键字参数传入。"
         )
         if item.get("api_key"):
             env[env_name] = str(item["api_key"])

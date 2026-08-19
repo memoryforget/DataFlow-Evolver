@@ -1,7 +1,7 @@
 """Build and refine DataFlow pipelines from direct ReviewAgent feedback.
 
-它不直接产出文本，而是通过配置的 AgentRuntime 启动无头编码 Agent，让 Agent 借助 MCP 算子发现、
-源码阅读和 dataflow-dev 技能把完整可运行的 DataFlow 流水线写到 iteration workspace；
+它不直接产出文本，而是通过配置的 AgentRuntime 启动无头编码 Agent，让 Agent 只依据专用
+dataflow-evolver-pipeline 技能和本轮上下文，把完整可运行的流水线写到 iteration workspace；
 然后框架读取 pipeline.py + decision.json，并负责确定性的 artifact、compile 与执行检查。
 
 注意：PipelineAgent 不继承 AgentABC（那是非-SDK 辅助 Agent 的基类）。
@@ -22,7 +22,6 @@ from dataflow_evolver.core.schemas import (
 )
 from dataflow_evolver.llm.agent_runtime import AgentRuntime, build_agent_runtime
 from dataflow_evolver.llm.agent_sdk import AgentInfraError
-from dataflow_evolver.llm.mcp_operators import _recommend_categories
 from dataflow_evolver.llm.prompts import (
     build_pipeline_prompt,
     build_selfcorrect_prompt,
@@ -66,7 +65,6 @@ class PipelineAgent:
             corpus=self.corpus,
             iteration_dir=str(iteration_dir),
             llm_block=self.llm_block,
-            recommended_categories=_recommend_categories(task.task_description),
             downstream_feedback=downstream_feedback,
             is_init=True,
         )
@@ -86,15 +84,12 @@ class PipelineAgent:
         """Challenge the incumbent using its review and compact attempt history."""
         iteration_dir = iteration_dir.resolve()
         iteration_dir.mkdir(parents=True, exist_ok=True)
-        # 预调用推荐引擎，把结果直接注入 prompt 强制引导算子选择
-        recommended = _recommend_categories(task.task_description)
         prompt = build_pipeline_prompt(
             task=task,
             corpus=self.corpus,
             iteration_dir=str(iteration_dir),
             llm_block=self.llm_block,
             parent_code=parent_code,
-            recommended_categories=recommended,
             parent_rationale=parent_rationale,
             parent_review=parent_review,
             downstream_feedback=downstream_feedback,

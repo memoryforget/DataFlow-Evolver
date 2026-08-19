@@ -10,7 +10,16 @@ _RUNAWAY_RESPONSE_HEAD_CHARS = 500
 _RUNAWAY_RESPONSE_TAIL_CHARS = 500
 
 
-PIPELINE_PROMPT = """为下述目标编写一条完整、可直接运行的 DataFlow 流水线（含自定义算子）。
+_PIPELINE_RUNTIME_BOUNDARY = """
+【最高优先级运行边界】
+先加载并遵循 `$dataflow-evolver-pipeline`。DataFlow 运行时只使用已安装的
+`open-dataflow` 包；不要读取、搜索或复制任何 DataFlow 源码。算子和 Pipeline
+由本任务本地生成。通用 API、compile 和 Serving 响应兼容契约均以该 skill 为准；
+本 Prompt 只负责本轮数据目标、反馈、父代复用和动态模型配置。检查范围限于当前
+iteration 的任务产物，禁止自行执行 Pipeline 或做宽泛探索。
+"""
+
+PIPELINE_PROMPT = _PIPELINE_RUNTIME_BOUNDARY + "\n\n" + """为下述目标编写一条完整、可直接运行的 DataFlow 流水线（含自定义算子）。
 
 Target: {target}
 Expected outputs: {expected_outputs}
@@ -25,36 +34,32 @@ Entry file: {entry_path}
    FileStorage 的 `hf:` / `ms:` 远程入口。调用配置好的 LLM serving API 不受此限。
 3. 目标 schema：{target_schema}。最终 JSONL 至少包含这些字段且非空；可以保留额外的中间字段
    和溯源信息。
-4. 每个处理步骤放在 `{iteration_dir}/operators/` 下的独立自定义算子文件中。算子继承
-   `OperatorABC`，实现 `run()`；主文件写到 `{iteration_dir}/pipeline.py`。
+4. 每个处理步骤放在 `{iteration_dir}/operators/` 下的独立自定义算子文件中，主文件写到
+   `{iteration_dir}/pipeline.py`；算子和 Pipeline 的通用实现契约严格遵循专用 skill。
 5. 同步写 `{iteration_dir}/decision.json`，schema 必须为：
    {{"ops": [{{"name": "算子类名", "purpose": "作用", "params": {{}}}}, ...],
      "field_flow": "raw fields -> ... -> target fields", "reason": "设计理由"}}
-6. LLM 算子使用 `APILLMServing_request`，配置如下：
+6. 需要 LLM 的算子使用专用 skill 中的可配置 Serving 兼容层，并逐项采用以下动态配置；
+   不得根据模型名称自行推断 CoT 模式：
 {llm_block}
-7. FileStorage 的 `cache_path` 设为 `{iteration_dir}/cache`，最终在 `{iteration_dir}/` 下产出 JSONL。
-8. 主入口必须严格按 `pipeline.compile()` →
-   `if os.environ.get('DF_COMPILE_ONLY'): sys.exit(0)` → `pipeline.forward()` 排列。只写入所需产物，
+7. FileStorage 的 `cache_path` 设为 `{iteration_dir}/cache`；正式运行产生的最后一个 step JSONL 是本轮最终数据集产物。
+8. 主入口必须使用专用 skill 中唯一的 framework-owned compile/forward 契约。只写入所需产物，
    不要自行执行 `pipeline.py`（包括 compile-only 或 smoke test）；框架会在 Agent 返回后依次执行
    确定性的 artifact 校验、compile 预检和正式运行。
-{recommendation_block}{init_block}{parent_block}{review_block}{downstream_block}{history_block}
-约束：无头自动化运行，禁止 AskUserQuestion 与 git/gh 子流程。MCP 仅用于查看 DataFlow 算子源码，
-不能用于获取新数据。"""
+{init_block}{parent_block}{review_block}{downstream_block}{history_block}
+约束：无头自动化运行，禁止 AskUserQuestion 与 git/gh 子流程，不能获取新数据；所有实现
+依据均来自专用 skill、本轮 Prompt 和当前 iteration 产物。"""
 
 
 DECISION_SYNC_NOTE = """如果修复改变了算子、字段流或设计取舍，请同步覆盖
 `{iteration_dir}/decision.json`（键名仍为 `ops` / `field_flow` / `reason`）。"""
 
 
-PIPELINE_SELFCORRECT_PROMPT = """流水线 `{iteration_dir}/pipeline.py` 未通过框架检查。
+PIPELINE_SELFCORRECT_PROMPT = _PIPELINE_RUNTIME_BOUNDARY + "\n\n" + """流水线 `{iteration_dir}/pipeline.py` 未通过框架检查。
 失败阶段：`{failure_stage}`。
 
-请根据具体错误栈定向对照以下 DataFlow 源码定位并修复：
-- `dataflow/core/operator.py` 中的 `OperatorABC`
-- `dataflow/pipeline/Pipeline.py` 中的 `PipelineABC`
-- `dataflow/utils/storage.py`
-- `dataflow/serving/api_llm_serving_request.py`
-- `{iteration_dir}/operators/`
+只依据专用 skill、错误栈、逐步诊断以及当前 iteration 的 `pipeline.py` 和 `operators/`
+定位问题。
 
 只修改 `pipeline.py`、`operators/` 和必要的 `decision.json`，不要自行执行 `pipeline.py`、
 compile-only 或 smoke test。Agent 返回后，框架会重新执行 artifact 校验、compile 预检与正式运行。
@@ -78,10 +83,10 @@ compile-only 或 smoke test。Agent 返回后，框架会重新执行 artifact �
 
 
 FAILURE_SIGNALS: dict[str, str] = {
-    "F1": "描述过窄：数据围绕极少数结构展开，能力维度单一",
-    "F2": "华而不实：表面变化很多但逻辑结构高度一致",
-    "F3": "模板锁定：大量近重复或模板化雷同",
-    "F4": "覆盖塌陷：未覆盖目标任务的关键能力维度",
+    "F1": "抽样描述过窄：可见样本围绕极少数结构展开",
+    "F2": "抽样华而不实：表面变化很多但可见逻辑结构高度一致",
+    "F3": "抽样模板锁定：可见样本存在近重复或模板化雷同",
+    "F4": "抽样覆盖不足：可见样本缺少目标任务的关键能力维度",
     "F5": "约束漂移：偏离目标任务、领域或答案格式",
     "F6": "有形无实：形式满足但训练价值低",
     "F7": "描述空泛：内容语义松散或逐渐跑题",
@@ -95,9 +100,9 @@ _DIM_LABELS: tuple[tuple[str, str], ...] = (
 )
 
 
-REVIEW_PROMPT = """你是数据质量评审员。下面只是候选数据集的随机抽样。请评估单条样本用于微调
-目标模型的质量，每个维度取 0.0-1.0。不要从该抽样推断或评分整个数据集的多样性；
-框架会用同一批 dataset embedding 单独计算多样性指标。
+REVIEW_PROMPT = """你是数据质量评审员。下面是候选数据集的有界随机抽样。请评估该抽样中
+可直接观察到的微调质量，每个维度取 0.0-1.0。F1-F4 只能在抽样本身提供重复、模板化或覆盖不足
+的直接证据时报告，不能外推整个数据集；全量多样性由框架使用 dataset embedding 单独评估。
 
 目标任务：{task_description}
 期望 schema：{target_schema}
@@ -133,7 +138,6 @@ def build_pipeline_prompt(
     iteration_dir: str,
     llm_block: str = "",
     parent_code: str | None = None,
-    recommended_categories: dict | None = None,
     parent_rationale: str | None = None,
     parent_review: ReviewResult | None = None,
     downstream_feedback: DownstreamEvaluationResult | None = None,
@@ -150,12 +154,11 @@ def build_pipeline_prompt(
         target_schema=task.target_schema,
         iteration_dir=iteration_dir,
         llm_block=llm_block or "   使用项目已有的默认 serving 配置。",
-        recommendation_block=_recommendation_block(recommended_categories),
         init_block=(
             "【初始流水线】从固定 raw data 出发，设计稳定、可解释的处理基线。\n"
             if is_init else ""
         ),
-        parent_block=_parent_block(parent_code, parent_rationale),
+        parent_block=_parent_block(parent_code, parent_rationale, iteration_dir),
         review_block=(
             _parent_quality_block(parent_review) if parent_review is not None else ""
         ),
@@ -189,7 +192,7 @@ def build_review_prompt(task: TaskSpec, samples_text: str) -> str:
     )
 
 
-def _parent_block(code: str | None, rationale: str | None) -> str:
+def _parent_block(code: str | None, rationale: str | None, iteration_dir: str) -> str:
     if not code and not rationale:
         return ""
     lines = ["【上一轮流水线】"]
@@ -204,7 +207,7 @@ def _parent_block(code: str | None, rationale: str | None) -> str:
         lines.append(
             "【父轮算子代码与中间数据复用】上一轮 pipeline 中的绝对 `cache_path` 可定位父轮目录："
             "其同级 `operators/` 保存算子源码，`cache/` 保存逐步 JSONL。优先复制完全未变化的算子"
-            "源码到当前 `{iteration_dir}/operators/`，并复用这些算子形成的连续前缀 step JSONL；"
+            f"源码到当前 `{iteration_dir}/operators/`，并复用这些算子形成的连续前缀 step JSONL；"
             "尤其不要重复调用未变化的 LLM 算子。缓存命中时，用父轮最后一个可复用 step JSONL"
             "作为 suffix storage 的 `first_entry_file_name`，只运行首个变化步骤及其下游。\n"
             "只有 raw Entry file 内容，以及连续前缀每个算子的源码、初始化参数、`run()` 参数、"
@@ -368,7 +371,7 @@ def _downstream_feedback_block(
                 else "unknown"
             )
             finish_reason = case.finish_reason or "unknown"
-            runaway = "true" if case.length_truncated else "false"
+            runaway = "true" if is_runaway else "false"
             lines.extend(
                 [
                     f"Bad case {index}",
@@ -421,26 +424,11 @@ def _project_bad_case_response(
         return response, 0
     omitted = len(response) - limit
     marker = (
-        f"\n\n...[{omitted} chars omitted from prompt; read the full result file]...\n\n"
+        f"\n\n...[{omitted} chars omitted from prompt; full response retained for human audit only]...\n\n"
     )
     return (
         response[:head_chars]
         + marker
         + response[-tail_chars:],
         omitted,
-    )
-
-
-def _recommendation_block(recommended: dict | None) -> str:
-    if not recommended:
-        return ""
-    items = recommended.get("recommended_categories", [])
-    if not items:
-        return ""
-    text = "; ".join(
-        f"{item.get('category')} ({item.get('reason', '')})" for item in items[:3]
-    )
-    return (
-        "【DataFlow 源码参考】建议查看类别：" + text + "。可用 `list_operators` 和 "
-        "`get_operator_detail` 学习 API 与实现模式，但仍应为当前 raw data 编写自定义算子。\n"
     )
