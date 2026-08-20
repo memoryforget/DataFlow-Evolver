@@ -547,6 +547,49 @@ def summarize_qwen_records(
         raise RuntimeConfigError("Qwen evaluator produced an empty result file")
     correctness: list[bool] = []
     failures: list[dict[str, Any]] = []
+
+    def append_failure(
+        record: dict[str, Any],
+        sample_index: int,
+        outputs: list[Any],
+        parsed_answers: list[Any],
+        finish_reasons: list[Any],
+        output_token_counts: list[Any],
+    ) -> None:
+        question = _render_text(record.get("question"), "question")
+        reference = _render_text(record.get("gt"), "ground truth")
+        response = _render_text(
+            outputs[sample_index],
+            "model response",
+            empty_sentinel="[empty model response]",
+        )
+        parsed_answer = _render_text(
+            parsed_answers[sample_index],
+            "parsed answer",
+            empty_sentinel="",
+        )
+        finish_reason = str(finish_reasons[sample_index] or "")
+        raw_token_count = output_token_counts[sample_index]
+        response_token_count = (
+            int(raw_token_count) if raw_token_count is not None else None
+        )
+        length_truncated = finish_reason == "length" or (
+            response_token_count is not None
+            and response_token_count >= max_tokens_per_call - 1
+        )
+        failures.append(
+            {
+                "question": question,
+                "model_response": response,
+                "parsed_answer": parsed_answer,
+                "correct_answer": reference,
+                "response_token_count": response_token_count,
+                "finish_reason": finish_reason,
+                "length_truncated": length_truncated,
+                "sample_index": sample_index,
+            }
+        )
+
     for index, record in enumerate(records):
         scores = record.get("score")
         outputs = record.get("code")
@@ -578,58 +621,58 @@ def summarize_qwen_records(
             raise RuntimeConfigError(
                 f"Qwen result {index} has invalid output token counts"
             )
+
+        sample_correctness = [bool(score) for score in scores]
         if metric == "accuracy":
-            correct = bool(scores[0])
+            correct = sample_correctness[0]
+            correctness.append(correct)
+            if not correct:
+                append_failure(
+                    record, 0, outputs, parsed_answers, finish_reasons, output_token_counts
+                )
         elif metric == f"pass@{n_sampling}":
-            correct = any(bool(score) for score in scores)
+            correct = any(sample_correctness)
+            correctness.append(correct)
+            if not correct:
+                append_failure(
+                    record, 0, outputs, parsed_answers, finish_reasons, output_token_counts
+                )
+        elif metric == f"avg@{n_sampling}":
+            correctness.extend(sample_correctness)
+            for sample_index, correct in enumerate(sample_correctness):
+                if not correct:
+                    append_failure(
+                        record,
+                        sample_index,
+                        outputs,
+                        parsed_answers,
+                        finish_reasons,
+                        output_token_counts,
+                    )
         else:
             raise RuntimeConfigError(
-                f"unsupported metric {metric!r}; use 'accuracy' or 'pass@{n_sampling}'"
+                f"unsupported metric {metric!r}; use 'accuracy', "
+                f"'pass@{n_sampling}', or 'avg@{n_sampling}'"
             )
-        correctness.append(correct)
-        if not correct:
-            question = _render_text(record.get("question"), "question")
-            reference = _render_text(record.get("gt"), "ground truth")
-            response = _render_text(
-                outputs[0], "model response", empty_sentinel="[empty model response]"
-            )
-            parsed_answer = _render_text(
-                parsed_answers[0], "parsed answer", empty_sentinel=""
-            )
-            finish_reason = str(finish_reasons[0] or "")
-            raw_token_count = output_token_counts[0]
-            response_token_count = (
-                int(raw_token_count) if raw_token_count is not None else None
-            )
-            length_truncated = finish_reason == "length" or (
-                response_token_count is not None
-                and response_token_count >= max_tokens_per_call - 1
-            )
-            failures.append(
-                {
-                    "question": question,
-                    "model_response": response,
-                    "parsed_answer": parsed_answer,
-                    "correct_answer": reference,
-                    "response_token_count": response_token_count,
-                    "finish_reason": finish_reason,
-                    "length_truncated": length_truncated,
-                }
-            )
+
+    correct_count = sum(correctness)
+    total_count = len(correctness)
     failure_counts = _count_bad_case_categories(failures)
     bad_cases = _select_stratified_bad_cases(
         failures,
         limit=bad_cases_per_benchmark,
     )
-    score = sum(correctness) / len(correctness)
     return {
-        "score": score,
+        "score": correct_count / total_count,
+        "correct_count": correct_count,
+        "total_count": total_count,
+        "question_count": len(records),
+        "n_sampling": n_sampling,
         "metric": metric,
         "incorrect_count": len(failures),
         **failure_counts,
         "bad_cases": bad_cases,
     }
-
 
 def _bad_case_category(case: dict[str, Any]) -> str:
     finish_reason = str(case.get("finish_reason") or "")

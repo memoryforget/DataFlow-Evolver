@@ -14,6 +14,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from dataflow_evolver.core.schemas import PipelineConfig
+from dataflow_evolver.engine.step_cache import (
+    MANIFEST_FILENAME,
+    REUSE_PLAN_FILENAME,
+    prepare_step_reuse,
+    write_step_manifest,
+)
 from dataflow_evolver.telemetry.pipeline_usage import (
     ATTEMPT_ENV,
     BOOTSTRAP_DIR,
@@ -53,6 +59,7 @@ class ExecutionWrapperABC(ABC):
         config: PipelineConfig,
         iteration_dir: Path,
         env_overrides: dict[str, str] | None = None,
+        parent_iteration_dir: Path | None = None,
     ) -> ExecutionResult:
         """Execute the generated pipeline inside one iteration directory."""
         raise NotImplementedError
@@ -74,6 +81,7 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
         timeout_sec: int = 1800,
         python_exe: str | None = None,
         extra_env: dict[str, str] | None = None,
+        raw_entry_path: str | None = None,
     ) -> None:
         self.workspace_dir = Path(workspace_dir).resolve()
         self.pipeline_filename = pipeline_filename
@@ -81,6 +89,7 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
         self.timeout_sec = timeout_sec
         self.python_exe = python_exe or sys.executable
         self.extra_env = extra_env or {}
+        self.raw_entry_path = str(Path(raw_entry_path).resolve()) if raw_entry_path else ""
         self._execution_attempts: dict[str, int] = {}
 
     def run(
@@ -88,6 +97,7 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
         config: PipelineConfig,
         iteration_dir: Path,
         env_overrides: dict[str, str] | None = None,
+        parent_iteration_dir: Path | None = None,
     ) -> ExecutionResult:
         iteration_dir = iteration_dir.resolve()
         pipeline_path = iteration_dir / self.pipeline_filename
@@ -112,7 +122,29 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
                 failure_stage="artifact_validation",
             )
 
-        env = {**os.environ, **self.extra_env}
+        raw_entry_path = self.raw_entry_path
+        if not raw_entry_path:
+            return ExecutionResult(
+                False,
+                traceback="framework raw_entry_path is not configured",
+                failure_stage="artifact_validation",
+            )
+        reuse_plan = prepare_step_reuse(
+            config,
+            iteration_dir,
+            parent_iteration_dir=parent_iteration_dir,
+            raw_entry_path=raw_entry_path,
+            pipeline_filename=self.pipeline_filename,
+        )
+        logger.info(
+            "Framework step cache：prefix=%d/%d source=%s reason=%s",
+            reuse_plan.prefix_count,
+            len(reuse_plan.operator_names),
+            reuse_plan.entry_path,
+            reuse_plan.reason,
+        )
+
+        env = {**os.environ, **self.extra_env, **reuse_plan.env()}
         # Generated code may import Evolver's compatibility adapter, but DataFlow itself
         # resolves from the installed open-dataflow package.
         prev_pp = env.get("PYTHONPATH", "")
@@ -151,6 +183,8 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
             "pipeline_llm_calls": str(events_path),
             "pipeline_llm_token_usage": str(summary_path),
             "token_usage": str(combined_path),
+            "step_reuse_plan": str(iteration_dir / REUSE_PLAN_FILENAME),
+            "step_manifest": str(iteration_dir / MANIFEST_FILENAME),
         }
 
         def finalize_usage() -> None:
@@ -209,6 +243,34 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
                 failure_stage="compile",
             )
 
+        if reuse_plan.fully_reused:
+            try:
+                manifest_path = write_step_manifest(
+                    config,
+                    iteration_dir,
+                    raw_entry_path=raw_entry_path,
+                    pipeline_filename=self.pipeline_filename,
+                    plan=reuse_plan,
+                    executed_artifacts=[],
+                    final_dataset_path=reuse_plan.entry_path,
+                )
+            except (OSError, ValueError) as exc:
+                return ExecutionResult(
+                    False,
+                    traceback=f"step manifest validation failed: {exc}",
+                    artifacts=artifacts,
+                    failure_stage="output_validation",
+                )
+            artifacts["step_manifest"] = str(manifest_path)
+            logger.info("Framework step cache 全前缀命中：%s", reuse_plan.entry_path)
+            return ExecutionResult(
+                True,
+                dataset_path=reuse_plan.entry_path,
+                stdout=compile_proc.stdout,
+                stderr=compile_proc.stderr,
+                artifacts=artifacts,
+            )
+
         logger.info("compile 预检通过，开始正式执行：%s", pipeline_path)
         start = time.time()
         try:
@@ -255,6 +317,29 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
                 diagnostics=diagnostics,
                 failure_stage="output_validation",
             )
+        executed_artifacts = _find_fresh_step_jsonl(iteration_dir, since=start)
+        try:
+            manifest_path = write_step_manifest(
+                config,
+                iteration_dir,
+                raw_entry_path=raw_entry_path,
+                pipeline_filename=self.pipeline_filename,
+                plan=reuse_plan,
+                executed_artifacts=executed_artifacts,
+                final_dataset_path=str(dataset_path),
+            )
+        except (OSError, ValueError) as exc:
+            diagnostics = _jsonl_diagnostics(iteration_dir, since=start)
+            return ExecutionResult(
+                False,
+                traceback=f"step manifest validation failed: {exc}",
+                stdout=proc.stdout,
+                stderr=proc.stderr,
+                artifacts=artifacts,
+                diagnostics=diagnostics,
+                failure_stage="output_validation",
+            )
+        artifacts["step_manifest"] = str(manifest_path)
         logger.info("流水线产出数据集：%s", dataset_path)
         return ExecutionResult(
             True, dataset_path=str(dataset_path), stdout=proc.stdout, stderr=proc.stderr,
@@ -334,6 +419,23 @@ def _is_pipeline_artifact(path: Path, iteration_dir: Path) -> bool:
     except ValueError:
         return False
     return bool(relative.parts) and relative.parts[0] != "sessions" and path.name not in _METADATA_JSONL
+
+
+def _find_fresh_step_jsonl(iteration_dir: Path, since: float) -> list[Path]:
+    fresh: list[tuple[int, Path]] = []
+    for path in iteration_dir.rglob("*.jsonl"):
+        if not path.is_file() or not _is_pipeline_artifact(path, iteration_dir):
+            continue
+        try:
+            if path.stat().st_mtime < since - 1.0:
+                continue
+        except OSError:
+            continue
+        match = _STEP_RE.search(path.name)
+        if match:
+            fresh.append((int(match.group(1)), path))
+    fresh.sort(key=lambda item: item[0])
+    return [path for _, path in fresh]
 
 
 def _find_fresh_jsonl(iteration_dir: Path, since: float) -> Path | None:

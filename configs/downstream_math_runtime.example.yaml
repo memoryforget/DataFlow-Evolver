@@ -17,8 +17,8 @@ sft:
     dataloader_num_workers: 4
     per_device_train_batch_size: 2
     gradient_accumulation_steps: 4
-    learning_rate: 1.0e-5
-    num_train_epochs: 3.0
+    learning_rate: 5.0e-6
+    num_train_epochs: 2.0
     lr_scheduler_type: cosine
     warmup_ratio: 0.1
     bf16: true
@@ -69,11 +69,11 @@ evaluation:
         amc23: amc23
         aime24: aime24
         aime25: aime25
-      metric: pass@32
+      metric: avg@4
       prompt_type: qwen25-math-cot
       temperature: 0.6
       top_p: 1.0
-      n_sampling: 32
+      n_sampling: 4
       max_tokens_per_call: 16384
       max_model_len: 32768
       seed: 0

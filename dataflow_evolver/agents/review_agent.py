@@ -81,6 +81,7 @@ class ReviewAgent(AgentABC):
         dataset_quality_weight: float = 0.25,
         dataset_quality_score_weights: dict[str, float] | None = None,
         duplicate_fields: list[str] | None = None,
+        contamination_fields: list[str] | None = None,
     ) -> None:
         super().__init__(serving, max_retries=max_retries)
         self.schema_threshold = schema_threshold
@@ -102,6 +103,9 @@ class ReviewAgent(AgentABC):
             dataset_quality_score_weights
         )
         self.duplicate_fields = list(duplicate_fields) if duplicate_fields else None
+        self.contamination_fields = (
+            list(contamination_fields) if contamination_fields else None
+        )
 
     def build_prompt(self, task: TaskSpec, samples_text: str) -> str:
         return build_review_prompt(task, samples_text)
@@ -187,7 +191,10 @@ class ReviewAgent(AgentABC):
         # 去污染：与 benchmark 测试集重合的数据不是"质量差"，是把评测答案抄进了训练集。
         # 既按比例打折（少量疑似重合可能是假阳，不该一票否决），又设硬门槛（超过阈值就是
         # 在刷分，必须判不通过并把证据喂回 Agent，否则搜索会持续往这个方向走）。
-        contam = self.contamination.scan(dataset_path)
+        contam = self.contamination.scan(
+            dataset_path,
+            fields=self.contamination_fields,
+        )
         result.contamination_rate = contam.rate
         if contam.hits:
             self.logger.warning(

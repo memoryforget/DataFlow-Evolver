@@ -27,9 +27,9 @@ Entry file: {entry_path}
 {input_block}
 
 核心要求：
-1. 这是固定语料加工/增强任务。`first_entry_file_name` 必须指向上面的 Entry file；流水线必须
-   在用户提供的 raw data 上做抽取、清洗、过滤、改写、增强、蒸馏或字段转换，不能绕开输入另起
-   一套纯生成数据。
+1. 这是固定语料加工/增强任务。将上面的 Entry file 作为 `FrameworkStepCache.from_env()` 的
+   `raw_entry_path`；`first_entry_file_name` 必须使用框架返回的 `entry_path`。未命中复用时该路径
+   就是固定 raw data。流水线不能绕开输入另起一套纯生成数据。
 2. 不允许联网拉取外部数据，包括 `load_dataset`、`hf_hub_download`、`requests`/curl，以及
    FileStorage 的 `hf:` / `ms:` 远程入口。调用配置好的 LLM serving API 不受此限。
 3. 目标 schema：{target_schema}。最终 JSONL 至少包含这些字段且非空；可以保留额外的中间字段
@@ -39,13 +39,16 @@ Entry file: {entry_path}
 5. 同步写 `{iteration_dir}/decision.json`，schema 必须为：
    {{"ops": [{{"name": "算子类名", "purpose": "作用", "params": {{}}}}, ...],
      "field_flow": "raw fields -> ... -> target fields", "reason": "设计理由"}}
-6. 需要 LLM 的算子使用专用 skill 中的可配置 Serving 兼容层，并逐项采用以下动态配置；
-   不得根据模型名称自行推断 CoT 模式：
+6. 以下动态配置只声明本轮可用的 LLM Serving 能力，不预设 Pipeline 是否调用 LLM、
+   在哪个步骤调用或调用结果承担什么职责，你需要根据任务与反馈自行设计；若使用 LLM，
+   必须在 Pipeline 层按专用 skill 构造并注入 Serving，且不得根据模型名称自行推断响应模式：
 {llm_block}
 7. FileStorage 的 `cache_path` 设为 `{iteration_dir}/cache`；正式运行产生的最后一个 step JSONL 是本轮最终数据集产物。
 8. 主入口必须使用专用 skill 中唯一的 framework-owned compile/forward 契约。只写入所需产物，
    不要自行执行 `pipeline.py`（包括 compile-only 或 smoke test）；框架会在 Agent 返回后依次执行
    确定性的 artifact 校验、compile 预检和正式运行。
+9. 以解决 Review、下游评测和 bad cases 暴露的问题为首要目标，不以最少代码、文件或算子为目标。
+   根据职责边界和反馈自由增加、删除、拆分或合并算子；不要为了缓存复用而保留不合理的父流水线结构。
 {init_block}{parent_block}{review_block}{downstream_block}{history_block}
 约束：无头自动化运行，禁止 AskUserQuestion 与 git/gh 子流程，不能获取新数据；所有实现
 依据均来自专用 skill、本轮 Prompt 和当前 iteration 产物。"""
@@ -198,25 +201,24 @@ def _parent_block(code: str | None, rationale: str | None, iteration_dir: str) -
     lines = ["【上一轮流水线】"]
     if code:
         lines.append(
-            "在下面这份已执行流水线基础上做针对性修改，不要原样复制，也不要无依据重写：\n"
+            "把下面这份已执行流水线作为经过验证的参考实现。根据反馈自由保留、替换、拆分、合并、增加或删除算子；不要为了缓存复用而维持原结构，也不要无依据重写：\n"
             f"```python\n{code}\n```"
         )
     if rationale:
         lines.append(f"上一轮设计理由：{rationale}")
     if code:
         lines.append(
-            "【父轮算子代码与中间数据复用】上一轮 pipeline 中的绝对 `cache_path` 可定位父轮目录："
-            "其同级 `operators/` 保存算子源码，`cache/` 保存逐步 JSONL。优先复制完全未变化的算子"
-            f"源码到当前 `{iteration_dir}/operators/`，并复用这些算子形成的连续前缀 step JSONL；"
-            "尤其不要重复调用未变化的 LLM 算子。缓存命中时，用父轮最后一个可复用 step JSONL"
-            "作为 suffix storage 的 `first_entry_file_name`，只运行首个变化步骤及其下游。\n"
-            "只有 raw Entry file 内容，以及连续前缀每个算子的源码、初始化参数、`run()` 参数、"
-            "字段流、模型、prompt 和 serving 参数都相同，且父轮 step JSONL 存在可解析时才允许命中。"
-            "任一条件不能确认就从 raw input 完整重算；某一步变化时，该步及其下游全部重算。当前轮"
-            "必须包含复用算子的源码副本并保留 raw-input fallback，禁止跨 iteration import 或把父轮"
-            "最终数据伪装成 raw input。\n"
-            "在 `decision.json.reason` 记录复用算子、截止 step、父轮缓存、验证条件和 fallback。"
-            "命中或未命中都打印 `DF_PREFIX_CACHE_REUSE hit|miss cutoff=<step> source=<path>`。"
+            "【Framework-owned 父轮复用】只判断哪些连续前缀算子在语义上保持不变，并复制这些算子"
+            f"的本地源码到当前 `{iteration_dir}/operators/`。不要读取、选择、验证或硬编码父轮 cache "
+            "JSONL；不要通过 `pipeline_step_stepN` 推断 producer，也不要自行实现 cache hit/miss。\n"
+            "每条 Pipeline 都必须使用 skill 中的 `FrameworkStepCache.from_env()` 标准适配器。框架会在"
+            "执行前比较 raw input、逻辑算子顺序、源码及本地依赖、初始化调用与参数 fingerprint，并从"
+            "父轮 `step_manifest.json` 注入经过验证的 entry path 和 prefix count；无法证明时自动从 raw "
+            "input 完整重算。Pipeline 只按 `should_run(logical_index)` 机械跳过框架确认的前缀。\n"
+            "在 `decision.json.reason` 只记录哪些前缀算子未变化以及首个变化算子；缓存 artifact、step "
+            "编号、lineage 与命中结论全部由框架记录，Agent 不得自行决定。源码不参与身份校验；保持相同的算子名、顺序、"
+            "`decision.json.params` 与初始化调用即声明语义未变并授权框架复用。若算子实现或本地依赖的行为发生变化，"
+            "必须更新算子类名、params 或初始化参数中的至少一项。"
         )
     return "\n".join(lines) + "\n"
 
@@ -329,7 +331,7 @@ def _downstream_feedback_block(
         checkpoint,
         "以下 bad cases 是诊断证据，不是可复制进训练数据的新数据源。禁止复述、硬编码或"
         "针对这些 benchmark 题目构造答案；应归纳能力缺口并改进 raw-data pipeline。",
-        "完整、未截断的结果由框架单独保留用于人工审计；PipelineAgent 不要读取完整 result.json。"
+        "完整、未截断的结果由框架单独保留用于人工审计；不要读取完整 result.json。"
         "下面提供的有界投影已经是本轮允许使用的全部下游诊断证据。",
     ]
     for benchmark_name, benchmark in feedback.benchmarks.items():
@@ -344,6 +346,10 @@ def _downstream_feedback_block(
         lines.append(
             f"\n### {benchmark_name}: {benchmark.metric}={benchmark.score:.6f}"
             f"{delta_text}{baseline_delta_text}; "
+            f"correct_count={benchmark.correct_count}; "
+            f"total_count={benchmark.total_count}; "
+            f"question_count={benchmark.question_count}; "
+            f"n_sampling={benchmark.n_sampling}; "
             f"incorrect_count={benchmark.incorrect_count}; "
             f"wrong_answer_count={benchmark.wrong_answer_count}; "
             f"parse_failure_count={benchmark.parse_failure_count}; "

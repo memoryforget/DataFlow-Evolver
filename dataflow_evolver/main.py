@@ -142,6 +142,9 @@ class ReviewOnlyLoop:
                 parent_review=(
                     parent_incumbent.review if parent_incumbent is not None else None
                 ),
+                parent_iteration_dir=(
+                    parent_incumbent.iteration_dir if parent_incumbent is not None else None
+                ),
             )
             candidate.parent_iteration = (
                 parent_incumbent.iteration if parent_incumbent is not None else None
@@ -223,9 +226,14 @@ class ReviewOnlyLoop:
         iteration_dir: Path,
         config: PipelineConfig,
         parent_review: ReviewResult | None = None,
+        parent_iteration_dir: Path | None = None,
     ) -> Candidate:
         iteration_started = time.perf_counter()
-        result: ExecutionResult = self.executor.run(config, iteration_dir)
+        result: ExecutionResult = self.executor.run(
+            config,
+            iteration_dir,
+            parent_iteration_dir=parent_iteration_dir,
+        )
         retries = 0
         while not result.success and retries < self.execution_repairs:
             retries += 1
@@ -239,7 +247,11 @@ class ReviewOnlyLoop:
             if fixed is None:
                 break
             config = fixed
-            result = self.executor.run(config, iteration_dir)
+            result = self.executor.run(
+                config,
+                iteration_dir,
+                parent_iteration_dir=parent_iteration_dir,
+            )
 
         if not result.success or not result.dataset_path:
             logger.error("流水线执行最终失败：%s", result.traceback)
@@ -518,6 +530,9 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
             dataset_quality_cfg.get("score_weights")
         ) or None,
         duplicate_fields=list(review_cfg.get("duplicate_fields", []) or []) or None,
+        contamination_fields=(
+            list(decon_cfg.get("candidate_fields", []) or []) or None
+        ),
     )
 
     agent_cfg = cfg.agent
@@ -539,6 +554,7 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
         timeout_sec=int(loop_cfg.get("execution_timeout_sec", 1200)),
         python_exe=str(loop_cfg.get("python_exe", "") or "") or None,
         extra_env=extra_env or None,
+        raw_entry_path=corpus.entry_path,
     )
     downstream_evaluator, downstream_interval = _build_downstream_evaluator(
         cfg.get("downstream_eval") or Config({})
@@ -741,18 +757,20 @@ def _normalize_pipeline_api_url(value: Any) -> Any:
 def _pipeline_runtime_contract(
     pipeline_llm: dict[str, dict[str, Any]],
 ) -> tuple[str, dict[str, str]]:
-    lines = ["   按用途区分的 Pipeline 算子 LLM Serving（配置决定模型与响应策略）："]
+    lines = ["   可用的 Pipeline LLM Serving profiles（profile 名只标识配置，不限定算子职责）："]
     env: dict[str, str] = {}
-    for purpose, item in pipeline_llm.items():
-        env_name = f"DF_PIPELINE_API_KEY_{purpose.upper()}"
+    for profile, item in pipeline_llm.items():
+        env_name = f"DF_PIPELINE_API_KEY_{profile.upper()}"
         lines.append(
-            f"   [{purpose}] model={item['model_name']}, api_url={item['api_url']}, "
+            f"   [{profile}] model={item['model_name']}, api_url={item['api_url']}, "
             f"key_name_of_api_key={env_name}, max_workers={item['max_workers']}, "
-            f"serving_kwargs={json.dumps(item.get('serving_kwargs', {}), ensure_ascii=False)}"
+            f"default_serving_kwargs={json.dumps(item.get('serving_kwargs', {}), ensure_ascii=False)}"
         )
         lines.append(
-            f"      使用 from dataflow_evolver.compat import EvolverAPILLMServing；"
-            f"构造服务时必须把 [{purpose}] serving_kwargs 逐项作为关键字参数传入。"
+            "      该 profile 是连接与默认响应契约，不代表必须采用的算子用途。"
+            "你自行决定是否使用以及是否从它构造多个 Pipeline-owned serving；"
+            "若为设计需要选择不同响应契约，应使用 skill 公开的兼容参数并在 decision.json.params "
+            "记录非敏感语义差异。"
         )
         if item.get("api_key"):
             env[env_name] = str(item["api_key"])

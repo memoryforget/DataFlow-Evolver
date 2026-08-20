@@ -58,6 +58,10 @@ class DownstreamBenchmarkResult:
     parse_failure_count: int
     runaway_count: int
     bad_cases: list[DownstreamBadCase]
+    correct_count: int | None = None
+    total_count: int | None = None
+    question_count: int | None = None
+    n_sampling: int | None = None
 
 
 @dataclass
@@ -314,6 +318,74 @@ def _validate_result(
                 f"(min({bad_cases_per_benchmark}, incorrect_count={incorrect_count}))"
             )
         metric = _nonempty_string(item.get("metric"), f"{name}.metric")
+        result_count_fields = (
+            "correct_count",
+            "total_count",
+            "question_count",
+            "n_sampling",
+        )
+        present_result_counts = [field in item for field in result_count_fields]
+        if any(present_result_counts) and not all(present_result_counts):
+            raise ValueError(
+                f"benchmark {name!r} must provide all result count fields"
+            )
+        if all(present_result_counts):
+            correct_count = _nonnegative_int(
+                item.get("correct_count"), f"{name}.correct_count"
+            )
+            total_count = _nonnegative_int(
+                item.get("total_count"), f"{name}.total_count"
+            )
+            question_count = _nonnegative_int(
+                item.get("question_count"), f"{name}.question_count"
+            )
+            n_sampling = _nonnegative_int(
+                item.get("n_sampling"), f"{name}.n_sampling"
+            )
+            if total_count < 1 or question_count < 1 or n_sampling < 1:
+                raise ValueError(
+                    f"benchmark {name!r} result counts must be positive except correct_count"
+                )
+            if correct_count > total_count:
+                raise ValueError(
+                    f"benchmark {name!r} correct_count exceeds total_count"
+                )
+            if total_count - correct_count != incorrect_count:
+                raise ValueError(
+                    f"benchmark {name!r} count mismatch: total-correct="
+                    f"{total_count - correct_count}, incorrect_count={incorrect_count}"
+                )
+            expected_total = (
+                question_count * n_sampling
+                if metric == f"avg@{n_sampling}"
+                else question_count
+            )
+            if total_count != expected_total:
+                raise ValueError(
+                    f"benchmark {name!r} total_count={total_count} does not match "
+                    f"metric={metric}, question_count={question_count}, "
+                    f"n_sampling={n_sampling}"
+                )
+            if abs(score - correct_count / total_count) > 1e-9:
+                raise ValueError(
+                    f"benchmark {name!r} score does not equal correct_count/total_count"
+                )
+        else:
+            # Backward-compatible inference for cached protocol-v3 baseline results.
+            n_sampling = 1
+            if "@" in metric:
+                try:
+                    n_sampling = int(metric.rsplit("@", 1)[1])
+                except ValueError:
+                    n_sampling = 1
+            if score < 1.0:
+                total_count = round(incorrect_count / (1.0 - score))
+                correct_count = total_count - incorrect_count
+                question_count = total_count
+            else:
+                correct_count = None
+                total_count = None
+                question_count = None
         validated[name] = DownstreamBenchmarkResult(
             score=score,
             metric=metric,
@@ -325,6 +397,10 @@ def _validate_result(
                 _validate_bad_case(name, index, value)
                 for index, value in enumerate(bad_cases)
             ],
+            correct_count=correct_count,
+            total_count=total_count,
+            question_count=question_count,
+            n_sampling=n_sampling,
         )
     return validated
 
