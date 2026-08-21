@@ -152,6 +152,76 @@ def audit_sft_token_lengths(
     }
 
 
+def synchronize_model_eos_contract(model_dir: Path) -> dict[str, Any]:
+    """Align model generation EOS with the tokenizer used by the SFT template."""
+    tokenizer_path = model_dir / "tokenizer_config.json"
+    if not tokenizer_path.is_file():
+        raise RuntimeError(
+            f"LlamaFactory completed without tokenizer_config.json: {model_dir}"
+        )
+    tokenizer_config = json.loads(tokenizer_path.read_text(encoding="utf-8"))
+    eos_token = tokenizer_config.get("eos_token")
+    if isinstance(eos_token, Mapping):
+        eos_token = eos_token.get("content")
+    if not isinstance(eos_token, str) or not eos_token:
+        raise RuntimeError(f"saved tokenizer has no usable eos_token: {tokenizer_path}")
+
+    eos_token_id = tokenizer_config.get("eos_token_id")
+    if isinstance(eos_token_id, bool) or not isinstance(eos_token_id, int):
+        eos_token_id = None
+        decoder = tokenizer_config.get("added_tokens_decoder", {})
+        if isinstance(decoder, Mapping):
+            for raw_token_id, token_spec in decoder.items():
+                content = (
+                    token_spec.get("content")
+                    if isinstance(token_spec, Mapping)
+                    else token_spec
+                )
+                if content == eos_token:
+                    try:
+                        eos_token_id = int(raw_token_id)
+                    except (TypeError, ValueError):
+                        continue
+                    break
+    if eos_token_id is None:
+        added_tokens_path = model_dir / "added_tokens.json"
+        if added_tokens_path.is_file():
+            added_tokens = json.loads(added_tokens_path.read_text(encoding="utf-8"))
+            candidate = added_tokens.get(eos_token)
+            if isinstance(candidate, int) and not isinstance(candidate, bool):
+                eos_token_id = candidate
+    if eos_token_id is None:
+        raise RuntimeError(
+            f"cannot resolve token id for saved tokenizer EOS {eos_token!r}"
+        )
+
+    report: dict[str, Any] = {
+        "eos_token": eos_token,
+        "eos_token_id": eos_token_id,
+        "configs": {},
+    }
+    for file_name in ("config.json", "generation_config.json"):
+        config_path = model_dir / file_name
+        if not config_path.is_file():
+            if file_name == "config.json":
+                raise RuntimeError(
+                    f"LlamaFactory completed without a model config: {model_dir}"
+                )
+            continue
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        previous = payload.get("eos_token_id")
+        payload["eos_token_id"] = eos_token_id
+        config_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        report["configs"][file_name] = {
+            "previous_eos_token_id": previous,
+            "eos_token_id": eos_token_id,
+        }
+    return report
+
+
 def train_sft(
     request: Mapping[str, Any],
     config: Mapping[str, Any],
@@ -261,11 +331,40 @@ def train_sft(
         raise RuntimeError(
             f"LlamaFactory completed without a model config: {output_dir}"
         )
+    eos_contract = synchronize_model_eos_contract(output_dir)
+    expected_eos_token = sft.get("expected_eos_token")
+    if expected_eos_token is not None:
+        expected_token = _string(
+            expected_eos_token, "sft.expected_eos_token"
+        )
+        if eos_contract["eos_token"] != expected_token:
+            raise RuntimeConfigError(
+                "SFT tokenizer EOS contract mismatch: "
+                f"expected token {expected_token!r}, "
+                f"got {eos_contract['eos_token']!r}"
+            )
+    expected_eos_token_id = sft.get("expected_eos_token_id")
+    if expected_eos_token_id is not None:
+        expected_token_id = _nonnegative_int(
+            expected_eos_token_id, "sft.expected_eos_token_id"
+        )
+        if eos_contract["eos_token_id"] != expected_token_id:
+            raise RuntimeConfigError(
+                "SFT tokenizer EOS contract mismatch: "
+                f"expected token id {expected_token_id}, "
+                f"got {eos_contract['eos_token_id']}"
+            )
+    eos_contract_path = runtime_dir / "sft_eos_contract.json"
+    eos_contract_path.write_text(
+        json.dumps(eos_contract, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     return output_dir, {
         "checkpoint": str(output_dir.resolve()),
         "normalized_dataset": str(train_file.resolve()),
         "normalization_report": str(normalization_path.resolve()),
         "sft_config": str(train_config_path.resolve()),
+        "sft_eos_contract": str(eos_contract_path.resolve()),
     }
 
 
@@ -356,6 +455,16 @@ def evaluate_model(
         group_output = output_root / group_name
         group_output.mkdir(parents=True, exist_ok=True)
         parser_names = list(labels_to_parsers.values())
+        prompt_type = _string(
+            group_map.get("prompt_type", "qwen25-math-cot"),
+            f"{group_name}.prompt_type",
+        )
+        apply_chat_template = bool(group_map.get("apply_chat_template", False))
+        if prompt_type == "qwen25-math-cot" and apply_chat_template:
+            raise RuntimeConfigError(
+                "qwen25-math-cot already contains complete Qwen ChatML markers; "
+                "evaluation.groups[].apply_chat_template must remain false"
+            )
         cuda_visible_devices = _string(
             group_map.get("cuda_visible_devices", global_cuda),
             f"{group_name}.cuda_visible_devices",
@@ -396,10 +505,7 @@ def evaluate_model(
             "--model_name_or_path",
             str(model_path.resolve()),
             "--prompt_type",
-            _string(
-                group_map.get("prompt_type", "qwen25-math-cot"),
-                f"{group_name}.prompt_type",
-            ),
+            prompt_type,
             "--split",
             "test",
             "--num_test_sample",
@@ -442,7 +548,7 @@ def evaluate_model(
             "--save_outputs",
             "--overwrite",
         ]
-        if bool(group_map.get("apply_chat_template", False)):
+        if apply_chat_template:
             argv.append("--apply_chat_template")
         devices_per_replica = tensor_parallel_size * pipeline_parallel_size
         shard_outputs: list[Path] = []

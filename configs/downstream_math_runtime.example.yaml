@@ -7,10 +7,14 @@ sft:
   timeout_sec: 86400
   user_field: instruction
   assistant_field: output
+  expected_eos_token: <|endoftext|>
+  expected_eos_token_id: 151643
   fail_on_truncation: false
+  env:
+    PYTHONPATH: $DFE_REPO/scripts/downstream/llamafactory_qwen2_5_base_site
   trainer:
     deepspeed: $DFE_REPO/configs/deepspeed/ds_z2_config.json
-    template: qwen
+    template: qwen2_5_base
     cutoff_len: 4096
     packing: false
     preprocessing_num_workers: 16
@@ -18,7 +22,7 @@ sft:
     per_device_train_batch_size: 2
     gradient_accumulation_steps: 4
     learning_rate: 5.0e-6
-    num_train_epochs: 2.0
+    num_train_epochs: 1.0
     lr_scheduler_type: cosine
     warmup_ratio: 0.1
     bf16: true

@@ -56,6 +56,11 @@ def parse_args():
         help="Few shot for multiple-choice questions, zero shot for others.",
     )
     args = parser.parse_args()
+    if args.prompt_type == "qwen25-math-cot" and args.apply_chat_template:
+        parser.error(
+            "qwen25-math-cot already contains complete Qwen ChatML markers; "
+            "do not combine it with --apply_chat_template"
+        )
     args.top_p = (
         1 if args.temperature == 0 else args.top_p
     )  # top_p must be 1 when using greedy sampling (vllm)
@@ -120,6 +125,32 @@ def prepare_data(data_name, args):
     return examples, processed_samples, out_file
 
 
+def resolve_stop_token_ids(tokenizer):
+    token_ids = []
+    candidates = [
+        tokenizer.eos_token_id,
+        tokenizer.convert_tokens_to_ids("<|im_end|>"),
+        tokenizer.convert_tokens_to_ids("<|endoftext|>"),
+    ]
+    vocabulary_size = len(tokenizer)
+    for candidate in candidates:
+        if isinstance(candidate, (list, tuple)):
+            values = candidate
+        else:
+            values = [candidate]
+        for token_id in values:
+            if (
+                isinstance(token_id, int)
+                and not isinstance(token_id, bool)
+                and 0 <= token_id < vocabulary_size
+                and token_id not in token_ids
+            ):
+                token_ids.append(token_id)
+    if not token_ids:
+        raise ValueError("unable to resolve evaluator stop token IDs from tokenizer")
+    return token_ids
+
+
 def setup(args):
     # load model
     available_gpus = [
@@ -145,11 +176,9 @@ def setup(args):
             seed=args.seed,
             max_model_len=args.max_model_len,
         )
-        tokenizer = None
-        if args.apply_chat_template:
-            tokenizer = AutoTokenizer.from_pretrained(
-                args.model_name_or_path, trust_remote_code=True
-            )
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_name_or_path, trust_remote_code=True
+        )
     else:
         llm, tokenizer = load_hf_lm_and_tokenizer(
             model_name_or_path=args.model_name_or_path,
@@ -316,11 +345,7 @@ def main(llm, tokenizer, data_name, args):
                     max_tokens=args.max_tokens_per_call,
                     n=1,
                     stop=stop_words,
-                    stop_token_ids=(
-                        [151645, 151643]
-                        if "qwen2" in args.model_name_or_path.lower()
-                        else None
-                    ),
+                    stop_token_ids=resolve_stop_token_ids(tokenizer),
                 ),
             )
 

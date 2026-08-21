@@ -21,6 +21,7 @@ from math_runtime import (
     load_request,
     normalize_sft_dataset,
     summarize_qwen_records,
+    synchronize_model_eos_contract,
 )
 
 
@@ -65,6 +66,41 @@ def test_normalize_sft_dataset_drops_blank_and_extra_fields(tmp_path: Path) -> N
     }
 
 
+def test_synchronize_model_eos_contract_uses_saved_tokenizer_eos(
+    tmp_path: Path,
+) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "eos_token": "<|im_end|>",
+                "added_tokens_decoder": {
+                    "151643": {"content": "<|endoftext|>"},
+                    "151645": {"content": "<|im_end|>"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (model_dir / "config.json").write_text(
+        json.dumps({"eos_token_id": 151643}), encoding="utf-8"
+    )
+    (model_dir / "generation_config.json").write_text(
+        json.dumps({"eos_token_id": 151643}), encoding="utf-8"
+    )
+
+    report = synchronize_model_eos_contract(model_dir)
+
+    assert report["eos_token"] == "<|im_end|>"
+    assert report["eos_token_id"] == 151645
+    assert json.loads((model_dir / "config.json").read_text())["eos_token_id"] == 151645
+    assert (
+        json.loads((model_dir / "generation_config.json").read_text())["eos_token_id"]
+        == 151645
+    )
+
+
 def test_pass_at_k_and_bad_cases_are_computed_per_question() -> None:
     records = [
         {
@@ -98,6 +134,7 @@ def test_pass_at_k_and_bad_cases_are_computed_per_question() -> None:
             "response_token_count": None,
             "finish_reason": "",
             "length_truncated": False,
+            "sample_index": 0,
         }
     ]
 
@@ -167,7 +204,7 @@ def test_periodic_request_requires_dataset(tmp_path: Path) -> None:
         load_request(request)
 
 
-def test_sampled_competitions_share_one_seeded_pass_at_32_group() -> None:
+def test_sampled_competitions_share_one_seeded_avg_at_4_group() -> None:
     config_path = (
         Path(__file__).resolve().parents[1]
         / "configs/downstream_math_runtime.example.yaml"
@@ -185,8 +222,8 @@ def test_sampled_competitions_share_one_seeded_pass_at_32_group() -> None:
         "aime24": "aime24",
         "aime25": "aime25",
     }
-    assert sampled["metric"] == "pass@32"
-    assert sampled["n_sampling"] == 32
+    assert sampled["metric"] == "avg@4"
+    assert sampled["n_sampling"] == 4
     assert sampled["seed"] == 0
     assert sampled["max_model_len"] == 32768
 
@@ -204,6 +241,51 @@ def test_vendored_evaluator_forwards_seed_to_vllm() -> None:
     assert "tensor_parallel_size=args.tensor_parallel_size" in source
     assert '"finish_reason"' in source
     assert '"output_token_count"' in source
+    assert "resolve_stop_token_ids(tokenizer)" in source
+    assert '"qwen2" in args.model_name_or_path.lower()' not in source
+    assert "qwen25-math-cot already contains complete Qwen ChatML markers" in source
+
+
+def test_qwen25_math_cot_rejects_double_chat_templating(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    config_path = tmp_path / "runtime.yaml"
+    config_path.touch()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.touch()
+    config = {
+        "config_path": str(config_path),
+        "evaluation": {
+            "python": "python",
+            "diagnostic_manifest": str(manifest_path),
+            "cuda_visible_devices": "0",
+            "data_parallel_size": 1,
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "groups": [
+                {
+                    "name": "core",
+                    "data_dir": str(data_dir),
+                    "benchmarks": {"gsm8k": "gsm8k"},
+                    "metric": "accuracy",
+                    "n_sampling": 1,
+                    "prompt_type": "qwen25-math-cot",
+                    "apply_chat_template": True,
+                }
+            ],
+        },
+    }
+
+    with pytest.raises(RuntimeConfigError, match="complete Qwen ChatML"):
+        evaluate_model(
+            tmp_path / "model",
+            ["gsm8k"],
+            2,
+            config,
+            tmp_path / "runtime",
+        )
 
 
 def test_evaluation_parallelism_requires_exact_gpu_topology() -> None:

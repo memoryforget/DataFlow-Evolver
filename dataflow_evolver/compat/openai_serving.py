@@ -1,31 +1,23 @@
-"""Lightweight OpenAI-compatible serving for generated DataFlow operators.
-
-Only the stable ``dataflow.core.LLMServingABC`` contract is imported.  This
-avoids importing DataFlow's aggregate serving package, whose ``__init__``
-eagerly imports every local, multimodal, audio, and cloud backend.
-"""
+"""Strict response adapter over open-dataflow's API LLM transport."""
 from __future__ import annotations
 
-import logging
-import os
 import re
-import time
-import warnings
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Literal
 
-import requests
-from requests.adapters import HTTPAdapter
-
-from dataflow.core import LLMServingABC
+from dataflow.serving.api_llm_serving_request import APILLMServing_request
 
 
 ResponseMode = Literal["content", "reasoning_and_content", "auto"]
 
 
-class EvolverAPILLMServing(LLMServingABC):
-    """OpenAI-compatible HTTP transport with configurable response composition."""
+class EvolverAPILLMServing(APILLMServing_request):
+    """Reuse DataFlow transport while enforcing an explicit response contract.
+
+    The formal math experiment uses response_mode="content". Optional reasoning
+    composition remains available for other tasks and legacy comparison
+    pipelines, but is never inferred from a model name.
+    """
 
     def __init__(
         self,
@@ -67,22 +59,6 @@ class EvolverAPILLMServing(LLMServingABC):
         if response_mode not in {"content", "reasoning_and_content", "auto"}:
             raise ValueError(f"Unsupported response_mode: {response_mode}")
 
-        deprecated_timeout = configs.pop("timeout", None)
-        if deprecated_timeout is not None:
-            warnings.warn(
-                "The `timeout` parameter is deprecated; use read_timeout.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            read_timeout = float(deprecated_timeout)
-
-        self.api_url = api_url
-        self.model_name = model_name
-        self.max_workers = max(1, int(max_workers))
-        self.max_retries = max(1, int(max_retries))
-        self.timeout = (float(connect_timeout), float(read_timeout))
-        self.configs = dict(configs)
-        self.configs["temperature"] = temperature
         self.response_mode = response_mode
         self.reasoning_fields = _as_tuple(
             reasoning_fields or ("reasoning", "reasoning_content")
@@ -92,53 +68,44 @@ class EvolverAPILLMServing(LLMServingABC):
         self.require_reasoning = bool(require_reasoning)
         self.require_content = bool(require_content)
         self.accept_preformatted = bool(accept_preformatted)
-        self.logger = logging.getLogger("dataflow_evolver.compat.serving")
 
-        api_key = os.environ.get(key_name_of_api_key)
-        if api_key is None:
-            raise ValueError(
-                f"Missing API key environment variable `{key_name_of_api_key}` "
-                f"for {api_url}"
-            )
-        self.headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        self.session = requests.Session()
-        adapter = HTTPAdapter(
-            pool_connections=self.max_workers,
-            pool_maxsize=self.max_workers,
-            max_retries=0,
-            pool_block=True,
+        super().__init__(
+            api_url=api_url,
+            key_name_of_api_key=key_name_of_api_key,
+            model_name=model_name,
+            temperature=temperature,
+            max_workers=max_workers,
+            max_retries=max_retries,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            **configs,
         )
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
-
-    def start_serving(self) -> None:
-        return None
-
-    def cleanup(self) -> None:
-        self.session.close()
 
     def format_response(self, payload: dict[str, Any], is_embedding: bool = False) -> Any:
         if is_embedding:
-            return payload.get("data", [{}])[0].get("embedding", [])
+            return super().format_response(payload, is_embedding=True)
+
         choices = payload.get("choices") or []
         if not choices:
             return None
         choice = choices[0]
-        message = choice.get("message") or {}
-        finish_reason = choice.get("finish_reason")
-        if self.allowed_finish_reasons and finish_reason not in self.allowed_finish_reasons:
+        if (
+            self.allowed_finish_reasons
+            and choice.get("finish_reason") not in self.allowed_finish_reasons
+        ):
             return None
 
-        content = message.get("content")
-        content = "" if content is None else str(content).strip()
+        message = choice.get("message") or {}
+        content_value = message.get("content")
+        content = "" if content_value is None else str(content_value).strip()
         if self.require_content and not content:
             return None
         if self.response_mode == "content":
             return content
-        if self.accept_preformatted and re.search(r"<think>.*?</think>", content, re.DOTALL):
+
+        if self.accept_preformatted and re.search(
+            r"<think>.*?</think>", content, re.DOTALL
+        ):
             return content
 
         reasoning = ""
@@ -156,106 +123,6 @@ class EvolverAPILLMServing(LLMServingABC):
             content=content,
             answer=content,
         )
-
-    def _request_once(
-        self,
-        request_id: int,
-        payload: Any,
-        *,
-        is_embedding: bool = False,
-        json_schema: dict[str, Any] | None = None,
-    ) -> tuple[int, Any]:
-        if is_embedding:
-            body = {"model": self.model_name, "input": payload}
-        else:
-            body = {"model": self.model_name, "messages": payload}
-            if json_schema is not None:
-                body["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "custom_response",
-                        "strict": True,
-                        "schema": json_schema,
-                    },
-                }
-        body.update(self.configs)
-        response = self.session.post(
-            self.api_url,
-            headers=self.headers,
-            json=body,
-            timeout=self.timeout,
-        )
-        if response.status_code != 200:
-            self.logger.warning(
-                "LLM request failed id=%s status=%s body=%s",
-                request_id,
-                response.status_code,
-                response.text[:500],
-            )
-            return request_id, None
-        return request_id, self.format_response(response.json(), is_embedding)
-
-    def _request_with_retry(self, request_id: int, payload: Any, **kwargs: Any) -> tuple[int, Any]:
-        for attempt in range(self.max_retries):
-            try:
-                result = self._request_once(request_id, payload, **kwargs)
-            except requests.exceptions.ConnectTimeout as exc:
-                raise RuntimeError(f"Cannot connect to LLM server: {exc}") from exc
-            except requests.exceptions.ConnectionError as exc:
-                raise RuntimeError(f"LLM server connection failed: {exc}") from exc
-            except requests.exceptions.Timeout as exc:
-                self.logger.warning("LLM request timeout id=%s: %s", request_id, exc)
-                result = (request_id, None)
-            except (requests.RequestException, ValueError) as exc:
-                self.logger.warning("LLM request error id=%s: %s", request_id, exc)
-                result = (request_id, None)
-            if result[1] is not None:
-                return result
-            if attempt + 1 < self.max_retries:
-                time.sleep(2**attempt)
-        return request_id, None
-
-    def _run_parallel(self, tasks: list[tuple[Any, dict[str, Any]]]) -> list[Any]:
-        responses: list[Any] = [None] * len(tasks)
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {
-                executor.submit(self._request_with_retry, index, payload, **kwargs): index
-                for index, (payload, kwargs) in enumerate(tasks)
-            }
-            for future in as_completed(futures):
-                index = futures[future]
-                try:
-                    response_id, value = future.result()
-                except RuntimeError:
-                    for pending in futures:
-                        pending.cancel()
-                    raise
-                responses[response_id if response_id is not None else index] = value
-        return responses
-
-    def generate_from_input(
-        self,
-        user_inputs: list[str],
-        system_prompt: str = "You are a helpful assistant",
-        json_schema: dict[str, Any] | None = None,
-    ) -> list[Any]:
-        tasks = [
-            (
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_input},
-                ],
-                {"json_schema": json_schema},
-            )
-            for user_input in user_inputs
-        ]
-        return self._run_parallel(tasks)
-
-    def generate_from_conversations(self, conversations: list[list[dict[str, Any]]]) -> list[Any]:
-        return self._run_parallel([(conversation, {}) for conversation in conversations])
-
-    def generate_embedding_from_input(self, texts: list[str]) -> list[Any]:
-        return self._run_parallel([(text, {"is_embedding": True}) for text in texts])
 
 
 def _as_tuple(value: Sequence[str] | str | None) -> tuple[str, ...]:

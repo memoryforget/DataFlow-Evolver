@@ -160,6 +160,46 @@ class CommandDownstreamEvaluator(DownstreamEvaluatorABC):
         ]
         started = time.perf_counter()
         try:
+            if request.stage == "baseline":
+                from os import environ
+
+                cache_path_value = environ.get(
+                    "DF_DOWNSTREAM_BASELINE_RESULT_PATH", ""
+                ).strip()
+                if cache_path_value:
+                    cache_path = Path(cache_path_value).expanduser().resolve()
+                    if not cache_path.is_file():
+                        raise FileNotFoundError(
+                            f"baseline cache result does not exist: {cache_path}"
+                        )
+                    raw = json.loads(cache_path.read_text(encoding="utf-8"))
+                    benchmarks = _validate_result(
+                        raw,
+                        expected_benchmarks=self.expected_benchmarks,
+                        bad_cases_per_benchmark=self.bad_cases_per_benchmark,
+                    )
+                    result_path.write_bytes(cache_path.read_bytes())
+                    stdout_path.write_text(
+                        f"Reused baseline result from {cache_path}\n",
+                        encoding="utf-8",
+                    )
+                    stderr_path.write_text("", encoding="utf-8")
+                    return DownstreamEvaluationResult(
+                        status="ok",
+                        checkpoint_iteration=request.checkpoint_iteration,
+                        incumbent_iteration=request.incumbent_iteration,
+                        dataset_path=request.dataset_path,
+                        stage=request.stage,
+                        training_performed=request.training_performed,
+                        model=_nonempty_string(raw.get("model"), "model"),
+                        benchmarks=benchmarks,
+                        summary=str(raw.get("summary", "") or ""),
+                        artifacts=_string_mapping(raw.get("artifacts", {}), "artifacts"),
+                        wall_time_seconds=round(time.perf_counter() - started, 6),
+                        request_path=str(request_path),
+                        result_path=str(result_path),
+                    )
+
             completed = subprocess.run(
                 argv,
                 cwd=str(checkpoint_dir),

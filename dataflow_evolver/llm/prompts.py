@@ -15,8 +15,7 @@ _PIPELINE_RUNTIME_BOUNDARY = """
 先加载并遵循 `$dataflow-evolver-pipeline`。DataFlow 运行时只使用已安装的
 `open-dataflow` 包；不要读取、搜索或复制任何 DataFlow 源码。算子和 Pipeline
 由本任务本地生成。通用 API、compile 和 Serving 响应兼容契约均以该 skill 为准；
-本 Prompt 只负责本轮数据目标、反馈、父代复用和动态模型配置。检查范围限于当前
-iteration 的任务产物，禁止自行执行 Pipeline 或做宽泛探索。
+本 Prompt 只负责本轮数据目标、反馈和动态模型配置。
 """
 
 PIPELINE_PROMPT = _PIPELINE_RUNTIME_BOUNDARY + "\n\n" + """为下述目标编写一条完整、可直接运行的 DataFlow 流水线（含自定义算子）。
@@ -39,15 +38,14 @@ Entry file: {entry_path}
 5. 同步写 `{iteration_dir}/decision.json`，schema 必须为：
    {{"ops": [{{"name": "算子类名", "purpose": "作用", "params": {{}}}}, ...],
      "field_flow": "raw fields -> ... -> target fields", "reason": "设计理由"}}
-6. 以下动态配置只声明本轮可用的 LLM Serving 能力，不预设 Pipeline 是否调用 LLM、
-   在哪个步骤调用或调用结果承担什么职责，你需要根据任务与反馈自行设计；若使用 LLM，
+6. 以下配置声明本轮可用的 LLM Serving 能力，你需要根据任务与反馈设计是否需要调用 LLM、在哪个步骤调用 LLM，例如你可以使用 LLM 来做数据清洗、质量控制、数据转换与增强等等；若使用 LLM，
    必须在 Pipeline 层按专用 skill 构造并注入 Serving，且不得根据模型名称自行推断响应模式：
 {llm_block}
 7. FileStorage 的 `cache_path` 设为 `{iteration_dir}/cache`；正式运行产生的最后一个 step JSONL 是本轮最终数据集产物。
 8. 主入口必须使用专用 skill 中唯一的 framework-owned compile/forward 契约。只写入所需产物，
    不要自行执行 `pipeline.py`（包括 compile-only 或 smoke test）；框架会在 Agent 返回后依次执行
    确定性的 artifact 校验、compile 预检和正式运行。
-9. 以解决 Review、下游评测和 bad cases 暴露的问题为首要目标，不以最少代码、文件或算子为目标。
+9. 以解决 Review、下游评测和 bad cases 暴露的问题为首要目标，不以最少代码、文件或算子为目标，也不为节省调用成本而牺牲数据质量；LLM 调用范围应根据任务与反馈合理设计。
    根据职责边界和反馈自由增加、删除、拆分或合并算子；不要为了缓存复用而保留不合理的父流水线结构。
 {init_block}{parent_block}{review_block}{downstream_block}{history_block}
 约束：无头自动化运行，禁止 AskUserQuestion 与 git/gh 子流程，不能获取新数据；所有实现
@@ -201,7 +199,7 @@ def _parent_block(code: str | None, rationale: str | None, iteration_dir: str) -
     lines = ["【上一轮流水线】"]
     if code:
         lines.append(
-            "把下面这份已执行流水线作为经过验证的参考实现。根据反馈自由保留、替换、拆分、合并、增加或删除算子；不要为了缓存复用而维持原结构，也不要无依据重写：\n"
+            "下面是上一轮已执行流水线，仅作为可复用的参考，不限制本轮设计空间。根据任务与反馈自由设计，并可按需保留、替换、拆分、合并、增加或删除算子；不要为了缓存复用而维持原结构：\n"
             f"```python\n{code}\n```"
         )
     if rationale:

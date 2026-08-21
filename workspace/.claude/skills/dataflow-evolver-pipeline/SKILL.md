@@ -136,7 +136,7 @@ class LLMAssistedOperator(OperatorABC):
 
 - Do not construct `EvolverAPILLMServing` inside an operator module or `run()`.
 - Do not make an operator read API-key variables or declare URL, model, worker,
-  timeout, retry, reasoning-field, or response-format transport settings.
+  timeout, retry, or response-contract transport settings.
 - Do not add operator-level `batch_size` or manually split requests merely to
   control API concurrency. Pass the aligned logical input list to serving and let
   its configured `max_workers` own transport concurrency. A domain-specific chunk
@@ -167,16 +167,16 @@ class Pipeline(PipelineABC):
     def __init__(self):
         super().__init__()
         self.storage = FileStorage(...)
-        self.reasoning_serving = EvolverAPILLMServing(
+        self.llm_serving = EvolverAPILLMServing(
             api_url=PIPELINE_API_URL,
             key_name_of_api_key=PIPELINE_API_KEY_ENV,
             model_name=PIPELINE_MODEL,
             max_workers=PIPELINE_MAX_WORKERS,
-            **PIPELINE_REASONING_SERVING_KWARGS,
+            **PIPELINE_SERVING_KWARGS,
         )
         self.first_operator = FirstOperator(...)
         self.llm_operator = LLMAssistedOperator(
-            llm_serving=self.reasoning_serving,
+            llm_serving=self.llm_serving,
             domain_option="task-specific",
         )
 
@@ -207,22 +207,21 @@ compile, formal execution, output discovery, and self-correction.
 
 ## Serving response policy
 
-`EvolverAPILLMServing` is a lightweight `LLMServingABC` implementation:
+When a design uses an LLM, read
+[Serving configuration and response contract](references/serving-contract.md)
+before constructing the Pipeline-owned serving instance.
 
-- `response_mode="content"`: return assistant content; safe default.
-- `response_mode="reasoning_and_content"`: compose reasoning and content with
-  the configured `reasoning_template`.
-- `response_mode="auto"`: compose when reasoning exists, otherwise use content.
-- `reasoning_fields`, `reasoning_template`, `allowed_finish_reasons`,
-  `require_reasoning`, and `require_content` come from experiment configuration.
+Critical invariants:
 
-A dynamic serving profile is an available runtime contract, not a required use
-case. You may use no LLM, one serving, or multiple Pipeline-owned
-servings with deliberately selected response contracts. Inject any serving into
-operators and do not copy compatibility rules into operator response parsers.
-Whenever a formatted LLM response becomes the final assistant training field,
-preserve the representation required by the task. Never infer response behavior
-from the model name.
+- Treat the dynamic profile as the complete request and response contract. Do not infer behavior from a model name or inspect undocumented response fields.
+- DataFlow owns HTTP transport, concurrency, retries, timeouts, request construction, and input-order alignment. Operators receive one formatted string or None per logical input.
+- For the formal math profile, Serving returns trimmed message.content only after validating the finish reason and non-empty content. Hidden reasoning fields are internal model planning and are not training text.
+- Operator prompts request the domain result: a correct, complete mathematical derivation and final answer. Do not discuss SFT construction, transport fields, hidden reasoning, or formatting deliberation in model prompts.
+- Do not parse raw OpenAI dictionaries, concatenate reasoning and content, add wrapper tokens, or add an operator-level HTTP retry loop.
+- Validate substantive reasoning, mathematical correctness, non-truncation, and a non-empty final answer. Answer-only or superficial fallback rows do not satisfy a complete-derivation task.
+- Record truthful rewrite, fallback, and rejection status. A rejected or missing teacher response does not make an answer-only fallback suitable for training.
+
+Wrapper tokens are task data only when the task explicitly requires them. Never add them merely because a backend model exposes a reasoning field.
 
 ## Task discipline
 
@@ -241,11 +240,14 @@ from the model name.
 - Preserve the fixed input corpus and every original field unless the task
   explicitly transforms it.
 - Keep domain strategy in custom operators rather than inventing APIs.
-- Do not scan the full corpus, install packages, run git, execute the pipeline,
-  or benchmark it during generation.
+- Do not exhaustively process the full corpus or benchmark during generation.
+  Inspect bounded representative samples or lightweight statistics when they
+  materially improve the design. Do not install packages, run git, or execute the
+  pipeline yourself.
 - Produce a coherent, complete `pipeline.py` and local operators, spending the effort
-  needed for a high-quality response to the supplied evidence. Inspect the current
-  iteration files needed to satisfy the artifact contract.
+  needed for a high-quality response to the supplied evidence. Inspect the task,
+  supplied parent implementation, current iteration files, and bounded data samples
+  needed to satisfy the artifact contract.
 - Iterate on the implementation as needed to leave coherent, runnable, well-structured
   artifacts, then return control to Evolver for framework validation.
 - On self-correction, use the supplied traceback and diagnostics and modify only
