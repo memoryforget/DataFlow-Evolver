@@ -63,7 +63,9 @@ def resolve_best(run_dir: Path) -> tuple[dict[str, Any], Path, Path, int]:
     if not pipeline_path.is_file():
         raise FileNotFoundError(f"best pipeline does not exist: {pipeline_path}")
     dataset_path.relative_to(run_dir)
-    pipeline_path.relative_to(run_dir)
+    # Comparison runs keep their immutable pipeline implementation in the
+    # tracked comparison directory instead of copying it into every run.
+    # Existence is sufficient because the pipeline is provenance-only here.
 
     best_iteration = int(best.get("iteration", -1)) + 1
     if best_iteration < 1:
