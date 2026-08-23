@@ -42,7 +42,7 @@ agent:
   pipeline_filename: pipeline.py
   max_retries: 4
   retry_base_delay: 10
-  run_timeout_sec: 1800
+  run_timeout_sec: ${DF_AGENT_RUN_TIMEOUT_SEC:3600}
   resume_on_retry: true
   claude:
     model: ${CLAUDE_AGENT_MODEL:}
@@ -71,7 +71,7 @@ agent:
     binary: ${CODEX_BIN:codex}
     model: ${CODEX_MODEL:}
     model_provider: ${CODEX_MODEL_PROVIDER:}
-    effort: ${CODEX_EFFORT:}
+    effort: ${CODEX_EFFORT:xhigh}
     api_key_env: ${CODEX_API_KEY_ENV:}
     base_url: ${CODEX_BASE_URL:}
     mcp_timeout_ms: ${CODEX_MCP_TIMEOUT_MS:30000}

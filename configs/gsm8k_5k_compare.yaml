@@ -40,7 +40,7 @@ agent:
   pipeline_filename: pipeline.py
   max_retries: 4
   retry_base_delay: 10
-  run_timeout_sec: 1800
+  run_timeout_sec: ${DF_AGENT_RUN_TIMEOUT_SEC:3600}
   resume_on_retry: true
   codex:
     # This comparison is pinned to the tested Codex CLI 0.118.0.

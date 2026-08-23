@@ -251,7 +251,7 @@ def run_opencode_agent(
     """Run OpenCode with the Claude adapter's retry and resume semantics."""
     max_retries = max(1, int(agent_cfg.get("max_retries", 4)))
     base_delay = float(agent_cfg.get("retry_base_delay", 10))
-    timeout = float(agent_cfg.get("run_timeout_sec", 1800))
+    timeout = float(agent_cfg.get("run_timeout_sec", 3600))
     resume_enabled = bool(agent_cfg.get("resume_on_retry", True))
     session_store = prepare_agent_session_store(
         agent_cfg,
