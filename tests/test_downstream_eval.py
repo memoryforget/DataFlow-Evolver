@@ -166,6 +166,9 @@ def test_prompt_projects_long_bad_cases_and_links_complete_evidence():
                 score=0.5,
                 metric="accuracy",
                 incorrect_count=3,
+                wrong_answer_count=0,
+                parse_failure_count=0,
+                runaway_count=3,
                 bad_cases=[
                     DownstreamBadCase(
                         question=f"question {index}",
@@ -188,7 +191,9 @@ def test_prompt_projects_long_bad_cases_and_links_complete_evidence():
     assert "BEGIN-REASONING" in prompt
     assert "FINAL-ANSWER" in prompt
     assert "chars omitted from prompt" in prompt
-    assert "/run/downstream_eval/checkpoint_003/result.json" in prompt
+    assert "/run/downstream_eval/checkpoint_003/result.json" not in prompt
+    assert "不要读取完整 result.json" in prompt
+    assert "有界投影已经是本轮允许使用的全部下游诊断证据" in prompt
     assert "tokens=16383" in prompt
     assert "length_truncated=true" in prompt
     assert "possible_runaway_generation=true" in prompt

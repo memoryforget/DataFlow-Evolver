@@ -57,9 +57,17 @@ class FakeExecutor:
         self.failures = failures
         self.calls = []
 
-    def run(self, config, iteration_dir, env_overrides=None):
+    def run(
+        self,
+        config,
+        iteration_dir,
+        env_overrides=None,
+        parent_iteration_dir=None,
+    ):
         iteration_dir = Path(iteration_dir)
-        self.calls.append((config.code, iteration_dir, env_overrides))
+        self.calls.append(
+            (config.code, iteration_dir, env_overrides, parent_iteration_dir)
+        )
         if self.failures:
             self.failures -= 1
             return ExecutionResult(
@@ -117,6 +125,9 @@ class FakeDownstreamEvaluator:
                     score=0.5 + 0.1 * len(self.requests),
                     metric="accuracy",
                     incorrect_count=0,
+                    wrong_answer_count=0,
+                    parse_failure_count=0,
+                    runaway_count=0,
                     bad_cases=[],
                 )
             },

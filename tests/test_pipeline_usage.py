@@ -19,7 +19,7 @@ from dataflow_evolver.telemetry.pipeline_usage import (
 )
 
 
-CFG = PipelineConfig([], "", "", "")
+CFG = PipelineConfig([{"name": "HttpStep"}], "", "", "")
 
 
 class _Response:
@@ -270,9 +270,13 @@ output.write_text('{"instruction":"q","output":"a"}\n', encoding="utf-8")
 def test_execution_wrapper_collects_real_requests_usage_and_accumulates(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    raw_entry = workspace / "raw.jsonl"
+    raw_entry.write_text('{"instruction":"raw"}\n', encoding="utf-8")
     iteration = workspace / "runs/run_a/iteration_001"
     _write_http_pipeline(iteration)
-    executor = SubprocessExecutionWrapper(str(workspace), timeout_sec=30)
+    executor = SubprocessExecutionWrapper(
+        str(workspace), timeout_sec=30, raw_entry_path=str(raw_entry)
+    )
 
     first = executor.run(CFG, iteration)
     second = executor.run(CFG, iteration)

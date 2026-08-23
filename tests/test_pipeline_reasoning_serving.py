@@ -55,6 +55,8 @@ def test_runtime_contract_names_compatibility_layer():
             "serving_kwargs": {"response_mode": "reasoning_and_content"},
         }
     })
-    assert "EvolverAPILLMServing" in text
+    assert "[reasoning] model=model-x" in text
+    assert "key_name_of_api_key=DF_PIPELINE_API_KEY_REASONING" in text
     assert '"response_mode": "reasoning_and_content"' in text
+    assert "禁止把密钥写入 pipeline.py" in text
     assert env == {"DF_PIPELINE_API_KEY_REASONING": "secret"}

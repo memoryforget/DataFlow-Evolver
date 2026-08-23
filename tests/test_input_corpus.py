@@ -109,14 +109,12 @@ def test_pipeline_prompt_allows_only_validated_prefix_cache_reuse(tmp_path):
         parent_code=parent_code,
     )
 
-    assert "连续前缀中间 JSONL" in prompt
-    assert "源码、初始化参数、`run()` 参数、字段流" in prompt
-    assert "模型、prompt 和 serving" in prompt
-    assert "父轮对应 step JSONL 存在且可解析" in prompt
-    assert "从 raw input 完整执行的 fallback" in prompt
-    assert "该步及其所有下游步骤都必须重算" in prompt
-    assert "不要仅因为类名相同就认定算子等价" in prompt
-    assert "suffix storage" in prompt
+    assert "Framework-owned 父轮复用" in prompt
+    assert "不要读取、选择、验证或硬编码父轮 cache JSONL" in prompt
+    assert "FrameworkStepCache.from_env()" in prompt
+    assert "逻辑算子顺序、源码及本地依赖、初始化调用与参数 fingerprint" in prompt
+    assert "无法证明时自动从 raw input 完整重算" in prompt
+    assert "只按 `should_run(logical_index)`" in prompt
+    assert "Agent 不得自行决定" in prompt
+    assert "必须更新算子类名、params 或初始化参数" in prompt
     assert "first_entry_file_name" in prompt
-    assert "不能再次调用已复用的前缀算子" in prompt
-    assert "DF_PREFIX_CACHE_REUSE hit|miss" in prompt

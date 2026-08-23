@@ -16,11 +16,11 @@ def test_default_prompt_mentions_only_selected_skill_root(
     backend: str, expected: str
 ):
     prompt = default_system_prompt_append(backend)
-    assert f"{expected}/templates/operator_api_reference.md" in prompt
-    assert f"{expected}/diagnostics/known_issues.md" in prompt
-    for other_backend, other_root in SKILL_ROOTS.items():
-        if other_backend != backend:
-            assert other_root not in prompt
+    assert "Activate the project skill" in prompt
+    assert "`dataflow-evolver-pipeline`" in prompt
+    assert "authoritative API/runtime" in prompt
+    assert "contract" in prompt
+    assert all(root not in prompt for root in SKILL_ROOTS.values())
 
 
 def test_unknown_backend_has_no_fallback_to_claude():

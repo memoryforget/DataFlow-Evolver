@@ -18,7 +18,10 @@ def _files(root: Path) -> set[Path]:
 def test_specialized_backend_skills_are_byte_identical():
     canonical = SKILL_ROOTS[0]
     canonical_files = _files(canonical)
-    assert canonical_files == {Path("SKILL.md")}
+    assert canonical_files == {
+        Path("SKILL.md"),
+        Path("references/serving-contract.md"),
+    }
     for root in SKILL_ROOTS[1:]:
         assert _files(root) == canonical_files
         for relative in canonical_files:

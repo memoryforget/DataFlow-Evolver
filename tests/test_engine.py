@@ -6,6 +6,9 @@ from dataflow_evolver.engine.execution_wrapper import SubprocessExecutionWrapper
 
 
 CFG = PipelineConfig([], "", "", "")
+STEP_CFG = PipelineConfig(
+    [{"name": "FirstStep"}, {"name": "SecondStep"}], "", "", ""
+)
 
 
 def _pipeline(iteration_dir: Path, code: str) -> None:
@@ -29,7 +32,11 @@ def _pipeline(iteration_dir: Path, code: str) -> None:
 def _executor(tmp_path) -> SubprocessExecutionWrapper:
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
-    return SubprocessExecutionWrapper(str(workspace), timeout_sec=30)
+    raw_entry = workspace / "raw.jsonl"
+    raw_entry.write_text('{"instruction":"raw"}\n', encoding="utf-8")
+    return SubprocessExecutionWrapper(
+        str(workspace), timeout_sec=30, raw_entry_path=str(raw_entry)
+    )
 
 
 def test_missing_pipeline_file(tmp_path):
@@ -65,7 +72,7 @@ def test_prefers_highest_step_number_not_latest_mtime(tmp_path):
         "(c/'x_step2.jsonl').write_text('{\"q\":\"final\"}\\n')\n"
         "time.sleep(0.05)\n(c/'x_step1.jsonl').write_text('{\"q\":\"middle\"}\\n')\n"
     ))
-    result = _executor(tmp_path).run(CFG, iteration)
+    result = _executor(tmp_path).run(STEP_CFG, iteration)
     assert result.success and result.dataset_path.endswith("x_step2.jsonl")
 
 
@@ -76,6 +83,6 @@ def test_empty_highest_step_is_failure(tmp_path):
         "(c/'x_step1.jsonl').write_text('{\"q\":\"ok\"}\\n')\n"
         "(c/'x_step2.jsonl').write_text('\\n')\n"
     ))
-    result = _executor(tmp_path).run(CFG, iteration)
+    result = _executor(tmp_path).run(STEP_CFG, iteration)
     assert not result.success
     assert '"rows": 0' in result.diagnostics
