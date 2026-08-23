@@ -1,0 +1,149 @@
+# Local experiment configuration. Secrets and provider endpoints are supplied via env.
+project:
+  workspace_dir: /jizhicfs/xiaqifeng/DataFlow-Evolver/workspace
+  input_path: /jizhicfs/xiaqifeng/DataFlow-Evolver/data/math_reasoning_mix_v3/gsm8k_math_dapo3333_bigmath3333_numina3333_train_5k_seed42_decontam.jsonl
+  run_name: ${DF_RUN_NAME:math_mix_v3_periodic_seed42}
+
+task:
+  target_schema:
+    instruction: str
+    output: str
+  quality_criteria:
+    - Require a non-empty instruction field that states the source math problem without changing its mathematical meaning.
+    - Require a correct self-contained output that identifies key components, applies relevant theorems or formulas step by step, shows calculations, and verifies important intermediate results.
+    - Require every output to conclude with the final answer explicitly wrapped in LaTeX \boxed{} notation and mathematically consistent with golden_answer.
+    - When teacher-generated solution text is used, preserve its complete clean mathematical solution; if its final answer is not boxed, normalize only the conclusion so it ends in \boxed{answer}.
+    - Exclude teacher hidden planning, reasoning metadata, transport-specific response fields, truncated responses, answer-only outputs, and unsupported answer changes.
+    - Maintain useful coverage across sources, mathematical problem types, and difficulty levels while minimizing exact and semantic duplication.
+    - Exclude diagnostic or evaluation content, external questions, copied judge commentary, and malformed records.
+
+llm:
+  backend: api
+  api:
+    api_url: ${DF_API_URL:}
+    model_name: ${DF_REVIEW_MODEL:gpt-5.4}
+    api_key: ${DF_API_KEY:}
+    max_workers: ${DF_API_MAX_WORKERS:10}
+    request_timeout: ${DF_REVIEW_REQUEST_TIMEOUT:600}
+    max_retries: ${DF_REVIEW_MAX_RETRIES:3}
+  pipeline_llm:
+    teacher:
+      api_url: ${DF_PIPELINE_API_URL:http://28.59.7.41:8000/v1/chat/completions}
+      model_name: ${DF_PIPELINE_MODEL:Qwen3.8-27B}
+      api_key: ${DF_PIPELINE_API_KEY:EMPTY}
+      max_workers: ${DF_PIPELINE_MAX_WORKERS:100}
+      serving_kwargs:
+        temperature: 0.6
+        top_p: 0.95
+        max_tokens: 16384
+        chat_template_kwargs:
+          enable_thinking: true
+        connect_timeout: 10
+        read_timeout: 1800
+        max_retries: 3
+        response_mode: content
+        allowed_finish_reasons: [stop]
+        require_content: true
+
+agent:
+  backend: ${AGENT_BACKEND:codex}
+  api_key_env: ${DF_AGENT_API_KEY_ENV:DF_AGENT_API_KEY}
+  base_url: ${DF_AGENT_BASE_URL:}
+  setting_sources: [project]
+  max_turns: 50
+  pipeline_filename: pipeline.py
+  max_retries: 4
+  retry_base_delay: 10
+  run_timeout_sec: ${DF_AGENT_RUN_TIMEOUT_SEC:3600}
+  resume_on_retry: true
+  codex:
+    binary: ${CODEX_BIN:/jizhicfs/xiaqifeng/bin/codex}
+    model: ${CODEX_MODEL:gpt-5.4}
+    model_provider: ${CODEX_MODEL_PROVIDER:}
+    effort: ${CODEX_EFFORT:xhigh}
+    api_key_env: ${CODEX_API_KEY_ENV:}
+    base_url: ${CODEX_BASE_URL:}
+    mcp_timeout_ms: ${CODEX_MCP_TIMEOUT_MS:30000}
+    bypass_sandbox: true
+
+loop:
+  max_iterations: ${DF_MAX_ITERATIONS:5}
+  compile_timeout_sec: ${DF_COMPILE_TIMEOUT_SEC:120}
+  execution_timeout_sec: ${DF_EXECUTION_TIMEOUT_SEC:43200}
+  execution_repairs: ${DF_EXECUTION_REPAIRS:2}
+  python_exe: ${DF_AGENT_PYTHON:/jizhicfs/xiaqifeng/miniconda3/envs/dfe-review/bin/python}
+
+downstream_eval:
+  enabled: ${DF_DOWNSTREAM_EVAL_ENABLED:true}
+  interval: ${DF_DOWNSTREAM_EVAL_INTERVAL:2}
+  command:
+    - /jizhicfs/xiaqifeng/miniconda3/envs/dfe-math-eval/bin/python
+    - /jizhicfs/xiaqifeng/DataFlow-Evolver/scripts/downstream/run_math_downstream.py
+    - --config
+    - /jizhicfs/xiaqifeng/DataFlow-Evolver/configs/downstream_math_runtime.local.yaml
+  benchmarks: [gsm8k, math, amc23, aime24, aime25, minerva_math, gaokao2024_mix, olympiadbench]
+  baseline:
+    enabled: ${DF_DOWNSTREAM_BASELINE_ENABLED:true}
+  bad_cases_per_benchmark: 2
+  timeout_sec: ${DF_DOWNSTREAM_EVAL_TIMEOUT_SEC:345600}
+
+review:
+  sample_size: ${DF_REVIEW_SAMPLE_SIZE:80}
+  sample_seed: 42
+  correctness_threshold: 0.6
+  schema_threshold: 0.6
+  relevance_threshold: 0.6
+  null_threshold: 0.5
+  hard_metrics: true
+  weights:
+    correctness: 0.40
+    relevance: 0.25
+    difficulty: 0.15
+    schema: 0.20
+  decontamination:
+    reference_files:
+      - /jizhicfs/xiaqifeng/DataFlow-Evolver/artifacts/downstream_eval/math_diagnostics_seed42/shared_data/gsm8k/test.jsonl
+      - /jizhicfs/xiaqifeng/DataFlow-Evolver/artifacts/downstream_eval/math_diagnostics_seed42/shared_data/math/test.jsonl
+      - /jizhicfs/xiaqifeng/DataFlow-Evolver/artifacts/downstream_eval/math_diagnostics_seed42/shared_data/amc23/test.jsonl
+      - /jizhicfs/xiaqifeng/DataFlow-Evolver/artifacts/downstream_eval/math_diagnostics_seed42/shared_data/aime24/test.jsonl
+      - /jizhicfs/xiaqifeng/DataFlow-Evolver/artifacts/downstream_eval/math_diagnostics_seed42/shared_data/aime25/test.jsonl
+      - /jizhicfs/xiaqifeng/DataFlow-Evolver/artifacts/downstream_eval/math_diagnostics_seed42/shared_data/minerva_math/test.jsonl
+      - /jizhicfs/xiaqifeng/DataFlow-Evolver/artifacts/downstream_eval/math_diagnostics_seed42/shared_data/gaokao2024_mix/test.jsonl
+      - /jizhicfs/xiaqifeng/DataFlow-Evolver/artifacts/downstream_eval/math_diagnostics_seed42/shared_data/olympiadbench/test.jsonl
+    ngram: 13
+    max_rate: 0.01
+    candidate_fields:
+      - instruction
+      - output
+  dataset_quality:
+    enabled: ${DF_EMBEDDING_REVIEW_ENABLED:true}
+    score_weight: ${DF_DATASET_QUALITY_SCORE_WEIGHT:0.25}
+    score_weights:
+      das: 0.40
+      vendi: 0.30
+      nearest_neighbor: 0.30
+    sample_size: ${DF_DAS_SAMPLE_SIZE:1000}
+    sample_seed: 42
+    require_full_sample: false
+    rbf_sigma: 1.0
+    biased: true
+    normalize_embeddings: true
+    max_embedding_fail_rate: 0.02
+    cache_dir: ${DF_DAS_CACHE_DIR:/jizhicfs/xiaqifeng/DataFlow-Evolver/workspace/cache/das/math_mix_v3_seed42}
+    candidate:
+      user_field: instruction
+      assistant_field: output
+    proxy:
+      source: local
+      path: /jizhicfs/xiaqifeng/DataFlow-Evolver/data/ODA-Math-460k
+      split: train
+      user_field: question
+      assistant_field: response
+    embedding:
+      model_name: /jizhicfs/xiaqifeng/DataFlow-Evolver/model/Qwen3-Embedding-8B
+      base_url: ${DF_DAS_EMBEDDING_URL:http://127.0.0.1:8000/v1}
+      api_key: ${DF_DAS_EMBEDDING_API_KEY:EMPTY}
+      max_concurrent_requests: ${DF_DAS_EMBEDDING_CONCURRENCY:64}
+      max_retries: 3
+      truncate_prompt_tokens: 40960
+      truncation_side: right

@@ -1,0 +1,93 @@
+# Exact, credential-free runtime record for the formal periodic math experiments.
+# Paths describe the source server; use downstream_math_runtime.example.yaml when
+# recreating the environment at a different filesystem root.
+base_model: /jizhicfs/xiaqifeng/models/Qwen2.5-7B
+
+sft:
+  llamafactory_cli: /jizhicfs/xiaqifeng/miniconda3/envs/dfe-sft/bin/llamafactory-cli
+  # GPU 7 is reserved for Qwen3-Embedding-8B. Full SFT uses the other seven H20s.
+  cuda_visible_devices: "0,1,2,3,4,5,6"
+  timeout_sec: 172800
+  user_field: instruction
+  assistant_field: output
+  expected_eos_token: <|endoftext|>
+  expected_eos_token_id: 151643
+  fail_on_truncation: false
+  env:
+    PYTHONPATH: /jizhicfs/xiaqifeng/DataFlow-Evolver/scripts/downstream/llamafactory_qwen2_5_base_site
+    TOKENIZERS_PARALLELISM: "false"
+    TRITON_CACHE_DIR: /tmp/dfe-triton-cache
+    HF_HOME: /jizhicfs/xiaqifeng/.cache/huggingface
+  trainer:
+    deepspeed: /jizhicfs/xiaqifeng/DataFlow-Evolver/configs/deepspeed/ds_z2_config.json
+    template: qwen2_5_base
+    cutoff_len: 16384
+    packing: false
+    preprocessing_num_workers: 16
+    dataloader_num_workers: 4
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 4
+    learning_rate: 5.0e-6
+    num_train_epochs: 1.0
+    lr_scheduler_type: cosine
+    warmup_ratio: 0.1
+    bf16: true
+    tf32: true
+    flash_attn: sdpa
+    disable_gradient_checkpointing: false
+    optim: adamw_torch_fused
+    logging_steps: 1
+    save_strategy: "no"
+    save_only_model: true
+    plot_loss: true
+    overwrite_output_dir: true
+    report_to: none
+    seed: 42
+    data_seed: 42
+    ddp_timeout: 180000000
+
+evaluation:
+  python: /jizhicfs/xiaqifeng/miniconda3/envs/dfe-math-eval/bin/python
+  # Keep each vLLM worker's compile caches on node-local storage. The runtime
+  # creates separate process/group/rank subdirectories below this root.
+  local_cache_root: /tmp/dataflow-evolver-vllm-evaluation
+  diagnostic_manifest: /jizhicfs/xiaqifeng/DataFlow-Evolver/artifacts/downstream_eval/math_diagnostics_seed42/manifest.json
+  # Four independent replicas, one complete 7B model per H20.
+  cuda_visible_devices: "0,1,2,3"
+  data_parallel_size: 4
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  timeout_sec: 172800
+  groups:
+    - name: greedy_core
+      data_dir: /jizhicfs/xiaqifeng/DataFlow-Evolver/artifacts/downstream_eval/math_diagnostics_seed42/shared_data
+      benchmarks:
+        gsm8k: gsm8k
+        math: math
+        minerva_math: minerva_math
+        gaokao2024_mix: gaokao2024_mix
+        olympiadbench: olympiadbench
+      metric: accuracy
+      prompt_type: qwen25-math-cot
+      temperature: 0.0
+      top_p: 1.0
+      n_sampling: 1
+      max_tokens_per_call: 16384
+      max_model_len: 32768
+      seed: 0
+      apply_chat_template: false
+    - name: sampled_competition
+      data_dir: /jizhicfs/xiaqifeng/DataFlow-Evolver/artifacts/downstream_eval/math_diagnostics_seed42/shared_data
+      benchmarks:
+        amc23: amc23
+        aime24: aime24
+        aime25: aime25
+      metric: avg@4
+      prompt_type: qwen25-math-cot
+      temperature: 0.6
+      top_p: 1.0
+      n_sampling: 4
+      max_tokens_per_call: 16384
+      max_model_len: 32768
+      seed: 0
+      apply_chat_template: false

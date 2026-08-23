@@ -1,0 +1,2 @@
+# Preserve the byte-identical archived pipeline, including upstream whitespace.
+downstream_runtime/comparisons/dataflow_instruct_math3k_qwen38_skip_qgen/reasoning_math_pipeline_skip_qgen.py whitespace=-trailing-space

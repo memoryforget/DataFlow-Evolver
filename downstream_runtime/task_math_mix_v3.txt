@@ -1,0 +1,15 @@
+Transform the supplied fixed 5,000-row math corpus into a dataset containing the best 1,000 high-quality SFT records for Qwen2.5-7B Base.
+
+Each final record must:
+
+1. Contain a non-empty `instruction` field stating the math problem.
+2. Contain a correct, self-contained `output` field that:
+   - Identifies the key components of the problem.
+   - Applies the relevant theorems or formulas with a step-by-step derivation.
+   - Shows calculations and verifies important intermediate results.
+   - Concludes with the final answer explicitly wrapped in LaTeX `\boxed{}` notation.
+3. Be distinct, mathematically valid, and suitable for supervised fine-tuning.
+
+The configured Qwen3.8-27B teacher is available to the pipeline. When teacher-generated solution text is used, preserve its complete, clean mathematical solution. If its final answer is not already enclosed in `\boxed{}`, normalize the solution so that it concludes with the final answer in the form `\boxed{answer}`. Do not include the teacher's hidden planning, reasoning metadata, or transport-specific response fields in the training output.
+
+The final dataset must contain exactly 1,000 distinct, valid records. Every record must have a complete derivation and a final answer enclosed in `\boxed{}`.
