@@ -21,6 +21,7 @@ sft:
   trainer:
     deepspeed: /jizhicfs/xiaqifeng/DataFlow-Evolver/configs/deepspeed/ds_z2_config.json
     template: qwen2_5_base
+    enable_thinking: true
     cutoff_len: 16384
     packing: false
     preprocessing_num_workers: 16
