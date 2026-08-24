@@ -213,21 +213,35 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         self.rfile.read(length)
-        payload = {
-            "id": "response-1",
-            "model": "synthetic-model",
-            "choices": [{"message": {"content": "answer"}}],
-            "usage": {
-                "prompt_tokens": 120,
-                "completion_tokens": 30,
-                "total_tokens": 150,
-                "prompt_tokens_details": {"cached_tokens": 20},
-                "completion_tokens_details": {"reasoning_tokens": 5}
+        chunks = [
+            {
+                "id": "response-1",
+                "model": "synthetic-model",
+                "choices": [{"index": 0, "delta": {"reasoning_content": "derive"}}],
+            },
+            {
+                "id": "response-1",
+                "model": "synthetic-model",
+                "choices": [{"index": 0, "delta": {"content": "answer"}}],
+            },
+            {
+                "id": "response-1",
+                "model": "synthetic-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 120,
+                    "completion_tokens": 30,
+                    "total_tokens": 150,
+                    "prompt_tokens_details": {"cached_tokens": 20},
+                    "completion_tokens_details": {"reasoning_tokens": 5}
+                }
             }
-        }
-        body = json.dumps(payload).encode()
+        ]
+        events = [f"data: {json.dumps(chunk)}" for chunk in chunks]
+        events.append("data: [DONE]")
+        body = ("\n\n".join(events) + "\n\n").encode()
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -241,10 +255,19 @@ thread = threading.Thread(target=server.handle_request)
 thread.start()
 response = requests.post(
     f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
-    json={"model": "synthetic-model", "messages": [{"role": "user", "content": "private"}]},
+    json={
+        "model": "synthetic-model",
+        "messages": [{"role": "user", "content": "private"}],
+        "stream": True,
+    },
     timeout=10,
 )
 response.raise_for_status()
+assert response.json()["choices"][0]["message"] == {
+    "role": "assistant",
+    "reasoning_content": "derive",
+    "content": "answer",
+}
 thread.join(timeout=10)
 server.server_close()
 

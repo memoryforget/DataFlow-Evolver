@@ -15,9 +15,9 @@ downstream results, and bad cases to make the strongest justified pipeline desig
 - Import `OperatorABC` and `LLMServingABC` from `dataflow.core`,
   `PipelineABC` from `dataflow.pipeline`, and `FileStorage` from
   `dataflow.utils.storage`.
-- Pipeline modules import `EvolverAPILLMServing` from
-  `dataflow_evolver.compat`; operator modules depend only on an injected
-  `LLMServingABC`.
+- Pipeline modules import `APILLMServing_request` from
+  `dataflow.serving.api_llm_serving_request`; operator modules depend only on
+  an injected `LLMServingABC`.
 - Generated operators and pipelines are local custom code. Available serving
   profiles are runtime capabilities, not prescribed operator roles. You decide whether, where, and how to use them from the task and feedback.
   When used, construct serving in the Pipeline from the dynamic configuration.
@@ -134,7 +134,7 @@ class LLMAssistedOperator(OperatorABC):
         storage.write(output_rows)
 ```
 
-- Do not construct `EvolverAPILLMServing` inside an operator module or `run()`.
+- Do not construct `APILLMServing_request` inside an operator module or `run()`.
 - Do not make an operator read API-key variables or declare URL, model, worker,
   timeout, retry, or response-contract transport settings.
 - Do not add operator-level `batch_size` or manually split requests merely to
@@ -150,6 +150,10 @@ class LLMAssistedOperator(OperatorABC):
   prescribe what those calls do.
 - Do not initialize or close serving inside `run()`; one execution may reuse it
   across multiple operator calls.
+- Set `enable_thinking` to a real Python boolean on every serving instance. It
+  is both an upstream model option and the formatted-response contract. Keep one
+  value fixed for the lifetime of an instance; construct a separate
+  Pipeline-owned instance when another operator needs the other contract.
 
 Generated responses remain aligned with inputs; filter `None` or empty responses
 explicitly before writing. Copy unchanged parent operator source when useful, but
@@ -167,7 +171,7 @@ class Pipeline(PipelineABC):
     def __init__(self):
         super().__init__()
         self.storage = FileStorage(...)
-        self.llm_serving = EvolverAPILLMServing(
+        self.llm_serving = APILLMServing_request(
             api_url=PIPELINE_API_URL,
             key_name_of_api_key=PIPELINE_API_KEY_ENV,
             model_name=PIPELINE_MODEL,
@@ -213,15 +217,31 @@ before constructing the Pipeline-owned serving instance.
 
 Critical invariants:
 
-- Treat the dynamic profile as the complete request and response contract. Do not infer behavior from a model name or inspect undocumented response fields.
+- Treat the dynamic profile as the complete transport contract. Do not infer
+  behavior from a model name or inspect undocumented response fields. The task
+  may explicitly choose `enable_thinking=true` or `false` per Pipeline-owned
+  serving instance; copy the remaining dynamic settings unchanged.
 - DataFlow owns HTTP transport, concurrency, retries, timeouts, request construction, and input-order alignment. Operators receive one formatted string or None per logical input.
-- For the formal math profile, Serving returns trimmed message.content only after validating the finish reason and non-empty content. Hidden reasoning fields are internal model planning and are not training text.
-- Operator prompts request the domain result: a correct, complete mathematical derivation and final answer. Do not discuss SFT construction, transport fields, hidden reasoning, or formatting deliberation in model prompts.
-- Do not parse raw OpenAI dictionaries, concatenate reasoning and content, add wrapper tokens, or add an operator-level HTTP retry loop.
+- `enable_thinking=true` returns
+  `<think>{reasoning}</think>\n<answer>{content}</answer>`. Use this contract for
+  the category of calls whose downstream artifact must retain model reasoning.
+  Final Math SFT solution generation is one example; explanation synthesis or a
+  rationale-bearing critique may be others when the task requires that text.
+- `enable_thinking=false` returns content only. Use this contract for the
+  category of calls whose downstream artifact needs only the model's content. A
+  judge, scorer, classifier, router, extractor, or concise normalizer is an
+  example, not an exhaustive list.
+- Operator prompts request only their task-specific domain result, whether that
+  is a reasoning-bearing artifact or a concise content-only value. Do not
+  discuss SFT construction, transport fields, hidden reasoning, or formatting
+  deliberation in model prompts.
+- Do not parse raw OpenAI dictionaries, concatenate response fields, alter the
+  DataFlow-provided wrapper structure, or add an operator-level HTTP retry loop.
 - Validate substantive reasoning, mathematical correctness, non-truncation, and a non-empty final answer. Answer-only or superficial fallback rows do not satisfy a complete-derivation task.
-- Record truthful rewrite, fallback, and rejection status. A rejected or missing teacher response does not make an answer-only fallback suitable for training.
-
-Wrapper tokens are task data only when the task explicitly requires them. Never add them merely because a backend model exposes a reasoning field.
+Wrapper tokens returned with `enable_thinking=true` are already part of this
+task's training text. Preserve them; do not add a second set of wrappers in an
+operator. With `enable_thinking=false`, consume and validate the returned
+content directly rather than searching for wrapper tags.
 
 ## Task discipline
 

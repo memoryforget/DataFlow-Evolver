@@ -2,10 +2,11 @@
 
 Read this reference when a generated pipeline uses an API-backed LLM operator.
 
-EvolverAPILLMServing is a thin response-contract adapter over open-dataflow
-1.0.10 APILLMServing_request. DataFlow owns HTTP transport, connection pooling,
-concurrency, retries, timeouts, request construction, and input-order alignment.
-The adapter adds explicit finish-reason and required-field checks.
+Use open-dataflow 1.0.10 `APILLMServing_request` directly. DataFlow owns HTTP
+transport, connection pooling, concurrency, retries, timeouts, request
+construction, input-order alignment, and response formatting. Generated code
+must not import a project-specific serving class or know about runtime transport
+adaptation.
 
 ## Request fields
 
@@ -15,38 +16,53 @@ The adapter adds explicit finish-reason and required-field checks.
 | key_name_of_api_key | Environment-variable name containing the API key, not the key value. |
 | model_name | Request-body model; it does not define response parsing. |
 | temperature | Sampling temperature. |
-| extra keyword arguments | Forwarded to the request body, for example top_p, max_tokens, or chat_template_kwargs. |
+| enable_thinking | Required boolean response contract. `true` exposes reasoning plus content in DataFlow wrappers; `false` exposes content only. The same value is forwarded to the upstream model. |
+| extra keyword arguments | The remaining dynamic serving profile forwarded by DataFlow, for example `top_p`, `max_tokens`, `stream`, and `stream_options`. |
 | max_workers | DataFlow-owned HTTP concurrency and connection-pool size. |
 | max_retries | Total attempts per logical input, including the first. |
 | connect_timeout / read_timeout | Connection and response-read timeouts. |
-| allowed_finish_reasons | Accepted finish reasons; other values become None and are retried. |
-| require_content | Reject missing or empty message.content. |
-| response_mode | Explicitly selects content, reasoning_and_content, or auto; never infer it from a model name. |
 
-## Formal math profile
+Copy the dynamic serving profile to `APILLMServing_request`. Keep all transport
+settings unchanged. When the task requires different response contracts,
+construct separate Pipeline-owned serving instances and change only the
+explicit `enable_thinking` boolean. Never use strings such as `"true"` or
+`"false"`.
 
-The formal math task uses response_mode="content",
-allowed_finish_reasons=["stop"], and require_content=true.
+## Response contracts
 
-In this mode the returned string is trimmed message.content. Raw
-message.reasoning and message.reasoning_content are ignored. A reasoning model's
-internal planning is not assumed to be clean, pedagogical training text.
+With `enable_thinking=true`, Serving returns:
 
-Operators receive one aligned str or None per input. They must not parse raw
-OpenAI dictionaries, concatenate hidden reasoning, add transport retries, or
-construct another HTTP client.
+```text
+<think>{reasoning}</think>
+<answer>{content}</answer>
+```
+
+Use this contract for the category of calls whose downstream artifact must
+retain model reasoning. Final Math SFT solution generation is one example, not
+the definition of the category. Preserve the entire returned string and
+validate it against the task's quality requirements.
+
+With `enable_thinking=false`, Serving returns `message.content` only. Use this
+contract for the category of calls whose downstream artifact needs only
+content. Judges, scorers, classifiers, routers, extractors, and concise
+normalizers are examples, not an exhaustive operator list. Parse and validate
+the content according to the operator's declared domain output.
+
+Operators receive one aligned `str` or `None` per input. They must not inspect
+raw OpenAI dictionaries, parse streaming events, concatenate reasoning and
+content fields, add another wrapper layer, add transport retries, or construct a
+second HTTP client. An operator may parse its returned domain content, such as a
+score, but must not parse raw transport fields or streaming events.
 
 ## Prompt and validation ownership
 
-Prompts request only the domain result: a correct, complete mathematical
-derivation followed by the final answer. Do not mention hidden reasoning fields,
-transport serialization, SFT construction, reference-answer matching, or prompt
-format deliberation unless the task itself genuinely requires that visible text.
+Prompts request only the task-specific domain result appropriate to the chosen
+response category. Reference material may be supplied as a correctness anchor,
+but the visible response must not discuss reference matching. Do not mention
+response field names, transport serialization, SFT construction, or formatting
+deliberation unless the task itself genuinely requires that visible text.
 
-Validate the returned content for mathematical correctness, completeness,
-non-truncation, and a non-empty final answer. Do not require wrapper tokens unless
-the task explicitly defines them as part of its output schema.
-
-Record truthful outcomes such as llm_rewritten, fallback_original, and
-rejected_response. A fallback may enter the final dataset only when it already
-contains a substantive derivation and correct final answer.
+For a reasoning-retaining call, validate the returned formatted text against the
+task's substantive requirements and do not strip the `<think>/<answer>`
+structure. For a content-only call, validate the returned content against that
+operator's domain contract and reject malformed values rather than guessing.
