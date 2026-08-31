@@ -37,10 +37,9 @@ With `enable_thinking=true`, Serving returns:
 <answer>{content}</answer>
 ```
 
-Use this contract for the category of calls whose downstream artifact must
-retain model reasoning. Final Math SFT solution generation is one example, not
-the definition of the category. Preserve the entire returned string and
-validate it against the task's quality requirements.
+Use this contract only when the task explicitly requires the reasoning field as
+visible artifact text. A complete derivation in `message.content` remains
+content-only. Preserve the returned string and validate it against the task.
 
 With `enable_thinking=false`, Serving returns `message.content` only. Use this
 contract for the category of calls whose downstream artifact needs only

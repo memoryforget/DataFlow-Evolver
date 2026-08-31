@@ -165,6 +165,35 @@ def test_streaming_sse_is_normalized_for_native_dataflow_and_usage_tracking():
     )
 
 
+def test_streaming_sse_uses_utf8_when_requests_guesses_latin1():
+    response = _sse_response(
+        [
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "reasoning_content": "2 × 3 → 6",
+                            "content": "\u2713",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        ]
+    )
+    response.encoding = "ISO-8859-1"
+
+    normalized = normalize_streaming_chat_response(
+        _request({"messages": [{"role": "user", "content": "math"}], "stream": True}),
+        response,
+    )
+
+    message = normalized.json()["choices"][0]["message"]
+    assert message["reasoning_content"] == "2 × 3 → 6"
+    assert message["content"] == "\u2713"
+
+
 def test_non_streaming_json_response_is_untouched():
     response = requests.Response()
     response.status_code = 200

@@ -54,9 +54,10 @@ def normalize_streaming_chat_response(
     if not body:
         return response
     if isinstance(body, bytes):
-        text = body.decode(
-            getattr(response, "encoding", None) or "utf-8", errors="replace"
-        )
+        # SSE is UTF-8 by specification.  ``requests`` otherwise falls back to
+        # ISO-8859-1 when ``text/event-stream`` omits a charset, corrupting
+        # symbols such as ``×`` into mojibake such as ``Ã``.
+        text = body.decode("utf-8", errors="replace")
     else:
         text = str(body)
     if not _looks_like_sse(response, text):

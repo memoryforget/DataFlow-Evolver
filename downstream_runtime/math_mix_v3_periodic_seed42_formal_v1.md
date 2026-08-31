@@ -1,4 +1,8 @@
-# math_mix_v3_periodic_seed42_formal_v1 实验手册
+# math_mix_v3_periodic_seed42_formal_v1 实验手册（历史记录）
+
+> 本手册记录旧的 Qwen3.8 reasoning 实验；其中的模型和数据规模仅适用于该历史 run。
+> 当前实验以 `task_math_mix_v3.txt`、运行时动态 profile 及 Pipeline skill 为准，
+> 不应从本手册推导当前 Pipeline LLM 的响应契约。
 
 > 本文件仅保存在当前实验机器的 Git 忽略目录，不 commit、不 push。不得记录 API key 或 token。
 
@@ -29,7 +33,7 @@
 ### Pipeline Agent（Codex）
 \n- Pipeline 执行失败后默认最多进行 2 次代码自修复。配置字段为 loop.execution_repairs=2，可通过环境变量 DF_EXECUTION_REPAIRS 覆盖。
 
-- URL：`https://relay01.01tree.ai/codex/v1`
+- URL：`https://01tree.ai/codex/v1`
 - Model：`gpt-5.4`；provider：`tree-relay`；wire API：`responses`
 - Key env：`CODEX_API_KEY`；同步 env：`DF_AGENT_API_KEY`
 - `DF_AGENT_API_KEY_ENV=CODEX_API_KEY`
@@ -42,7 +46,7 @@
 
 ### Review Agent
 
-- URL：`https://relay01.01tree.ai/codex/v1`
+- URL：`https://01tree.ai/codex/v1`
 - Model：`gpt-5.4`；API：OpenAI-compatible `chat.completions`
 - Key env：`DF_API_KEY`；URL env：`DF_API_URL`
 - Max workers：10；request timeout：600 秒；max retries：3
@@ -58,7 +62,7 @@
 - Max workers：100
 - Temperature：0.6；top_p：0.95；max_tokens：16,384
 - Connect timeout：10 秒；read timeout：1,800 秒；max retries：3
-- `enable_thinking=true`；`reasoning_output_format=think`
+- `enable_thinking=true`
 - 要求 finish reason=`stop`，reasoning 和 content 均非空
 
 ### Embedding API

@@ -767,10 +767,8 @@ def _pipeline_runtime_contract(
             f"default_serving_kwargs={json.dumps(item.get('serving_kwargs', {}), ensure_ascii=False)}"
         )
         lines.append(
-            "      该 profile 是连接与默认响应契约，不代表必须采用的算子用途。"
-            "你自行决定是否使用以及是否从它构造多个 Pipeline-owned serving；"
-            "若为设计需要选择不同响应契约，应使用 skill 公开的兼容参数并在 decision.json.params "
-            "记录非敏感语义差异。"
+            "      按算子所需的响应契约选择 profile；选定后必须原样使用其 default_serving_kwargs。"
+            "不得因算子需求擅自改写 profile 参数。"
         )
         if item.get("api_key"):
             env[env_name] = str(item["api_key"])

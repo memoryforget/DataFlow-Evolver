@@ -144,10 +144,10 @@ class LLMAssistedOperator(OperatorABC):
 - Do not parse raw OpenAI response dictionaries or rebuild
   `reasoning + content` in an operator. Serving returns the configured formatted
   value. Operators handle missing values and domain validation only.
-- Share one serving instance among operators with the same response contract.
-  When the design requires different response contracts, construct separate
-  Pipeline-owned instances from the available dynamic profile. The Skill does not
-  prescribe what those calls do.
+- Select a configured `pipeline_llm` profile according to each operator's response
+  needs. Reuse one serving instance for operators with the same contract; when
+  profiles differ, construct separate instances and preserve each profile's
+  `serving_kwargs` unchanged.
 - Do not initialize or close serving inside `run()`; one execution may reuse it
   across multiple operator calls.
 - Set `enable_thinking` to a real Python boolean on every serving instance. It
@@ -217,20 +217,16 @@ before constructing the Pipeline-owned serving instance.
 
 Critical invariants:
 
-- Treat the dynamic profile as the complete transport contract. Do not infer
-  behavior from a model name or inspect undocumented response fields. The task
-  may explicitly choose `enable_thinking=true` or `false` per Pipeline-owned
-  serving instance; copy the remaining dynamic settings unchanged.
+- Treat each dynamic profile as the complete transport and response contract.
+  Do not infer behavior from a model name or change its `serving_kwargs`; select
+  the profile that matches the operator's needs and copy its settings unchanged.
 - DataFlow owns HTTP transport, concurrency, retries, timeouts, request construction, and input-order alignment. Operators receive one formatted string or None per logical input.
 - `enable_thinking=true` returns
-  `<think>{reasoning}</think>\n<answer>{content}</answer>`. Use this contract for
-  the category of calls whose downstream artifact must retain model reasoning.
-  Final Math SFT solution generation is one example; explanation synthesis or a
-  rationale-bearing critique may be others when the task requires that text.
-- `enable_thinking=false` returns content only. Use this contract for the
-  category of calls whose downstream artifact needs only the model's content. A
-  judge, scorer, classifier, router, extractor, or concise normalizer is an
-  example, not an exhaustive list.
+  `<think>{reasoning}</think>\n<answer>{content}</answer>`. Select this contract
+  only when the task explicitly requires the reasoning field as visible artifact
+  text; a derivation written in `message.content` remains content-only.
+- `enable_thinking=false` returns `message.content` only; `true` exposes the
+  reasoning-plus-content wrapper described above.
 - Operator prompts request only their task-specific domain result, whether that
   is a reasoning-bearing artifact or a concise content-only value. Do not
   discuss SFT construction, transport fields, hidden reasoning, or formatting
