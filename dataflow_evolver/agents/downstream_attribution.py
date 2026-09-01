@@ -69,6 +69,8 @@ class DownstreamAttributionAgent(AgentABC):
                 max(len(item.bad_cases) for item in feedback.benchmarks.values()),
             )
             or 0,
+            max_findings=self.max_findings,
+            max_actions=self.max_actions,
         )
 
     def parse(
@@ -205,4 +207,3 @@ def _clean_list(value: Any, limit: int, item_limit: int) -> list[str]:
         if text:
             output.append(text)
     return output
-

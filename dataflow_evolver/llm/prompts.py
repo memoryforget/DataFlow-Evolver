@@ -359,7 +359,7 @@ def _downstream_feedback_block(
         )
         return "\n".join(lines) + "\n"
     lines.extend(["", "下游 bad case 归因报告：", attribution.summary or "无总体结论。"])
-    for index, finding in enumerate(attribution.findings[:6], start=1):
+    for index, finding in enumerate(attribution.findings, start=1):
         category = str(finding.get("category", "other"))
         confidence = finding.get("confidence", 0.0)
         is_data_side = bool(finding.get("data_side", True))
@@ -428,6 +428,8 @@ def build_downstream_attribution_prompt(
     pipeline_operators: list[dict[str, object]],
     parent_review: ReviewResult | None = None,
     max_cases_per_benchmark: int = 3,
+    max_findings: int = 6,
+    max_actions: int = 8,
 ) -> str:
     """Build a structured, evidence-bound diagnosis prompt.
 
@@ -502,6 +504,8 @@ def build_downstream_attribution_prompt(
                     f"Correct answer: {_compact_prompt_text(case.correct_answer, 800)}",
                 ]
             )
+    max_findings = max(1, int(max_findings))
+    max_actions = max(1, int(max_actions))
     lines.extend(
         [
             "",
@@ -524,7 +528,8 @@ def build_downstream_attribution_prompt(
                 },
                 ensure_ascii=False,
             ),
-            "JSON 字段约束：findings 最多 6 条；confidence 为 0-1；evidence_ids 必须引用上面已有的 Evidence；"
+            f"JSON 字段约束：findings 最多 {max_findings} 条；每条 finding 的 recommended_actions 最多 {max_actions} 条；"
+            "confidence 为 0-1；evidence_ids 必须引用上面已有的 Evidence；"
             "recommended_actions 只能描述数据流水线动作。若证据不足，返回空 findings 并说明原因。",
         ]
     )

@@ -68,7 +68,7 @@ def test_attribution_is_structured_and_audited(tmp_path):
             "recommended_pipeline_changes": ["增加上下文完整性过滤"],
         }
     )
-    agent = DownstreamAttributionAgent(serving)
+    agent = DownstreamAttributionAgent(serving, max_findings=2, max_actions=3)
     result = agent.attribute(
         task=TaskSpec("math", {"instruction": "str", "output": "str"}, []),
         feedback=_feedback(),
@@ -85,6 +85,8 @@ def test_attribution_is_structured_and_audited(tmp_path):
     assert record["result"]["status"] == "ok"
     assert "Question: q1" in serving.prompts[0]
     assert "不要把单个 benchmark 题目当作训练数据" in serving.prompts[0]
+    assert "findings 最多 2 条" in serving.prompts[0]
+    assert "recommended_actions 最多 3 条" in serving.prompts[0]
 
 
 def test_attribution_rejects_empty_response():
