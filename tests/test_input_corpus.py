@@ -94,6 +94,8 @@ def test_pipeline_prompt_uses_fixed_input_path_and_forbids_external_data(tmp_pat
     assert str(source.resolve()) in prompt
     assert "fixed raw" in prompt or "固定语料" in prompt
     assert "不允许联网拉取外部数据" in prompt
+    assert "LLM 算子" in prompt
+    assert "prompt 作为可调整的设计部分" in prompt
     assert "photosynthesis" in prompt
 
 

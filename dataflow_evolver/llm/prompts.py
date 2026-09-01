@@ -43,6 +43,7 @@ Entry file: {entry_path}
 6. 以下配置声明本轮可用的 LLM Serving 能力，你需要根据任务与反馈设计是否需要调用 LLM、在哪个步骤调用 LLM，例如你可以使用 LLM 来做数据清洗、质量控制、数据转换与增强等等；若使用 LLM，
    必须在 Pipeline 层按专用 skill 构造并注入 Serving，且不得根据模型名称自行推断响应模式：
 {llm_block}
+   如果流水线包含 LLM 算子，也请把该算子的 prompt 作为可调整的设计部分之一：根据 Review 和下游归因适度改进任务说明、上下文组织和输出约束。prompt 应保持任务级、可复用、可审计，不得针对单个 benchmark 题目或答案硬编码。
 7. FileStorage 的 `cache_path` 设为 `{iteration_dir}/cache`；正式运行产生的最后一个 step JSONL 是本轮最终数据集产物。
 8. 主入口必须使用专用 skill 中唯一的 framework-owned compile/forward 契约。只写入所需产物，
    不要自行执行 `pipeline.py`（包括 compile-only 或 smoke test）；框架会在 Agent 返回后依次执行

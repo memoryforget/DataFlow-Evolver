@@ -144,6 +144,11 @@ class LLMAssistedOperator(OperatorABC):
 - Do not parse raw OpenAI response dictionaries or rebuild
   `reasoning + content` in an operator. Serving returns the configured formatted
   value. Operators handle missing values and domain validation only.
+- If the Pipeline includes an LLM operator, treat its prompt as one adjustable
+  design part alongside the data operators: use Review/downstream attribution to
+  improve task instructions, context organization, or output constraints when
+  justified. Keep prompts task-level, reusable, and auditable; never hard-code a
+  specific benchmark question or answer.
 - Select a configured `pipeline_llm` profile according to each operator's response
   needs. Reuse one serving instance for operators with the same contract; when
   profiles differ, construct separate instances and preserve each profile's
