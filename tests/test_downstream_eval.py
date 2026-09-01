@@ -4,6 +4,7 @@ from pathlib import Path
 
 from dataflow_evolver.core.downstream_eval import (
     CommandDownstreamEvaluator,
+    DownstreamAttributionResult,
     DownstreamBadCase,
     DownstreamBenchmarkResult,
     DownstreamEvaluationRequest,
@@ -152,7 +153,7 @@ def test_baseline_request_is_eval_only_and_has_no_candidate_paths(tmp_path):
     assert payload["pipeline_path"] is None
 
 
-def test_prompt_projects_long_bad_cases_and_links_complete_evidence():
+def test_prompt_uses_attribution_report_and_never_exposes_raw_bad_cases():
     full_output = "BEGIN-REASONING\n" + ("very long reasoning; " * 1000) + "\nFINAL-ANSWER"
     result = DownstreamEvaluationResult(
         status="ok",
@@ -183,25 +184,35 @@ def test_prompt_projects_long_bad_cases_and_links_complete_evidence():
                 ],
             )
         },
+        attribution=DownstreamAttributionResult(
+            status="ok",
+            summary="多个样本显示上下文缺失。",
+            findings=[
+                {
+                    "category": "missing_context",
+                    "data_side": True,
+                    "confidence": 0.86,
+                    "evidence_ids": ["gsm8k#1", "gsm8k#2"],
+                    "diagnosis": "题干依赖未保留的前置条件。",
+                    "recommended_actions": ["过滤上下文不完整的 chunk"],
+                }
+            ],
+            non_data_causes=["部分失败可能来自模型解析器"],
+            recommended_pipeline_changes=["保留题干与必要条件"],
+        ),
     )
 
     prompt = _downstream_feedback_block(result)
 
     assert full_output not in prompt
-    assert "BEGIN-REASONING" in prompt
-    assert "FINAL-ANSWER" in prompt
-    assert "chars omitted from prompt" in prompt
+    assert "下游 bad case 归因报告" in prompt
+    assert "多个样本显示上下文缺失" in prompt
+    assert "missing_context" in prompt
+    assert "gsm8k#1" in prompt
+    assert "保留题干与必要条件" in prompt
     assert "/run/downstream_eval/checkpoint_003/result.json" not in prompt
-    assert "不要读取完整 result.json" in prompt
-    assert "有界投影已经是本轮允许使用的全部下游诊断证据" in prompt
-    assert "tokens=16383" in prompt
-    assert "length_truncated=true" in prompt
-    assert "possible_runaway_generation=true" in prompt
-    assert result.benchmarks["gsm8k"].bad_cases[0].model_response == full_output
-    assert "gsm8k: accuracy=0.500000" in prompt
-    assert prompt.count("Model response (bounded prompt projection):") == 3
-    assert prompt.count("Parsed answer:") == 3
-    assert "不是可复制进训练数据的新数据源" in prompt
+    assert "Question:" not in prompt
+    assert "Model response (bounded prompt projection):" not in prompt
 
 
 def test_downstream_config_is_disabled_without_loading_external_dependencies():

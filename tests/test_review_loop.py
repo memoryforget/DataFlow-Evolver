@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from dataflow_evolver.core.downstream_eval import (
+    DownstreamAttributionResult,
     DownstreamBenchmarkResult,
     DownstreamEvaluationResult,
 )
@@ -102,6 +103,29 @@ class FakeReviewer:
         return self.results.pop(0)
 
 
+class FakeDownstreamAttributionAgent:
+    def __init__(self):
+        self.calls = []
+
+    def attribute(self, **kwargs):
+        self.calls.append(kwargs)
+        return DownstreamAttributionResult(
+            status="ok",
+            summary="跨案例归因：上下文缺失",
+            findings=[
+                {
+                    "category": "missing_context",
+                    "data_side": True,
+                    "confidence": 0.9,
+                    "evidence_ids": [],
+                    "diagnosis": "上下文截断",
+                    "recommended_actions": ["保留完整上下文"],
+                }
+            ],
+            recommended_pipeline_changes=["增加上下文完整性检查"],
+        )
+
+
 class FakeDownstreamEvaluator:
     expected_benchmarks = ["gsm8k"]
     bad_cases_per_benchmark = 3
@@ -142,6 +166,7 @@ def _loop(
     failures=0,
     reviewer=None,
     downstream_evaluator=None,
+    downstream_attribution_agent=None,
     downstream_interval=3,
 ):
     workspace = tmp_path / "workspace"
@@ -152,6 +177,7 @@ def _loop(
         workspace=workspace, run_name="run_a",
         max_iterations=max_iterations, execution_repairs=execution_repairs,
         downstream_evaluator=downstream_evaluator,
+        downstream_attribution_agent=downstream_attribution_agent,
         downstream_interval=downstream_interval,
     )
 
@@ -234,6 +260,26 @@ def test_downstream_evaluation_runs_every_three_rounds_on_current_incumbent(tmp_
     assert manifest["downstream_evaluation_wall_time_seconds"] >= 0.0
     assert manifest["total_wall_time_seconds"] >= manifest["data_preparation_wall_time_seconds"]
     assert (loop.run_dir / "downstream_evaluations.jsonl").is_file()
+
+
+def test_downstream_bad_cases_are_attributed_before_pipeline_feedback(tmp_path):
+    downstream = FakeDownstreamEvaluator(baseline_enabled=True)
+    attribution = FakeDownstreamAttributionAgent()
+    loop = _loop(
+        tmp_path,
+        max_iterations=1,
+        downstream_evaluator=downstream,
+        downstream_attribution_agent=attribution,
+    )
+
+    assert loop.run() is not None
+
+    assert len(attribution.calls) == 1
+    assert attribution.calls[0]["feedback"].stage == "baseline"
+    assert attribution.calls[0]["evidence_path"].name == "attribution.json"
+    feedback = loop.pipeline_agent.initial_downstream_feedback
+    assert feedback.attribution is not None
+    assert "上下文缺失" in feedback.attribution.summary
 
 
 def test_downstream_baseline_runs_before_initial_pipeline_and_anchors_deltas(tmp_path):

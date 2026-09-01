@@ -7,22 +7,37 @@ best-so-far incumbent dataset is exported to an external command for SFT and eva
 
 ```text
 checkpoint 0 -> evaluate the untrained downstream model on the fixed diagnostic split
-             -> PipelineAgent receives baseline scores and bad cases
+             -> attribution agent summarizes bounded bad cases
+             -> PipelineAgent receives baseline scores and the attribution report
 iteration 1 -> static Review -> incumbent update
 iteration 2 -> static Review -> incumbent update
             -> external SFT + benchmark evaluation of that incumbent
             -> validated scores and complete bad cases
-iteration 3 -> PipelineAgent receives static Review + downstream feedback
+            -> attribution agent summarizes bounded bad cases
+iteration 3 -> PipelineAgent receives static Review + aggregate scores + attribution report
             -> static Review -> incumbent update
 iteration 4 -> static Review -> incumbent update
             -> external SFT + benchmark evaluation of that incumbent
-iteration 5 -> PipelineAgent receives the latest downstream feedback
+iteration 5 -> PipelineAgent receives the latest downstream attribution report
             -> final static Review and incumbent update
 ```
 
 The downstream score is diagnostic feedback. It does not replace static `review_score`
 and does not retroactively change incumbent selection. This keeps candidate selection
 deterministic and makes it clear which signal caused each later pipeline change.
+
+
+## Bad-case attribution
+
+Before periodic or baseline downstream feedback reaches the next PipelineAgent, the
+framework runs a separate structured attribution call using the configured Review
+serving backend. The attribution prompt receives bounded bad cases, benchmark
+statistics, the incumbent operator names, and the incumbent static review. It must
+separate reusable data-side causes from model/parser/infrastructure causes, bind each
+finding to evidence IDs, and emit executable pipeline actions. The next PipelineAgent
+receives only this report and aggregate benchmark statistics; raw questions, answers,
+and model responses remain in the checkpoint audit files. A failed attribution call
+is represented as unavailable feedback and cannot stop evolution.
 
 ## Configuration
 
@@ -42,6 +57,11 @@ downstream_eval:
     enabled: true
   bad_cases_per_benchmark: 3  # maximum retained per benchmark
   timeout_sec: 86400
+  attribution:
+    enabled: true
+    max_retries: 2
+    max_findings: 6
+    max_actions: 8
 ```
 
 DataFlow Evolver appends these arguments:
@@ -140,6 +160,7 @@ Each checkpoint is auditable under:
 workspace/runs/<run_name>/downstream_eval/checkpoint_NNN/
   request.json
   result.json
+  attribution.json  # structured report; raw cases stay in result.json
   stdout.log
   stderr.log
 ```

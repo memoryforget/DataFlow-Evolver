@@ -105,6 +105,13 @@ downstream_eval:
   # Maximum retained cases; actual count is min(this value, result.incorrect_count).
   bad_cases_per_benchmark: 3
   timeout_sec: ${DF_DOWNSTREAM_EVAL_TIMEOUT_SEC:86400}
+  # Convert bounded bad cases into a structured data-side diagnosis before
+  # anything is shown to the next PipelineAgent.
+  attribution:
+    enabled: ${DF_DOWNSTREAM_ATTRIBUTION_ENABLED:true}
+    max_retries: ${DF_DOWNSTREAM_ATTRIBUTION_MAX_RETRIES:2}
+    max_findings: 6
+    max_actions: 8
 
 review:
   sample_size: ${DF_REVIEW_SAMPLE_SIZE:80}

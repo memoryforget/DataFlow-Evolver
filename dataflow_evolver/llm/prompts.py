@@ -1,6 +1,8 @@
 """Prompts for the fixed-corpus PipelineAgent -> ReviewAgent feedback loop."""
 from __future__ import annotations
 
+import json
+
 from dataflow_evolver.core.downstream_eval import DownstreamEvaluationResult
 from dataflow_evolver.core.input_corpus import InputCorpus
 from dataflow_evolver.core.schemas import ReviewResult, TaskSpec
@@ -332,79 +334,57 @@ def _downstream_feedback_block(
         "完整、未截断的结果由框架单独保留用于人工审计；不要读取完整 result.json。"
         "下面提供的有界投影已经是本轮允许使用的全部下游诊断证据。",
     ]
+    attribution = feedback.attribution
     for benchmark_name, benchmark in feedback.benchmarks.items():
         delta = feedback.score_deltas.get(benchmark_name)
-        delta_text = f", delta_vs_previous={delta:+.6f}" if delta is not None else ""
         baseline_delta = feedback.score_deltas_vs_baseline.get(benchmark_name)
-        baseline_delta_text = (
-            f", delta_vs_untrained_baseline={baseline_delta:+.6f}"
-            if baseline_delta is not None
-            else ""
-        )
         lines.append(
-            f"\n### {benchmark_name}: {benchmark.metric}={benchmark.score:.6f}"
-            f"{delta_text}{baseline_delta_text}; "
-            f"correct_count={benchmark.correct_count}; "
-            f"total_count={benchmark.total_count}; "
-            f"question_count={benchmark.question_count}; "
-            f"n_sampling={benchmark.n_sampling}; "
-            f"incorrect_count={benchmark.incorrect_count}; "
-            f"wrong_answer_count={benchmark.wrong_answer_count}; "
-            f"parse_failure_count={benchmark.parse_failure_count}; "
-            f"runaway_count={benchmark.runaway_count}"
+            f"\n### {benchmark_name}: {benchmark.metric}={benchmark.score:.6f}; "
+            f"delta_previous={delta if delta is not None else 'unknown'}; "
+            f"delta_baseline={baseline_delta if baseline_delta is not None else 'unknown'}; "
+            f"correct_count={benchmark.correct_count}; total_count={benchmark.total_count}; "
+            f"question_count={benchmark.question_count}; n_sampling={benchmark.n_sampling}; "
+            f"incorrect={benchmark.incorrect_count}; wrong={benchmark.wrong_answer_count}; "
+            f"parse_failure={benchmark.parse_failure_count}; runaway={benchmark.runaway_count}"
         )
-        for index, case in enumerate(benchmark.bad_cases, start=1):
-            is_runaway = case.length_truncated or case.finish_reason not in {
-                "",
-                "stop",
-            }
-            case_type = (
-                "generation_runaway"
-                if is_runaway
-                else "parse_failure"
-                if not case.parsed_answer.strip()
-                else "wrong_answer"
-            )
-            response_projection, omitted_chars = _project_bad_case_response(
-                case.model_response,
-                length_truncated=is_runaway,
-            )
-            token_count = (
-                str(case.response_token_count)
-                if case.response_token_count is not None
-                else "unknown"
-            )
-            finish_reason = case.finish_reason or "unknown"
-            runaway = "true" if is_runaway else "false"
-            lines.extend(
-                [
-                    f"Bad case {index}",
-                    "Question:",
-                    case.question,
-                    (
-                        "Response metadata: "
-                        f"case_type={case_type}, "
-                        f"chars={len(case.model_response)}, tokens={token_count}, "
-                        f"finish_reason={finish_reason}, "
-                        f"length_truncated={str(case.length_truncated).lower()}, "
-                        f"possible_runaway_generation={runaway}, "
-                        f"prompt_omitted_chars={omitted_chars}"
-                    ),
-                    "Model response (bounded prompt projection):",
-                    response_projection,
-                    "Parsed answer:",
-                    case.parsed_answer or "[empty; evaluator extracted no answer]",
-                    "Correct answer:",
-                    case.correct_answer,
-                ]
-            )
     if feedback.summary:
-        lines.extend(["\n外部评测摘要：", feedback.summary])
-    lines.append(
-        "请把各 benchmark 的共同与特有失败模式映射到可执行的过滤、重写、增强、难度或覆盖策略，"
-        "并在 decision.json 的 reason 中说明哪些改动由该反馈触发。"
-    )
+        lines.extend(["", "外部评测摘要：", feedback.summary])
+    if attribution is None or attribution.status != "ok":
+        lines.extend(
+            [
+                "",
+                "下游 bad case 归因报告不可用；本轮只保留 benchmark 统计，不向 PipelineAgent 暴露原始 bad case。",
+                f"归因失败原因：{attribution.error if attribution is not None else 'not generated'}。",
+            ]
+        )
+        return "\n".join(lines) + "\n"
+    lines.extend(["", "下游 bad case 归因报告：", attribution.summary or "无总体结论。"])
+    for index, finding in enumerate(attribution.findings[:6], start=1):
+        category = str(finding.get("category", "other"))
+        confidence = finding.get("confidence", 0.0)
+        is_data_side = bool(finding.get("data_side", True))
+        data_side = "data-side" if is_data_side else "non-data"
+        evidence_ids = ", ".join(str(item) for item in finding.get("evidence_ids", [])) or "none"
+        recommended_actions = (
+            "；".join(str(item) for item in finding.get("recommended_actions", []))
+            if is_data_side
+            else "[suppressed: non-data cause; do not modify pipeline]"
+        )
+        lines.extend(
+            [
+                f"Finding {index} [{category}; {data_side}; confidence={confidence}]",
+                f"Evidence: {evidence_ids}",
+                f"Diagnosis: {finding.get('diagnosis', '')}",
+                "Recommended pipeline actions: " + recommended_actions,
+            ]
+        )
+    if attribution.non_data_causes:
+        lines.extend(["非数据原因（不要通过修改 pipeline 解决）：", *attribution.non_data_causes])
+    if attribution.recommended_pipeline_changes:
+        lines.extend(["归因器建议的 pipeline 改动：", *attribution.recommended_pipeline_changes])
+    lines.append("只能依据归因报告中的跨案例模式改进 raw-data pipeline，不得针对单个 benchmark 题目硬编码。")
     return "\n".join(lines) + "\n"
+
 
 
 def _project_bad_case_response(
@@ -436,3 +416,116 @@ def _project_bad_case_response(
         + response[-tail_chars:],
         omitted,
     )
+
+def _compact_prompt_text(value: str, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+def build_downstream_attribution_prompt(
+    *,
+    task: TaskSpec,
+    feedback: DownstreamEvaluationResult,
+    pipeline_operators: list[dict[str, object]],
+    parent_review: ReviewResult | None = None,
+    max_cases_per_benchmark: int = 3,
+) -> str:
+    """Build a structured, evidence-bound diagnosis prompt.
+
+    This is deliberately separate from the PipelineAgent prompt: the
+    attribution model sees bounded bad cases, while the generator sees only
+    the resulting diagnosis.
+    """
+    operator_names = [
+        str(item.get("name", "?"))
+        for item in pipeline_operators[:12]
+        if isinstance(item, dict)
+    ]
+    review_text = "无静态 Review 记录。"
+    if parent_review is not None:
+        review_text = (
+            f"review_score={parent_review.review_score:.4f}; "
+            f"correctness={parent_review.correctness_score:.3f}; "
+            f"relevance={parent_review.relevance_score:.3f}; "
+            f"difficulty={parent_review.difficulty_score:.3f}; "
+            f"schema={parent_review.schema_score:.3f}; "
+            f"issues={'；'.join(parent_review.issues[:4]) or 'none'}"
+        )
+    lines = [
+        "你是下游评测归因器，负责把模型 benchmark 失败归因到“可由数据流水线改进的原因”。",
+        "不要把单个 benchmark 题目当作训练数据，不要复述或硬编码题目/答案。",
+        "必须区分 data_side=true（数据生成可修复）与 data_side=false（模型、解析器或基础设施问题）。",
+        "只有跨多个案例可复用的模式才可作为 pipeline 建议；单个孤立案例应降低 confidence。",
+        "每条 finding 必须绑定 evidence_ids，并给出可执行的过滤、上下文、重写、覆盖或难度策略。",
+        "目标任务：",
+        task.task_description,
+        f"目标 schema：{task.target_schema}",
+        f"质量标准：{task.quality_criteria}",
+        f"当前 pipeline operators：{'>'.join(operator_names) or 'unknown'}",
+        f"当前静态 Review：{review_text}",
+        f"下游检查点：stage={feedback.stage}, checkpoint={feedback.checkpoint_iteration}, "
+        f"incumbent={feedback.incumbent_iteration}, model={feedback.model}",
+    ]
+    for benchmark_name, benchmark in feedback.benchmarks.items():
+        delta = feedback.score_deltas.get(benchmark_name)
+        baseline_delta = feedback.score_deltas_vs_baseline.get(benchmark_name)
+        lines.append(
+            f"\n### benchmark={benchmark_name}; metric={benchmark.metric}; "
+            f"score={benchmark.score:.6f}; incorrect={benchmark.incorrect_count}; "
+            f"wrong={benchmark.wrong_answer_count}; parse_failure={benchmark.parse_failure_count}; "
+            f"runaway={benchmark.runaway_count}; "
+            f"delta_previous={delta if delta is not None else 'unknown'}; "
+            f"delta_baseline={baseline_delta if baseline_delta is not None else 'unknown'}"
+        )
+        for index, case in enumerate(
+            benchmark.bad_cases[: max(0, max_cases_per_benchmark)], start=1
+        ):
+            is_runaway = case.length_truncated or case.finish_reason not in {"", "stop"}
+            response, omitted = _project_bad_case_response(
+                case.model_response,
+                length_truncated=is_runaway,
+            )
+            case_id = f"{benchmark_name}#{index}"
+            lines.extend(
+                [
+                    f"Evidence {case_id}:",
+                    f"Question: {_compact_prompt_text(case.question, 1200)}",
+                    (
+                        "Response metadata: "
+                        f"tokens={case.response_token_count if case.response_token_count is not None else 'unknown'}, "
+                        f"finish_reason={case.finish_reason or 'unknown'}, "
+                        f"length_truncated={str(case.length_truncated).lower()}, "
+                        f"omitted_chars={omitted}"
+                    ),
+                    "Model response (bounded):",
+                    response,
+                    f"Parsed answer: {_compact_prompt_text(case.parsed_answer, 800) or '[empty]'}",
+                    f"Correct answer: {_compact_prompt_text(case.correct_answer, 800)}",
+                ]
+            )
+    lines.extend(
+        [
+            "",
+            "只输出 JSON object，不要输出 markdown：",
+            json.dumps(
+                {
+                    "summary": "跨案例、面向数据流水线的总体结论",
+                    "findings": [
+                        {
+                            "category": "missing_context",
+                            "data_side": True,
+                            "confidence": 0.0,
+                            "evidence_ids": ["gsm8k#1"],
+                            "diagnosis": "可复用的失败模式及其证据解释",
+                            "recommended_actions": ["具体 pipeline 改动"],
+                        }
+                    ],
+                    "non_data_causes": ["应避免误改数据的模型或基础设施原因"],
+                    "recommended_pipeline_changes": ["按优先级排列的 1-3 个改动"],
+                },
+                ensure_ascii=False,
+            ),
+            "JSON 字段约束：findings 最多 6 条；confidence 为 0-1；evidence_ids 必须引用上面已有的 Evidence；"
+            "recommended_actions 只能描述数据流水线动作。若证据不足，返回空 findings 并说明原因。",
+        ]
+    )
+    return "\n".join(lines) + "\n"

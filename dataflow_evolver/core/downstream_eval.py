@@ -65,6 +65,22 @@ class DownstreamBenchmarkResult:
 
 
 @dataclass
+class DownstreamAttributionResult:
+    """Structured, data-side diagnosis of downstream benchmark failures.
+
+    The raw bad cases remain audit-only evidence. This report is the
+    deliberately smaller contract that may be shown to the next
+    PipelineAgent.
+    """
+
+    status: str = "failed"
+    summary: str = ""
+    findings: list[dict[str, Any]] = field(default_factory=list)
+    non_data_causes: list[str] = field(default_factory=list)
+    recommended_pipeline_changes: list[str] = field(default_factory=list)
+    error: str | None = None
+
+@dataclass
 class DownstreamEvaluationResult:
     """Validated feedback, including infrastructure failures as explicit records."""
 
@@ -84,6 +100,7 @@ class DownstreamEvaluationResult:
     request_path: str = ""
     result_path: str = ""
     error: str | None = None
+    attribution: DownstreamAttributionResult | None = None
 
     @property
     def succeeded(self) -> bool:

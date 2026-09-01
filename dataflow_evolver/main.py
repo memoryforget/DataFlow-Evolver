@@ -12,11 +12,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from dataflow_evolver.agents.downstream_attribution import DownstreamAttributionAgent
 from dataflow_evolver.agents.pipeline_agent import PipelineAgent
 from dataflow_evolver.agents.review_agent import ReviewAgent
 from dataflow_evolver.core import decontamination, input_corpus
 from dataflow_evolver.core.downstream_eval import (
     CommandDownstreamEvaluator,
+    DownstreamAttributionResult,
     DownstreamEvaluationRequest,
     DownstreamEvaluationResult,
     DownstreamEvaluatorABC,
@@ -77,6 +79,7 @@ class ReviewOnlyLoop:
         max_iterations: int,
         execution_repairs: int = 1,
         downstream_evaluator: DownstreamEvaluatorABC | None = None,
+        downstream_attribution_agent: DownstreamAttributionAgent | None = None,
         downstream_interval: int = 2,
     ) -> None:
         if max_iterations < 1:
@@ -92,6 +95,7 @@ class ReviewOnlyLoop:
         if downstream_evaluator is not None and downstream_interval < 1:
             raise ValueError("downstream_eval.interval must be at least 1")
         self.downstream_evaluator = downstream_evaluator
+        self.downstream_attribution_agent = downstream_attribution_agent
         self.downstream_interval = int(downstream_interval)
         self.candidates: list[Candidate] = []
         self.downstream_evaluations: list[DownstreamEvaluationResult] = []
@@ -319,6 +323,7 @@ class ReviewOnlyLoop:
             incumbent.dataset_path,
         )
         result = self.downstream_evaluator.run(request, checkpoint_dir)
+        self._attach_downstream_attribution(result, checkpoint_dir, incumbent)
         self._record_downstream_result(result)
 
     def _run_downstream_baseline(self) -> None:
@@ -340,7 +345,38 @@ class ReviewOnlyLoop:
             "触发第 0 轮下游诊断：不训练模型，直接评测外部 runner 的固定诊断集",
         )
         result = self.downstream_evaluator.run(request, checkpoint_dir)
+        self._attach_downstream_attribution(result, checkpoint_dir, None)
         self._record_downstream_result(result)
+
+    def _attach_downstream_attribution(
+        self,
+        result: DownstreamEvaluationResult,
+        checkpoint_dir: Path,
+        incumbent: Candidate | None,
+    ) -> None:
+        if (
+            not result.succeeded
+            or self.downstream_attribution_agent is None
+        ):
+            return
+        try:
+            result.attribution = self.downstream_attribution_agent.attribute(
+                task=self.task,
+                feedback=result,
+                pipeline_operators=(
+                    incumbent.config.operators if incumbent is not None else []
+                ),
+                parent_review=(
+                    incumbent.review if incumbent is not None else None
+                ),
+                evidence_path=checkpoint_dir / "attribution.json",
+            )
+        except Exception as exc:  # noqa: BLE001 — attribution must not stop evolution
+            logger.exception("下游 bad case 归因失败，继续保留静态 incumbent：%s", exc)
+            result.attribution = DownstreamAttributionResult(
+                status="failed",
+                error=f"attribution exception: {exc}",
+            )
 
     def _record_downstream_result(self, result: DownstreamEvaluationResult) -> None:
         """Persist one result and compute deltas without mixing it into review_score."""
@@ -556,9 +592,19 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
         extra_env=extra_env or None,
         raw_entry_path=corpus.entry_path,
     )
+    downstream_cfg = cfg.get("downstream_eval") or Config({})
     downstream_evaluator, downstream_interval = _build_downstream_evaluator(
-        cfg.get("downstream_eval") or Config({})
+        downstream_cfg
     )
+    downstream_attribution_agent = None
+    attribution_cfg = downstream_cfg.get("attribution") or Config({})
+    if downstream_evaluator is not None and _as_bool(attribution_cfg.get("enabled", True)):
+        downstream_attribution_agent = DownstreamAttributionAgent(
+            serving,
+            max_retries=int(attribution_cfg.get("max_retries", 2)),
+            max_findings=int(attribution_cfg.get("max_findings", 6)),
+            max_actions=int(attribution_cfg.get("max_actions", 8)),
+        )
     return ReviewOnlyLoop(
         pipeline_agent=pipeline_agent,
         executor=executor,
@@ -569,6 +615,7 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
         max_iterations=int(loop_cfg.get("max_iterations", 5)),
         execution_repairs=int(loop_cfg.get("execution_repairs", 1)),
         downstream_evaluator=downstream_evaluator,
+        downstream_attribution_agent=downstream_attribution_agent,
         downstream_interval=downstream_interval,
     )
 
