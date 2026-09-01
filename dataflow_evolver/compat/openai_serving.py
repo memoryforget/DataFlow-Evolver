@@ -8,7 +8,7 @@ differences that DataFlow 1.0.x does not handle itself:
   response;
 * accept ``message.reasoning`` as an alias for ``message.reasoning_content``;
   and
-* use ``enable_thinking`` as the explicit formatted-response switch.
+* treat ``enable_thinking`` as an optional tri-state request/response policy.
 
 DataFlow remains responsible for request construction, retries, concurrency,
 and input alignment. Generated pipelines still construct and call only its
@@ -27,13 +27,37 @@ from dataflow.serving.api_llm_serving_request import APILLMServing_request
 
 _SEND_MARKER = "_dataflow_evolver_streaming_reasoning_compat"
 _FORMAT_MARKER = "_dataflow_evolver_reasoning_response_compat"
+_INIT_MARKER = "_dataflow_evolver_optional_thinking_compat"
 
 
 def install_api_llm_reasoning_compat() -> None:
     """Install the transparent runtime adapters once per interpreter."""
 
+    _install_optional_enable_thinking_adapter()
     _install_streaming_response_adapter()
     _install_reasoning_response_adapter()
+
+
+def _is_omitted_enable_thinking(value: Any) -> bool:
+    return value is None or (
+        isinstance(value, str) and value.strip().lower() == "omit"
+    )
+
+
+def _install_optional_enable_thinking_adapter() -> None:
+    current_init = APILLMServing_request.__init__
+    if getattr(current_init, _INIT_MARKER, False):
+        return
+
+    def init_without_omitted_thinking(self, *args, **kwargs):
+        value = kwargs.get("enable_thinking")
+        if _is_omitted_enable_thinking(value):
+            kwargs.pop("enable_thinking", None)
+        return current_init(self, *args, **kwargs)
+
+    setattr(init_without_omitted_thinking, _INIT_MARKER, True)
+    setattr(init_without_omitted_thinking, "_original_init", current_init)
+    APILLMServing_request.__init__ = init_without_omitted_thinking
 
 
 def normalize_streaming_chat_response(
@@ -105,11 +129,15 @@ def _install_reasoning_response_adapter() -> None:
         if not isinstance(response, Mapping):
             return current_format(self, response, is_embedding=False)
 
-        enable_thinking = getattr(self, "configs", {}).get(
-            "enable_thinking", False
+        raw_enable_thinking = getattr(self, "configs", {}).get(
+            "enable_thinking", None
         )
-        if not isinstance(enable_thinking, bool):
-            raise TypeError("enable_thinking must be a bool")
+        if _is_omitted_enable_thinking(raw_enable_thinking):
+            enable_thinking = False
+        elif isinstance(raw_enable_thinking, bool):
+            enable_thinking = raw_enable_thinking
+        else:
+            raise TypeError("enable_thinking must be a bool, omit, or None")
 
         choices = response.get("choices")
         if not isinstance(choices, list) or not choices:

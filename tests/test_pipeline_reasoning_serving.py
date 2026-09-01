@@ -86,6 +86,17 @@ def test_enable_thinking_defaults_to_content_only():
     assert serving.format_response(payload) == "pass"
 
 
+def test_enable_thinking_omit_returns_content_only():
+    install_api_llm_reasoning_compat()
+    payload = {
+        "choices": [
+            {"message": {"reasoning_content": "hidden", "content": "pass"}}
+        ]
+    }
+
+    assert _native_serving(enable_thinking="omit").format_response(payload) == "pass"
+
+
 def test_enable_thinking_true_has_stable_wrappers_without_reasoning():
     install_api_llm_reasoning_compat()
     payload = {"choices": [{"message": {"content": "answer"}}]}
@@ -101,6 +112,24 @@ def test_enable_thinking_must_be_a_bool():
 
     with pytest.raises(TypeError, match="enable_thinking must be a bool"):
         _native_serving(enable_thinking="false").format_response(payload)
+
+
+def test_omit_enable_thinking_is_removed_before_native_request(monkeypatch):
+    install_api_llm_reasoning_compat()
+    monkeypatch.setenv("DF_PIPELINE_API_KEY", "dummy")
+    serving = APILLMServing_request(
+        api_url="http://127.0.0.1:9/v1/chat/completions",
+        key_name_of_api_key="DF_PIPELINE_API_KEY",
+        model_name="gpt-4o",
+        max_workers=1,
+        max_retries=1,
+        connect_timeout=1,
+        read_timeout=1,
+        enable_thinking="omit",
+        stream=True,
+    )
+
+    assert "enable_thinking" not in serving.configs
 
 
 def test_streaming_sse_is_normalized_for_native_dataflow_and_usage_tracking():
@@ -230,3 +259,21 @@ def test_runtime_contract_exposes_complete_native_serving_profile():
     assert '"include_usage": true' in text
     assert "禁止把密钥写入 pipeline.py" in text
     assert env == {"DF_PIPELINE_API_KEY_REASONING": "secret"}
+
+
+def test_runtime_contract_documents_omit_without_forwarding_a_boolean():
+    text, _ = _pipeline_runtime_contract(
+        {
+            "generation": {
+                "model_name": "gpt-4o",
+                "api_url": "http://gateway/v1/chat/completions",
+                "api_key": "secret",
+                "max_workers": 2,
+                "serving_kwargs": {"enable_thinking": "omit", "stream": True},
+            }
+        }
+    )
+
+    assert '"enable_thinking": "omit"' in text
+    assert "省略该 keyword" in text
+    assert "不得把 omit 改写成 false" in text

@@ -758,6 +758,11 @@ def _pipeline_runtime_contract(
     pipeline_llm: dict[str, dict[str, Any]],
 ) -> tuple[str, dict[str, str]]:
     lines = ["   可用的 Pipeline LLM Serving profiles（profile 名只标识配置，不限定算子职责）："]
+    lines.append(
+        "   enable_thinking 是三态请求/响应策略：true/false 作为布尔值原样发送；"
+        "omit（或 profile 中缺省）表示构造 serving 时省略该 keyword，且按 content-only 解析。"
+        "不得把 omit 改写成 false，也不得把 omit 字符串发送给上游 API。"
+    )
     env: dict[str, str] = {}
     for profile, item in pipeline_llm.items():
         env_name = f"DF_PIPELINE_API_KEY_{profile.upper()}"

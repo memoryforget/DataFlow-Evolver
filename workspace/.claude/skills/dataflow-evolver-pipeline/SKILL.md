@@ -150,10 +150,13 @@ class LLMAssistedOperator(OperatorABC):
   `serving_kwargs` unchanged.
 - Do not initialize or close serving inside `run()`; one execution may reuse it
   across multiple operator calls.
-- Set `enable_thinking` to a real Python boolean on every serving instance. It
-  is both an upstream model option and the formatted-response contract. Keep one
-  value fixed for the lifetime of an instance; construct a separate
-  Pipeline-owned instance when another operator needs the other contract.
+- `enable_thinking` is an optional tri-state request/response policy. With a real
+  boolean `true` or `false`, pass that boolean unchanged and keep it fixed for the
+  lifetime of the serving instance. With `omit` (or when the profile omits the
+  field), do not pass the keyword to `APILLMServing_request`; the response contract
+  is content-only. Never turn `omit` into `false` or send the string `"omit"` to
+  the upstream API. Construct a separate Pipeline-owned instance when another
+  operator needs a different explicit boolean contract.
 
 Generated responses remain aligned with inputs; filter `None` or empty responses
 explicitly before writing. Copy unchanged parent operator source when useful, but
@@ -225,8 +228,10 @@ Critical invariants:
   `<think>{reasoning}</think>\n<answer>{content}</answer>`. Select this contract
   only when the task explicitly requires the reasoning field as visible artifact
   text; a derivation written in `message.content` remains content-only.
-- `enable_thinking=false` returns `message.content` only; `true` exposes the
-  reasoning-plus-content wrapper described above.
+- `enable_thinking=false` returns `message.content` only and forwards the explicit
+  boolean to the upstream API.
+- `enable_thinking=omit` (or an absent field) also returns `message.content` only,
+  but the request JSON must not contain `enable_thinking`.
 - Operator prompts request only their task-specific domain result, whether that
   is a reasoning-bearing artifact or a concise content-only value. Do not
   discuss SFT construction, transport fields, hidden reasoning, or formatting
@@ -236,8 +241,8 @@ Critical invariants:
 - Validate substantive reasoning, mathematical correctness, non-truncation, and a non-empty final answer. Answer-only or superficial fallback rows do not satisfy a complete-derivation task.
 Wrapper tokens returned with `enable_thinking=true` are already part of this
 task's training text. Preserve them; do not add a second set of wrappers in an
-operator. With `enable_thinking=false`, consume and validate the returned
-content directly rather than searching for wrapper tags.
+operator. With `enable_thinking=false` or `enable_thinking=omit`, consume and validate the
+returned content directly rather than searching for wrapper tags.
 
 ## Task discipline
 

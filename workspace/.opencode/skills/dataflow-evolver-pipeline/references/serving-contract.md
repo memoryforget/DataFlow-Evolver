@@ -16,17 +16,17 @@ adaptation.
 | key_name_of_api_key | Environment-variable name containing the API key, not the key value. |
 | model_name | Request-body model; it does not define response parsing. |
 | temperature | Sampling temperature. |
-| enable_thinking | Required boolean response contract. `true` exposes reasoning plus content in DataFlow wrappers; `false` exposes content only. The same value is forwarded to the upstream model. |
+| enable_thinking | Optional tri-state policy: `true`/`false` are forwarded booleans; `omit` (or absence) omits the request field and uses content-only parsing. |
 | extra keyword arguments | The remaining dynamic serving profile forwarded by DataFlow, for example `top_p`, `max_tokens`, `stream`, and `stream_options`. |
 | max_workers | DataFlow-owned HTTP concurrency and connection-pool size. |
 | max_retries | Total attempts per logical input, including the first. |
 | connect_timeout / read_timeout | Connection and response-read timeouts. |
 
 Copy the dynamic serving profile to `APILLMServing_request`. Keep all transport
-settings unchanged. When the task requires different response contracts,
-construct separate Pipeline-owned serving instances and change only the
-explicit `enable_thinking` boolean. Never use strings such as `"true"` or
-`"false"`.
+settings unchanged. For `enable_thinking=true` or `false`, pass the real boolean
+unchanged. For `enable_thinking=omit` (or an absent field), omit that keyword from
+the constructor so it is absent from the upstream JSON; do not send the string
+`"omit"`. Never infer a value from the model name.
 
 ## Response contracts
 
@@ -41,11 +41,12 @@ Use this contract only when the task explicitly requires the reasoning field as
 visible artifact text. A complete derivation in `message.content` remains
 content-only. Preserve the returned string and validate it against the task.
 
-With `enable_thinking=false`, Serving returns `message.content` only. Use this
-contract for the category of calls whose downstream artifact needs only
-content. Judges, scorers, classifiers, routers, extractors, and concise
-normalizers are examples, not an exhaustive operator list. Parse and validate
-the content according to the operator's declared domain output.
+With `enable_thinking=false`, Serving returns `message.content` only and the
+explicit boolean is forwarded upstream. With `enable_thinking=omit` (or when the
+field is absent), Serving also returns `message.content` only, but the upstream
+request must not contain `enable_thinking`. Judges, scorers, classifiers, routers,
+extractors, and concise normalizers are examples, not an exhaustive operator list.
+Parse and validate the content according to the operator's declared domain output.
 
 Operators receive one aligned `str` or `None` per input. They must not inspect
 raw OpenAI dictionaries, parse streaming events, concatenate reasoning and
