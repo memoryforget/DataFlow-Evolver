@@ -186,6 +186,26 @@ def test_review_serving_capture_records_exact_usage_without_prompt(tmp_path):
     assert "private review prompt" not in serialized
 
 
+def test_review_serving_accepts_plain_string_relay_response(tmp_path):
+    serving = APILLMServing.__new__(APILLMServing)
+    serving.model_name = "configured-review-model"
+    serving.max_workers = 1
+    serving.temperature = 0.0
+    serving._client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **_kwargs: '{"passed": true}')
+        )
+    )
+    events = tmp_path / "review_llm_calls.jsonl"
+
+    with serving.capture_usage(events, phase="iteration_002"):
+        assert serving.generate_one("review prompt") == '{"passed": true}'
+
+    event = json.loads(events.read_text(encoding="utf-8"))
+    assert event["success"] is True
+    assert event["usage_status"] == "missing"
+
+
 def test_combined_iteration_usage_includes_review_and_embedding(tmp_path):
     review = {"kind": "review_llm", "tokens": {"total_tokens": 120}}
     embedding = {"kind": "embedding", "tokens": {"total_tokens": 500}}

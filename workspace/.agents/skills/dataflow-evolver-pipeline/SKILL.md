@@ -243,7 +243,9 @@ Critical invariants:
   deliberation in model prompts.
 - Do not parse raw OpenAI dictionaries, concatenate response fields, alter the
   DataFlow-provided wrapper structure, or add an operator-level HTTP retry loop.
-- Validate substantive reasoning, mathematical correctness, non-truncation, and a non-empty final answer. Answer-only or superficial fallback rows do not satisfy a complete-derivation task.
+- Validate substantive task correctness, domain-specific validity, non-truncation, and a non-empty required output.
+  For reasoning tasks, require a coherent derivation or justification. For non-reasoning tasks, validate
+  according to the task contract, target schema, and label/value constraints.
 Wrapper tokens returned with `enable_thinking=true` are already part of this
 task's training text. Preserve them; do not add a second set of wrappers in an
 operator. With `enable_thinking=false` or `enable_thinking=omit`, consume and validate the

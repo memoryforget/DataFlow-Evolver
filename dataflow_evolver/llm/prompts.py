@@ -116,9 +116,9 @@ REVIEW_PROMPT = """你是数据质量评审员。下面是候选数据集的有�
 {samples}
 
 评分维度：
-- correctness_score：标签/解答正确，推理与答案自洽。
+- correctness_score：输出内容、标签或解答满足任务要求；如果包含解释或推理，内容应保持自洽。
 - relevance_score：与目标任务和领域相关。
-- difficulty_score：具有非平凡但可学习的难度。
+- difficulty_score：对目标任务具有适当的信息量、覆盖度和可学习挑战。
 - schema_score：必需字段齐全、非空且类型正确；额外元数据不扣分。
 
 失败信号：
@@ -505,6 +505,11 @@ def build_downstream_attribution_prompt(
                     f"Correct answer: {_compact_prompt_text(case.correct_answer, 800)}",
                 ]
             )
+    example_benchmark = next(
+        (name for name, benchmark in feedback.benchmarks.items() if benchmark.bad_cases),
+        None,
+    )
+    example_evidence_ids = [f"{example_benchmark}#1"] if example_benchmark else []
     max_findings = max(1, int(max_findings))
     max_actions = max(1, int(max_actions))
     lines.extend(
@@ -519,7 +524,7 @@ def build_downstream_attribution_prompt(
                             "category": "missing_context",
                             "data_side": True,
                             "confidence": 0.0,
-                            "evidence_ids": ["gsm8k#1"],
+                            "evidence_ids": example_evidence_ids,
                             "diagnosis": "可复用的失败模式及其证据解释",
                             "recommended_actions": ["具体 pipeline 改动"],
                         }

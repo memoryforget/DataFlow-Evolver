@@ -143,13 +143,24 @@ class APILLMServing(LLMServingABC):
                 error_type=type(exc).__name__,
             )
             raise
+        # Some OpenAI-compatible relays return the response body as a plain
+        # string instead of an SDK ChatCompletion object. Treat that body as
+        # the completion text so review calls do not fail with
+        # ``'str' object has no attribute 'choices'``.
+        if isinstance(resp, str):
+            result = resp
+            response_model = self.model_name
+            response_usage = None
+        else:
+            response_model = str(getattr(resp, "model", None) or self.model_name)
+            response_usage = getattr(resp, "usage", None)
+            result = resp.choices[0].message.content or ""
         self._record_usage(
-            model=str(getattr(resp, "model", None) or self.model_name),
-            raw_usage=getattr(resp, "usage", None),
+            model=response_model,
+            raw_usage=response_usage,
             success=True,
             latency_seconds=time.perf_counter() - started,
         )
-        result = resp.choices[0].message.content or ""
         logger.debug("API 响应：len=%d, preview=%.200s", len(result), result)
         return result
 

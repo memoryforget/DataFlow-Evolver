@@ -7,6 +7,7 @@ from dataflow_evolver.core.downstream_eval import (
     DownstreamEvaluationResult,
 )
 from dataflow_evolver.core.schemas import TaskSpec
+from dataflow_evolver.llm.prompts import build_downstream_attribution_prompt
 
 
 class _Serving:
@@ -87,6 +88,19 @@ def test_attribution_is_structured_and_audited(tmp_path):
     assert "不要把单个 benchmark 题目当作训练数据" in serving.prompts[0]
     assert "findings 最多 2 条" in serving.prompts[0]
     assert "recommended_actions 最多 3 条" in serving.prompts[0]
+
+
+def test_attribution_prompt_uses_dynamic_benchmark_evidence_id():
+    feedback = _feedback()
+    feedback.benchmarks = {"summarization": feedback.benchmarks["gsm8k"]}
+    prompt = build_downstream_attribution_prompt(
+        task=TaskSpec("summarization", {"instruction": "str", "output": "str"}, []),
+        feedback=feedback,
+        pipeline_operators=[{"name": "Summarizer"}],
+    )
+
+    assert '"evidence_ids": ["summarization#1"]' in prompt
+    assert '"evidence_ids": ["gsm8k#1"]' not in prompt
 
 
 def test_attribution_rejects_empty_response():
