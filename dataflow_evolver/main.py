@@ -700,12 +700,15 @@ def _build_dataset_quality_evaluator(
     if not _as_bool(value.get("enabled", False)):
         return None, fields
 
+    proxy_comparison_enabled = _as_bool(
+        value.get("proxy_comparison_enabled", True)
+    )
     proxy_cfg = value.get("proxy") or Config({})
     embedding_cfg = value.get("embedding") or Config({})
     proxy_path = str(proxy_cfg.get("path", "") or "").strip()
     base_url = str(embedding_cfg.get("base_url", "") or "").strip()
     model_name = str(embedding_cfg.get("model_name", "") or "").strip()
-    if not proxy_path:
+    if proxy_comparison_enabled and not proxy_path:
         raise ValueError("review.dataset_quality.proxy.path 不能为空")
     if not base_url:
         raise ValueError("review.dataset_quality.embedding.base_url 不能为空")
@@ -714,14 +717,16 @@ def _build_dataset_quality_evaluator(
 
     cache_value = str(value.get("cache_dir", "") or "").strip()
     cache_dir = Path(cache_value) if cache_value else workspace / "cache" / "das"
-    proxy = ProxyDatasetConfig(
-        source=str(proxy_cfg.get("source", "huggingface")),
-        path=proxy_path,
-        name=str(proxy_cfg.get("name", "") or ""),
-        split=str(proxy_cfg.get("split", "train")),
-        user_field=str(proxy_cfg.get("user_field", "question")),
-        assistant_field=str(proxy_cfg.get("assistant_field", "response")),
-    )
+    proxy = None
+    if proxy_comparison_enabled:
+        proxy = ProxyDatasetConfig(
+            source=str(proxy_cfg.get("source", "huggingface")),
+            path=proxy_path,
+            name=str(proxy_cfg.get("name", "") or ""),
+            split=str(proxy_cfg.get("split", "train")),
+            user_field=str(proxy_cfg.get("user_field", "question")),
+            assistant_field=str(proxy_cfg.get("assistant_field", "response")),
+        )
     embedder = OpenAIChatEmbeddingBackend(
         model_name=model_name,
         base_url=base_url,
@@ -742,6 +747,7 @@ def _build_dataset_quality_evaluator(
         max_embedding_fail_rate=float(value.get("max_embedding_fail_rate", 0.02)),
         cache_dir=cache_dir,
         require_full_sample=_as_bool(value.get("require_full_sample", True)),
+        proxy_comparison_enabled=proxy_comparison_enabled,
     )
     return evaluator, fields
 
