@@ -247,6 +247,10 @@ class ReviewOnlyLoop:
                 result.traceback or "",
                 result.diagnostics,
                 failure_stage=result.failure_stage or "execution",
+                log_paths={
+                    key: value for key, value in result.artifacts.items()
+                    if key.endswith("_log")
+                },
             )
             if fixed is None:
                 break

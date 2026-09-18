@@ -104,6 +104,7 @@ class PipelineAgent:
         traceback: str,
         diagnostics: str = "",
         failure_stage: str = "execution",
+        log_paths: dict[str, str] | None = None,
     ) -> PipelineConfig | None:
         iteration_dir = iteration_dir.resolve()
         prompt = build_selfcorrect_prompt(
@@ -111,6 +112,7 @@ class PipelineAgent:
             traceback,
             diagnostics,
             failure_stage=failure_stage,
+            log_paths=log_paths,
         )
         return self._run_and_assemble(
             prompt,

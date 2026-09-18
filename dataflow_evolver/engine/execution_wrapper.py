@@ -35,6 +35,52 @@ logger = get_logger("engine.execution")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+# Keep complete subprocess output on disk, but do not copy progress-bar noise into
+# an Agent repair request. These limits stay below the provider input cap.
+MAX_TRACEBACK_CHARS = 32 * 1024
+MAX_DIAGNOSTICS_CHARS = 64 * 1024
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_PROGRESS_LINE_RE = re.compile(r"(?:\d{1,3}%\||it/s|Generating responses from prompts)")
+
+
+def _bounded_text(value: str | None, limit: int) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    marker = f"\n...[truncated to {limit} chars]...\n"
+    budget = max(0, limit - len(marker))
+    head = budget // 3
+    return text[:head] + marker + text[-(budget - head):]
+
+
+def _compact_failure_text(value: str | None) -> str:
+    """Remove terminal progress noise while retaining the useful exception tail."""
+    text = _ANSI_ESCAPE_RE.sub("", str(value or ""))
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.split("\r")[-1].strip()
+        if not line or _PROGRESS_LINE_RE.search(line):
+            continue
+        lines.append(line)
+    return _bounded_text("\n".join(lines), MAX_TRACEBACK_CHARS)
+
+
+def _write_process_logs(
+    iteration_dir: Path,
+    stdout: str | None,
+    stderr: str | None,
+    prefix: str,
+) -> dict[str, str]:
+    paths: dict[str, str] = {}
+    for stream_name, content in (("stdout", stdout), ("stderr", stderr)):
+        path = iteration_dir / f"{prefix}_{stream_name}.log"
+        try:
+            path.write_text(str(content or ""), encoding="utf-8")
+            paths[f"{prefix}_{stream_name}_log"] = str(path.resolve())
+        except OSError as exc:
+            logger.warning("写执行日志失败：%s (%s)", path, exc)
+    return paths
+
 
 @dataclass
 class ExecutionResult:
@@ -207,6 +253,9 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
             )
         except subprocess.TimeoutExpired as exc:
             finalize_usage()
+            artifacts.update(_write_process_logs(
+                iteration_dir, exc.stdout, exc.stderr, f"attempt_{attempt:02d}_compile"
+            ))
             logger.error("compile 预检超时（>%ds）：%s", self.compile_timeout_sec, pipeline_path)
             return ExecutionResult(
                 False,
@@ -220,12 +269,17 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
                 failure_stage="compile",
             )
 
+        artifacts.update(_write_process_logs(
+            iteration_dir, compile_proc.stdout, compile_proc.stderr,
+            f"attempt_{attempt:02d}_compile",
+        ))
+
         if compile_proc.returncode != 0:
             finalize_usage()
             logger.error("compile 预检失败（exit=%d）：%s", compile_proc.returncode, pipeline_path)
             return ExecutionResult(
                 False,
-                traceback=compile_proc.stderr or f"compile preflight exited with code {compile_proc.returncode}",
+                traceback=_compact_failure_text(compile_proc.stderr or f"compile preflight exited with code {compile_proc.returncode}"),
                 stdout=compile_proc.stdout,
                 stderr=compile_proc.stderr,
                 artifacts=artifacts,
@@ -234,8 +288,8 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
                         "stage": "compile",
                         "status": "failed",
                         "returncode": compile_proc.returncode,
-                        "stdout_tail": compile_proc.stdout[-2000:],
-                        "stderr_tail": compile_proc.stderr[-4000:],
+                        "stdout_tail": _bounded_text(compile_proc.stdout, 2000),
+                        "stderr_tail": _bounded_text(compile_proc.stderr, 4000),
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -284,6 +338,9 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
             )
         except subprocess.TimeoutExpired as exc:
             finalize_usage()
+            artifacts.update(_write_process_logs(
+                iteration_dir, exc.stdout, exc.stderr, f"attempt_{attempt:02d}_execution"
+            ))
             diagnostics = _jsonl_diagnostics(iteration_dir, since=start)
             logger.error("流水线执行超时（>%ds）：%s", self.timeout_sec, iteration_dir)
             return ExecutionResult(
@@ -294,6 +351,9 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
             )
 
         finalize_usage()
+        artifacts.update(_write_process_logs(
+            iteration_dir, proc.stdout, proc.stderr, f"attempt_{attempt:02d}_execution"
+        ))
         if proc.returncode != 0:
             diagnostics = _jsonl_diagnostics(iteration_dir, since=start)
             logger.error("流水线执行失败（exit=%d）：%s", proc.returncode, iteration_dir)
@@ -301,7 +361,7 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
                 logger.error("stderr:\n%s", proc.stderr[-2000:])
             return ExecutionResult(
                 False,
-                traceback=proc.stderr or f"non-zero exit code {proc.returncode}",
+                traceback=_compact_failure_text(proc.stderr or f"non-zero exit code {proc.returncode}"),
                 stdout=proc.stdout, stderr=proc.stderr, artifacts=artifacts,
                 diagnostics=diagnostics,
                 failure_stage="execution",
@@ -513,7 +573,7 @@ def _jsonl_diagnostics(iteration_dir: Path, since: float) -> str:
             "fields": fields,
             "parse_error": parse_error,
         })
-    return json.dumps(rows, ensure_ascii=False, indent=2) if rows else "no fresh JSONL artifacts"
+    return _bounded_text(json.dumps(rows, ensure_ascii=False, indent=2), MAX_DIAGNOSTICS_CHARS) if rows else "no fresh JSONL artifacts"
 
 
 def _jsonl_nonempty(path: Path) -> bool:

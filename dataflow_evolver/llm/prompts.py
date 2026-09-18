@@ -10,6 +10,19 @@ _BAD_CASE_RESPONSE_HEAD_CHARS = 1200
 _BAD_CASE_RESPONSE_TAIL_CHARS = 1800
 _RUNAWAY_RESPONSE_HEAD_CHARS = 500
 _RUNAWAY_RESPONSE_TAIL_CHARS = 500
+_SELFCORRECT_PROMPT_MAX_CHARS = 900_000
+_SELFCORRECT_TRACEBACK_MAX_CHARS = 32 * 1024
+_SELFCORRECT_DIAGNOSTICS_MAX_CHARS = 64 * 1024
+
+
+def _bounded_repair_section(value: str, limit: int) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    marker = f"\n...[section truncated to {limit} chars; use the log paths for full context]...\n"
+    budget = max(0, limit - len(marker))
+    head = budget // 4
+    return text[:head] + marker + text[-(budget - head):]
 
 
 _PIPELINE_RUNTIME_BOUNDARY = """
@@ -175,14 +188,24 @@ def build_selfcorrect_prompt(
     traceback: str,
     diagnostics: str = "not available",
     failure_stage: str = "execution",
+    log_paths: dict[str, str] | None = None,
 ) -> str:
-    return PIPELINE_SELFCORRECT_PROMPT.format(
+    logs = ""
+    if log_paths:
+        logs = "\n完整子进程日志（仅按需读取，不要默认全文加载）：\n" + "\n".join(
+            f"- {name}: `{path}`" for name, path in sorted(log_paths.items())
+        )
+    prompt = PIPELINE_SELFCORRECT_PROMPT.format(
         iteration_dir=iteration_dir,
         failure_stage=failure_stage,
-        traceback=traceback,
-        diagnostics=diagnostics,
+        traceback=_bounded_repair_section(traceback, _SELFCORRECT_TRACEBACK_MAX_CHARS),
+        diagnostics=_bounded_repair_section(diagnostics, _SELFCORRECT_DIAGNOSTICS_MAX_CHARS),
         decision_sync_note=DECISION_SYNC_NOTE.format(iteration_dir=iteration_dir),
-    )
+    ) + logs
+    if len(prompt) <= _SELFCORRECT_PROMPT_MAX_CHARS:
+        return prompt
+    marker = "\n...[repair context truncated; inspect the complete logs above]...\n"
+    return prompt[:_SELFCORRECT_PROMPT_MAX_CHARS - len(marker)] + marker
 
 
 def build_review_prompt(task: TaskSpec, samples_text: str) -> str:

@@ -58,10 +58,8 @@ You are the DataFlow-Evolver Pipeline Agent. Activate the project skill
 contract. Generate custom local operators and one bounded pipeline for the task.
 
 Use this specialized skill, the supplied task context, parent artifacts,
-diagnostics, and dynamic serving configuration as the complete contract. Keep all
-inspection scoped to the current iteration artifacts. Do not execute or benchmark
-the generated pipeline; the framework owns compile and execution. Write the
-requested artifact promptly and return without exploratory validation.
+diagnostics, and dynamic serving configuration as the complete contract. Do not execute or benchmark
+the generated pipeline; the framework owns compile and execution.
 """
 
 def default_system_prompt_append(backend: str) -> str:

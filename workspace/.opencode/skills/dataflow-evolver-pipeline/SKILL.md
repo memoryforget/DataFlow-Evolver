@@ -110,6 +110,36 @@ class CustomOperator(OperatorABC):
         storage.write(output_rows)
 ```
 
+## Cardinality-changing operator resilience
+
+When the task requires an exact or minimum output count, filtering and selection
+must implement that cardinality as an explicit contract rather than assuming that
+the preferred candidates will be sufficient:
+
+- Separate hard-invalid records from records excluded only by soft scores,
+  rankings, balancing targets, diversity preferences, or quotas. Preserve a
+  deterministic reserve of hard-valid records for downstream recovery.
+- A selector that underfills its target must backfill deterministically from that
+  reserve. It may relax soft preferences in a declared order, but it must never
+  relax the task's hard schema, content, provenance, safety, decontamination,
+  media-integrity, uniqueness, or length invariants.
+- Do not reach a target by duplicating rows, fabricating replacements, silently
+  truncating the requested count, or reintroducing hard-invalid records.
+- Validate the final distinct count before writing. If the available hard-valid
+  pool is still insufficient, raise an informative error with the target,
+  available count, and rejection or fallback counts so framework self-correction
+  can address the responsible upstream step.
+- For an LLM-backed operator, a missing, malformed, or rejected response may fall
+  back to the unchanged input record only if that record independently satisfies
+  every hard invariant. Otherwise expose it as a rejection for the selector's
+  reserve/backfill logic instead of silently dropping it.
+- Bounded classifiers, auditors, or repair operators may leave records outside
+  their candidate pool with missing or `None` metadata. Downstream operators must
+  type-check optional metadata before reading nested fields and treat an unprocessed
+  record as a documented neutral state unless the task explicitly makes that audit
+  mandatory. Do not assume `row.get(key, {})` returns a mapping when the key exists
+  with a null value.
+
 ## Serving ownership and dependency injection
 
 The Pipeline owns serving construction. An API-backed operator receives an initialized
