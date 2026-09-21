@@ -47,6 +47,7 @@ class DownstreamBadCase:
     response_token_count: int | None = None
     finish_reason: str = ""
     length_truncated: bool = False
+    dimension: str = ""
 
 
 @dataclass(frozen=True)
@@ -486,6 +487,9 @@ def _validate_bad_case(name: str, index: int, raw: Any) -> DownstreamBadCase:
         length_truncated=_bool(
             raw.get("length_truncated", False),
             f"{name}.bad_cases[{index}].length_truncated",
+        ),
+        dimension=_string(
+            raw.get("dimension", ""), f"{name}.bad_cases[{index}].dimension"
         ),
     )
 

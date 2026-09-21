@@ -77,6 +77,7 @@ class PipelineAgent:
         iteration_dir: Path,
         parent_code: str | None = None,
         parent_rationale: str | None = None,
+        parent_iteration_dir: Path | None = None,
         parent_review: ReviewResult | None = None,
         downstream_feedback: DownstreamEvaluationResult | None = None,
         evolution_history: list[dict[str, Any]] | None = None,
@@ -91,6 +92,11 @@ class PipelineAgent:
             llm_block=self.llm_block,
             parent_code=parent_code,
             parent_rationale=parent_rationale,
+            parent_iteration_dir=(
+                str(parent_iteration_dir.resolve())
+                if parent_iteration_dir is not None
+                else None
+            ),
             parent_review=parent_review,
             downstream_feedback=downstream_feedback,
             evolution_history=evolution_history,

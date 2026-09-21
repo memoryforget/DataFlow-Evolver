@@ -29,8 +29,7 @@ _PIPELINE_RUNTIME_BOUNDARY = """
 【最高优先级运行边界】
 先加载并遵循 `$dataflow-evolver-pipeline`。DataFlow 运行时只使用已安装的
 `open-dataflow` 包；不要读取、搜索或复制任何 DataFlow 源码。算子和 Pipeline
-由本任务本地生成。通用 API、compile 和 Serving 响应兼容契约均以该 skill 为准；
-本 Prompt 只负责本轮数据目标、反馈和动态模型配置。
+由本任务本地生成。通用 API、compile 和 Serving 响应兼容契约均以该 skill 为准。
 """
 
 PIPELINE_PROMPT = _PIPELINE_RUNTIME_BOUNDARY + "\n\n" + """为下述目标编写一条完整、可直接运行的 DataFlow 流水线（含自定义算子）。
@@ -44,6 +43,10 @@ Entry file: {entry_path}
 1. 这是固定语料加工/增强任务。将上面的 Entry file 作为 `FrameworkStepCache.from_env()` 的
    `raw_entry_path`；`first_entry_file_name` 必须使用框架返回的 `entry_path`。未命中复用时该路径
    就是固定 raw data。流水线不能绕开输入另起一套纯生成数据。
+   在设计流水线之前，必须先对 Entry file 做只读的输入审查。检查来源分布、schema、角色顺序、轮次数、语言、长度、占位符和重复等情况，
+   以及任务相关字段；不得把全量数据加载进内存或 Agent 上下文，也不得只依据 Prompt 中的前三行
+   预览、当前 iteration 目录为空或主观猜测直接设计。将实际检查到的关键证据和对应设计取舍写入
+   `decision.json.reason`。
 2. 不允许联网拉取外部数据，包括 `load_dataset`、`hf_hub_download`、`requests`/curl，以及
    FileStorage 的 `hf:` / `ms:` 远程入口。调用配置好的 LLM serving API 不受此限。
 3. 目标 schema：{target_schema}。最终 JSONL 至少包含这些字段且非空；可以保留额外的中间字段
@@ -61,11 +64,11 @@ Entry file: {entry_path}
 8. 主入口必须使用专用 skill 中唯一的 framework-owned compile/forward 契约。只写入所需产物，
    不要自行执行 `pipeline.py`（包括 compile-only 或 smoke test）；框架会在 Agent 返回后依次执行
    确定性的 artifact 校验、compile 预检和正式运行。
-9. 以解决 Review、下游评测和 bad cases 暴露的问题为首要目标，不以最少代码、文件或算子为目标，也不为节省调用成本而牺牲数据质量；LLM 调用范围应根据任务与反馈合理设计。
+9. 以解决 Review 与下游归因报告指出的问题为首要目标，不以最少代码、文件或算子为目标，也不为节省调用成本而牺牲数据质量；LLM 调用范围应根据任务与反馈合理设计。
    根据职责边界和反馈自由增加、删除、拆分或合并算子；不要为了缓存复用而保留不合理的父流水线结构。
 {init_block}{parent_block}{review_block}{downstream_block}{history_block}
 约束：无头自动化运行，禁止 AskUserQuestion 与 git/gh 子流程，不能获取新数据；所有实现
-依据均来自专用 skill、本轮 Prompt 和当前 iteration 产物。"""
+依据均来自专用 skill、本轮 Prompt、明确提供的父轮上下文、对固定 Entry file 的只读审查。当前 iteration 是输出目录。"""
 
 
 DECISION_SYNC_NOTE = """如果修复改变了算子、字段流或设计取舍，请同步覆盖
@@ -75,8 +78,8 @@ DECISION_SYNC_NOTE = """如果修复改变了算子、字段流或设计取舍�
 PIPELINE_SELFCORRECT_PROMPT = _PIPELINE_RUNTIME_BOUNDARY + "\n\n" + """流水线 `{iteration_dir}/pipeline.py` 未通过框架检查。
 失败阶段：`{failure_stage}`。
 
-只依据专用 skill、错误栈、逐步诊断以及当前 iteration 的 `pipeline.py` 和 `operators/`
-定位问题。
+只依据专用 skill、错误栈、逐步诊断、下面列出的完整子进程日志（仅按需读取），以及当前 iteration
+的 `pipeline.py` 和 `operators/` 定位问题。
 
 只修改 `pipeline.py`、`operators/` 和必要的 `decision.json`，不要自行执行 `pipeline.py`、
 compile-only 或 smoke test。Agent 返回后，框架会重新执行 artifact 校验、compile 预检与正式运行。
@@ -156,6 +159,7 @@ def build_pipeline_prompt(
     llm_block: str = "",
     parent_code: str | None = None,
     parent_rationale: str | None = None,
+    parent_iteration_dir: str | None = None,
     parent_review: ReviewResult | None = None,
     downstream_feedback: DownstreamEvaluationResult | None = None,
     evolution_history: list[dict] | None = None,
@@ -172,10 +176,16 @@ def build_pipeline_prompt(
         iteration_dir=iteration_dir,
         llm_block=llm_block or "   使用项目已有的默认 serving 配置。",
         init_block=(
-            "【初始流水线】从固定 raw data 出发，设计稳定、可解释的处理基线。\n"
+            "【初始流水线】本轮没有父流水线。当前 iteration 目录是新流水线的输出位置，"
+            "先完成上面要求的有界输入审查，再从固定 raw data 设计稳定、可解释的处理基线。\n"
             if is_init else ""
         ),
-        parent_block=_parent_block(parent_code, parent_rationale, iteration_dir),
+        parent_block=_parent_block(
+            parent_code,
+            parent_rationale,
+            iteration_dir,
+            parent_iteration_dir,
+        ),
         review_block=(
             _parent_quality_block(parent_review) if parent_review is not None else ""
         ),
@@ -219,10 +229,20 @@ def build_review_prompt(task: TaskSpec, samples_text: str) -> str:
     )
 
 
-def _parent_block(code: str | None, rationale: str | None, iteration_dir: str) -> str:
+def _parent_block(
+    code: str | None,
+    rationale: str | None,
+    iteration_dir: str,
+    parent_iteration_dir: str | None = None,
+) -> str:
     if not code and not rationale:
         return ""
     lines = ["【上一轮流水线】"]
+    if parent_iteration_dir:
+        lines.append(
+            f"父轮 incumbent 目录：`{parent_iteration_dir}`。这是本轮唯一允许继承的父轮目录；"
+            "不要按 iteration 编号猜测父轮。"
+        )
     if code:
         lines.append(
             "下面是上一轮已执行流水线，仅作为可复用的参考，不限制本轮设计空间。根据任务与反馈自由设计，并可按需保留、替换、拆分、合并、增加或删除算子；不要为了缓存复用而维持原结构：\n"
@@ -236,12 +256,14 @@ def _parent_block(code: str | None, rationale: str | None, iteration_dir: str) -
             f"的本地源码到当前 `{iteration_dir}/operators/`。不要读取、选择、验证或硬编码父轮 cache "
             "JSONL；不要通过 `pipeline_step_stepN` 推断 producer，也不要自行实现 cache hit/miss。\n"
             "每条 Pipeline 都必须使用 skill 中的 `FrameworkStepCache.from_env()` 标准适配器。框架会在"
-            "执行前比较 raw input、逻辑算子顺序、源码及本地依赖、初始化调用与参数 fingerprint，并从"
+            "执行前比较 raw input、逻辑算子顺序、算子名、`decision.json.params` 与初始化调用的语义"
+            "身份，并从"
             "父轮 `step_manifest.json` 注入经过验证的 entry path 和 prefix count；无法证明时自动从 raw "
             "input 完整重算。Pipeline 只按 `should_run(logical_index)` 机械跳过框架确认的前缀。\n"
             "在 `decision.json.reason` 只记录哪些前缀算子未变化以及首个变化算子；缓存 artifact、step "
-            "编号、lineage 与命中结论全部由框架记录，Agent 不得自行决定。源码不参与身份校验；保持相同的算子名、顺序、"
-            "`decision.json.params` 与初始化调用即声明语义未变并授权框架复用。若算子实现或本地依赖的行为发生变化，"
+            "编号、lineage 与命中结论全部由框架记录，Agent 不得自行决定。源码字节与源码文件哈希不参与"
+            "身份比较；保持相同的算子名、顺序、`decision.json.params` 与初始化调用即声明语义未变并授权框架复用。"
+            "若算子实现或本地依赖的行为发生变化，"
             "必须更新算子类名、params 或初始化参数中的至少一项。"
         )
     return "\n".join(lines) + "\n"
@@ -299,7 +321,10 @@ def _parent_quality_block(review: ReviewResult) -> str:
     if review.issues:
         lines.append("具体问题：")
         lines.extend(f"- {issue}" for issue in review.issues)
-    lines.append("只修改能够解释上述反馈的步骤，并在 decision.json 的 reason 中说明本轮改动。")
+    lines.append(
+        "优先修改能够解释上述反馈的步骤，同时保留无关且有效的行为；若证据要求，可增加、拆分、"
+        "合并或替换算子。请在 decision.json 的 reason 中说明反馈、改动与预期作用的对应关系。"
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -353,10 +378,12 @@ def _downstream_feedback_block(
     lines = [
         title,
         checkpoint,
-        "以下 bad cases 是诊断证据，不是可复制进训练数据的新数据源。禁止复述、硬编码或"
-        "针对这些 benchmark 题目构造答案；应归纳能力缺口并改进 raw-data pipeline。",
-        "完整、未截断的结果由框架单独保留用于人工审计；不要读取完整 result.json。"
-        "下面提供的有界投影已经是本轮允许使用的全部下游诊断证据。",
+        "指标含义：delta_previous 是当前 checkpoint 相对上一个成功下游 checkpoint 的分数变化；"
+        "delta_baseline 是相对 checkpoint 000（未训练 backbone）的分数变化；正数表示提升，"
+        "负数表示下降，baseline 阶段因没有对照而显示 unknown。",
+        "下面只提供聚合指标和 Downstream Attribution Agent 生成的结构化归因报告。",
+        "归因报告中的 Evidence ID 只是不可解析的审计引用，不代表可访问的数据源。"
+        "只能归纳可复用的能力缺口并改进 raw-data pipeline。",
     ]
     attribution = feedback.attribution
     for benchmark_name, benchmark in feedback.benchmarks.items():
@@ -480,7 +507,7 @@ def build_downstream_attribution_prompt(
         "你是下游评测归因器，负责把模型 benchmark 失败归因到“可由数据流水线改进的原因”。",
         "不要把单个 benchmark 题目当作训练数据，不要复述或硬编码题目/答案。",
         "必须区分 data_side=true（数据生成可修复）与 data_side=false（模型、解析器或基础设施问题）。",
-        "只有跨多个案例可复用的模式才可作为 pipeline 建议；单个孤立案例应降低 confidence。",
+        "优先从多个案例中归纳可复用模式，单个孤立案例可能需要降低 confidence。",
         "每条 finding 必须绑定 evidence_ids，并给出可执行的过滤、上下文、重写、覆盖或难度策略。",
         "目标任务：",
         task.task_description,
@@ -514,6 +541,7 @@ def build_downstream_attribution_prompt(
             lines.extend(
                 [
                     f"Evidence {case_id}:",
+                    f"Dimension: {case.dimension or 'unspecified'}",
                     f"Question: {_compact_prompt_text(case.question, 1200)}",
                     (
                         "Response metadata: "

@@ -635,19 +635,37 @@ def _conversation(record: dict[str, Any], user_field: str, assistant_field: str)
     assistant = record.get(assistant_field)
     if user_field == assistant_field and isinstance(user, list):
         messages: Conversation = []
-        for message in user:
-            if not isinstance(message, dict):
+        if user and all(isinstance(message, str) for message in user):
+            if len(user) % 2 != 0 or any(not message.strip() for message in user):
                 return None
-            role = message.get("role")
-            content = message.get("content")
-            if role not in {"system", "user", "assistant"}:
-                return None
-            if not isinstance(content, str) or not content.strip():
-                return None
-            messages.append({"role": role, "content": content.strip()})
+            # Alternating string-list proxies such as EduChat carry a repeated
+            # branding system prompt. Exclude that metadata so MMD compares the
+            # educational exchanges instead of a shared boilerplate prefix.
+            messages.extend(
+                {
+                    "role": "user" if index % 2 == 0 else "assistant",
+                    "content": content.strip(),
+                }
+                for index, content in enumerate(user)
+            )
+        else:
+            for message in user:
+                if not isinstance(message, dict):
+                    return None
+                role = message.get("role")
+                content = message.get("content")
+                if role not in {"system", "user", "assistant"}:
+                    return None
+                if not isinstance(content, str) or not content.strip():
+                    return None
+                messages.append({"role": role, "content": content.strip()})
         dialog = messages[1:] if messages and messages[0]["role"] == "system" else messages
         expected = ["user" if index % 2 == 0 else "assistant" for index in range(len(dialog))]
-        if len(dialog) < 2 or [message["role"] for message in dialog] != expected:
+        if (
+            len(dialog) < 2
+            or dialog[-1]["role"] != "assistant"
+            or [message["role"] for message in dialog] != expected
+        ):
             return None
         return messages
     if not isinstance(user, str) or not user.strip():
@@ -668,31 +686,49 @@ def _sample_jsonl_conversations(
     user_field: str,
     assistant_field: str,
 ) -> tuple[list[Conversation], int, int]:
+    return _sample_jsonl_files(
+        [Path(path)],
+        sample_size=sample_size,
+        seed=seed,
+        user_field=user_field,
+        assistant_field=assistant_field,
+    )
+
+
+def _sample_jsonl_files(
+    paths: list[Path],
+    *,
+    sample_size: int,
+    seed: int,
+    user_field: str,
+    assistant_field: str,
+) -> tuple[list[Conversation], int, int]:
     rng = random.Random(seed)
     reservoir: list[Conversation] = []
     total = 0
     valid = 0
-    with Path(path).open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            if not raw_line.strip():
-                continue
-            total += 1
-            try:
-                record = json.loads(raw_line)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            if not isinstance(record, dict):
-                continue
-            messages = _conversation(record, user_field, assistant_field)
-            if messages is None:
-                continue
-            valid += 1
-            if len(reservoir) < sample_size:
-                reservoir.append(messages)
-            else:
-                index = rng.randint(0, valid - 1)
-                if index < sample_size:
-                    reservoir[index] = messages
+    for path in paths:
+        with path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                if not raw_line.strip():
+                    continue
+                total += 1
+                try:
+                    record = json.loads(raw_line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                messages = _conversation(record, user_field, assistant_field)
+                if messages is None:
+                    continue
+                valid += 1
+                if len(reservoir) < sample_size:
+                    reservoir.append(messages)
+                else:
+                    index = rng.randint(0, valid - 1)
+                    if index < sample_size:
+                        reservoir[index] = messages
     return reservoir, total, valid
 
 
@@ -706,9 +742,22 @@ def _sample_local_proxy(
 ) -> tuple[list[Conversation], int, int]:
     proxy_path = Path(path)
     if proxy_path.is_dir():
+        jsonl_files = sorted(
+            file
+            for pattern in ("*.jsonl", "*.ndjson")
+            for file in proxy_path.rglob(pattern)
+        )
+        if jsonl_files:
+            return _sample_jsonl_files(
+                jsonl_files,
+                sample_size=sample_size,
+                seed=seed,
+                user_field=user_field,
+                assistant_field=assistant_field,
+            )
         parquet_files = sorted(proxy_path.rglob("*.parquet"))
         if not parquet_files:
-            raise ValueError(f"本地代理目录中没有 Parquet 分片：{proxy_path}")
+            raise ValueError(f"本地代理目录中没有 JSONL/NDJSON 或 Parquet 分片：{proxy_path}")
         try:
             from datasets import load_dataset
         except ImportError as exc:

@@ -190,6 +190,7 @@ class ReviewOnlyLoop:
                 iteration_dir=self._iteration_dir(iteration + 1),
                 parent_code=incumbent.config.code,
                 parent_rationale=incumbent.config.rationale,
+                parent_iteration_dir=incumbent.iteration_dir,
                 parent_review=incumbent.review,
                 downstream_feedback=self.latest_downstream_evaluation,
                 evolution_history=self._evolution_history(),
