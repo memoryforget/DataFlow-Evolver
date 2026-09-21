@@ -39,11 +39,17 @@ bash scripts/downstream/setup_math_envs.sh \
 ```
 
 It creates `dfe-sft` and `dfe-math-eval`. Do not install these packages into the
-DataFlow Evolver Agent/Review environment. The LlamaFactory checkout is needed only by
-this one-time setup command. The script performs a regular installation (not an editable
-install), and the runtime subsequently invokes the installed `llamafactory-cli`; it does
-not depend on the source checkout. The project also carries its own ZeRO-2 configuration
-under `configs/deepspeed/`.
+DataFlow Evolver Agent/Review environment. The setup script reuses the source environment's
+CUDA/PyTorch stack but removes vLLM and unrelated DataFlow packages from `dfe-sft`, then
+installs the training-only pins in `configs/requirements/sft.txt`. In particular,
+Transformers 5.2.0 is required to load Qwen3.5 checkpoints. vLLM remains isolated in
+`dfe-math-eval`; installing it in `dfe-sft` would introduce an incompatible Transformers
+constraint.
+
+The LlamaFactory checkout is needed only by this one-time setup command. The script
+performs a regular installation (not an editable install), and the runtime subsequently
+invokes the installed `llamafactory-cli`; it does not depend on the source checkout. The
+project also carries its own ZeRO-2 configuration under `configs/deepspeed/`.
 
 ## Fixed diagnostic materialization
 
@@ -72,8 +78,9 @@ in `UPSTREAM.md`; no external Qwen2.5-Math checkout is required at runtime.
 
 The suite contains GSM8K, MATH, AMC23, AIME24, AIME25, Minerva Math,
 Gaokao2024-Mix, and the Qwen OlympiadBench subset. Core benchmarks use deterministic
-greedy accuracy. Small competition sets use `pass@32` with temperature 0.6. Every group
-uses `max_tokens_per_call=16384` and explicitly caps the vLLM context with
+greedy accuracy. Small competition sets use `avg@4` with four samples per question and
+temperature 0.6. Every group uses `max_tokens_per_call=16384` and explicitly caps the
+vLLM context with
 `max_model_len=32768`. The `qwen25-math-cot` prompt already contains Qwen
 ChatML markers, so `apply_chat_template` is false; enabling it would double-wrap the
 prompt.

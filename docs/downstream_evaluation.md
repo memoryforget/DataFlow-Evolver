@@ -77,7 +77,10 @@ they are not copied into DataFlow Evolver's YAML.
 ## Request contract
 
 `request.json` contains protocol version 3, the checkpoint stage, task contract,
-expected benchmark names, and required bad-case count.
+expected benchmark names, and required bad-case count. Periodic `checkpoint_iteration`
+values count completed static iterations using one-based numbering. A non-null
+`incumbent_iteration` is also one-based and maps directly to `iteration_NNN`; only the
+untrained baseline uses checkpoint 0 with no incumbent.
 
 At checkpoint 0, `stage` is `baseline`, `training_performed` is false, and incumbent,
 dataset, and pipeline paths are null. The runner must skip SFT and directly evaluate its
