@@ -96,7 +96,19 @@ def test_pipeline_prompt_uses_fixed_input_path_and_forbids_external_data(tmp_pat
     assert "不允许联网拉取外部数据" in prompt
     assert "LLM 算子" in prompt
     assert "prompt 作为可调整的设计部分" in prompt
+    assert "有界、只读的输入审查" in prompt
+    assert "不得把全量数据加载进内存或 Agent 上下文" in prompt
+    assert "decision.json.reason" in prompt
+    assert "当前 iteration 是输出目录" in prompt
     assert "photosynthesis" in prompt
+
+
+def test_initial_pipeline_prompt_explains_empty_iteration_directory(tmp_path):
+    source = _write_jsonl(tmp_path / "data.jsonl", [{"text": "algebra"}])
+    corpus = input_corpus.discover(source)
+    prompt = build_pipeline_prompt(PROFILE, corpus, "run/iteration_001", is_init=True)
+    assert "本轮没有父流水线" in prompt
+    assert "为空或只含 session 文件是正常状态" in prompt
 
 
 def test_pipeline_prompt_allows_only_validated_prefix_cache_reuse(tmp_path):
@@ -109,14 +121,18 @@ def test_pipeline_prompt_allows_only_validated_prefix_cache_reuse(tmp_path):
         corpus,
         "run/iteration_002",
         parent_code=parent_code,
+        parent_iteration_dir="/runs/example/iteration_001",
     )
 
     assert "Framework-owned 父轮复用" in prompt
     assert "不要读取、选择、验证或硬编码父轮 cache JSONL" in prompt
     assert "FrameworkStepCache.from_env()" in prompt
-    assert "逻辑算子顺序、源码及本地依赖、初始化调用与参数 fingerprint" in prompt
+    assert "算子名、`decision.json.params` 与初始化调用的语义身份" in prompt
+    assert "源码字节与源码文件哈希不参与身份比较" in prompt
     assert "无法证明时自动从 raw input 完整重算" in prompt
     assert "只按 `should_run(logical_index)`" in prompt
     assert "Agent 不得自行决定" in prompt
+    assert "父轮 incumbent 目录：`/runs/example/iteration_001`" in prompt
+    assert "不要按 iteration 编号猜测父轮" in prompt
     assert "必须更新算子类名、params 或初始化参数" in prompt
     assert "first_entry_file_name" in prompt

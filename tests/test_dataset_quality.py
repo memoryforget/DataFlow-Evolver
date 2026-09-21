@@ -11,6 +11,7 @@ from dataflow_evolver.core.dataset_quality import (
     EmbeddingBatch,
     OpenAIChatEmbeddingBackend,
     ProxyDatasetConfig,
+    _sample_local_proxy,
     compute_embedding_diversity,
     compute_rbf_mmd,
 )
@@ -151,6 +152,74 @@ def test_dataset_evaluator_uses_configured_sample_size_and_cache(tmp_path):
     assert second.embedding_wall_time_seconds >= 0.0
 
 
+def test_candidate_only_diversity_skips_proxy_and_das(tmp_path):
+    candidate = tmp_path / "candidate.jsonl"
+    _write_jsonl(
+        candidate,
+        [
+            {"instruction": f"question {i}", "output": f"answer {i}"}
+            for i in range(5)
+        ],
+    )
+    embedder = FakeEmbedder()
+    evaluator = DatasetQualityEvaluator(
+        proxy=None,
+        embedder=embedder,
+        sample_size=5,
+        proxy_comparison_enabled=False,
+    )
+
+    result = evaluator.evaluate(
+        str(candidate), candidate_user_field="instruction", candidate_assistant_field="output"
+    )
+
+    assert result.status == "ok"
+    assert result.proxy_name == "disabled (candidate-only diversity)"
+    assert result.mmd is None
+    assert result.das is None
+    assert result.kernel_terms == {}
+    assert "cosine_vendi_score" in result.embedding_diversity
+    assert "nearest_neighbor_cosine_p95" in result.embedding_diversity
+    assert embedder.calls == 1
+
+
+def test_candidate_only_diversity_accepts_multiturn_messages(tmp_path):
+    candidate = tmp_path / "candidate.jsonl"
+    _write_jsonl(
+        candidate,
+        [
+            {
+                "messages": [
+                    {"role": "system", "content": "Tutor carefully."},
+                    {"role": "user", "content": f"question {i}"},
+                    {"role": "assistant", "content": f"hint {i}"},
+                    {"role": "user", "content": f"follow-up {i}"},
+                    {"role": "assistant", "content": f"answer {i}"},
+                ]
+            }
+            for i in range(5)
+        ],
+    )
+    embedder = FakeEmbedder()
+    evaluator = DatasetQualityEvaluator(
+        proxy=None,
+        embedder=embedder,
+        sample_size=5,
+        proxy_comparison_enabled=False,
+    )
+
+    result = evaluator.evaluate(
+        str(candidate), candidate_user_field="messages", candidate_assistant_field="messages"
+    )
+
+    assert result.status == "ok"
+    assert result.metric == "candidate_embedding_diversity"
+    assert result.proxy_sample_size == 0
+    assert result.mmd is None
+    assert result.das is None
+    assert embedder.calls == 1
+
+
 def test_openai_embedding_backend_aggregates_exact_api_usage(monkeypatch):
     class FakeClient:
         async def post(self, _path, *, cast_to, body):
@@ -222,6 +291,113 @@ def test_dataset_evaluator_reads_local_parquet_snapshot_directory(tmp_path):
     assert result.status == "ok"
     assert result.proxy_sample_size == 5
     assert result.mmd is not None
+
+
+def test_local_proxy_reads_educhat_jsonl_directory_as_one_reservoir(tmp_path):
+    proxy_dir = tmp_path / "educhat"
+    proxy_dir.mkdir()
+    _write_jsonl(
+        proxy_dir / "part-b.jsonl",
+        [
+            {"data": ["question b1", "answer b1"]},
+            {"data": ["question b2", "answer b2"]},
+        ],
+    )
+    _write_jsonl(
+        proxy_dir / "part-a.jsonl",
+        [
+            {"data": ["question a1", "answer a1"]},
+            {
+                "data": ["question a2", "answer a2", "question a3", "answer a3"],
+                "system_prompt": "You are a tutor.",
+            },
+        ],
+    )
+
+    first = _sample_local_proxy(
+        str(proxy_dir),
+        sample_size=3,
+        seed=42,
+        user_field="data",
+        assistant_field="data",
+    )
+    second = _sample_local_proxy(
+        str(proxy_dir),
+        sample_size=3,
+        seed=42,
+        user_field="data",
+        assistant_field="data",
+    )
+
+    messages, total, valid = first
+    assert first == second
+    assert total == 4
+    assert valid == 4
+    assert len(messages) == 3
+    assert all(dialog[-1]["role"] == "assistant" for dialog in messages)
+    assert all(dialog[0]["role"] == "user" for dialog in messages)
+    assert all(
+        message["content"] != "You are a tutor."
+        for dialog in messages
+        for message in dialog
+    )
+
+
+def test_local_proxy_rejects_malformed_educhat_turn_lists(tmp_path):
+    proxy = tmp_path / "proxy.jsonl"
+    _write_jsonl(
+        proxy,
+        [
+            {"data": ["question", "answer"]},
+            {"data": ["question", "answer", "orphan question"]},
+            {"data": ["question", ""]},
+        ],
+    )
+
+    messages, total, valid = _sample_local_proxy(
+        str(proxy),
+        sample_size=10,
+        seed=42,
+        user_field="data",
+        assistant_field="data",
+    )
+
+    assert total == 3
+    assert valid == 1
+    assert messages == [
+        [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+        ]
+    ]
+
+
+def test_local_proxy_rejects_sharegpt_conversation_ending_with_user(tmp_path):
+    proxy = tmp_path / "proxy.jsonl"
+    _write_jsonl(
+        proxy,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "partial answer"},
+                    {"role": "user", "content": "unanswered follow-up"},
+                ]
+            }
+        ],
+    )
+
+    messages, total, valid = _sample_local_proxy(
+        str(proxy),
+        sample_size=10,
+        seed=42,
+        user_field="messages",
+        assistant_field="messages",
+    )
+
+    assert total == 1
+    assert valid == 0
+    assert messages == []
 
 
 def test_dataset_evaluator_reports_insufficient_samples_without_embedding(tmp_path):

@@ -32,6 +32,7 @@ class FakePipelineAgent:
     def __init__(self):
         self.feedback = []
         self.parent_codes = []
+        self.parent_iteration_dirs = []
         self.histories = []
         self.downstream_feedback = []
         self.initial_downstream_feedback = None
@@ -44,11 +45,19 @@ class FakePipelineAgent:
     def generate(self, **kwargs):
         self.feedback.append(kwargs["parent_review"])
         self.parent_codes.append(kwargs["parent_code"])
+        self.parent_iteration_dirs.append(kwargs["parent_iteration_dir"])
         self.histories.append(kwargs["evolution_history"])
         self.downstream_feedback.append(kwargs.get("downstream_feedback"))
         return _config(str(len(self.feedback)))
 
-    def self_correct(self, iteration_dir, traceback, diagnostics="", failure_stage="execution"):
+    def self_correct(
+        self,
+        iteration_dir,
+        traceback,
+        diagnostics="",
+        failure_stage="execution",
+        log_paths=None,
+    ):
         self.repairs.append((iteration_dir, traceback, diagnostics, failure_stage))
         return _config("repaired")
 
@@ -213,6 +222,9 @@ def test_rejected_challenger_does_not_become_next_parent(tmp_path):
 
     assert best is not None and best.iteration == 2
     assert loop.pipeline_agent.parent_codes == ["0", "0"]
+    assert [path.name for path in loop.pipeline_agent.parent_iteration_dirs] == [
+        "iteration_001", "iteration_001"
+    ]
     rejected = loop.pipeline_agent.histories[1][-1]
     assert rejected["outcome"] == "rejected"
     assert rejected["decision"] == "iteration 1"

@@ -86,3 +86,21 @@ def test_empty_highest_step_is_failure(tmp_path):
     result = _executor(tmp_path).run(STEP_CFG, iteration)
     assert not result.success
     assert '"rows": 0' in result.diagnostics
+
+
+def test_execution_failure_writes_full_logs_and_bounds_traceback(tmp_path):
+    iteration = tmp_path / "iteration_001"
+    _pipeline(iteration, (
+        "import sys\n"
+        "print('Generating responses from prompts......: 99%| 99/100 [00:01, 50it/s]', file=sys.stderr)\n"
+        "raise ValueError('boom')\n"
+    ))
+    result = _executor(tmp_path).run(CFG, iteration)
+    assert not result.success
+    assert "ValueError" in (result.traceback or "")
+    assert "Generating responses" not in (result.traceback or "")
+    assert len(result.traceback or "") < 32 * 1024
+    stderr_logs = [path for key, path in result.artifacts.items() if key.endswith("execution_stderr_log")]
+    assert len(stderr_logs) == 1
+    assert Path(stderr_logs[0]).is_file()
+    assert "Generating responses" in Path(stderr_logs[0]).read_text(encoding="utf-8")

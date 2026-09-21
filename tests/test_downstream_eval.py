@@ -51,7 +51,7 @@ assert request['checkpoint_iteration'] == 3
 cases = [
     {{'question': f'question {{i}}', 'model_response': f'wrong output {{i}}',
       'parsed_answer': f'wrong parsed answer {{i}}',
-      'correct_answer': f'answer {{i}}'}}
+      'correct_answer': f'answer {{i}}', 'dimension': f'domain {{i}}'}}
     for i in range({bad_case_count})
 ]
 result = {{
@@ -88,6 +88,7 @@ def test_command_evaluator_uses_json_protocol_and_validates_results(tmp_path):
     assert result.benchmarks["gsm8k"].bad_cases[0].parsed_answer == (
         "wrong parsed answer 0"
     )
+    assert result.benchmarks["gsm8k"].bad_cases[0].dimension == "domain 0"
     assert len(result.benchmarks["math500"].bad_cases) == 3
     assert Path(result.request_path).is_file()
     assert Path(result.result_path).is_file()
@@ -205,6 +206,10 @@ def test_prompt_uses_attribution_report_and_never_exposes_raw_bad_cases():
     prompt = _downstream_feedback_block(result)
 
     assert full_output not in prompt
+    assert "下面只提供聚合指标和 Downstream Attribution Agent 生成的结构化归因报告" in prompt
+    assert "Evidence ID 只是不可解析的审计引用" in prompt
+    assert "以下 bad cases 是诊断证据" not in prompt
+    assert "有界投影" not in prompt
     assert "下游 bad case 归因报告" in prompt
     assert "多个样本显示上下文缺失" in prompt
     assert "missing_context" in prompt

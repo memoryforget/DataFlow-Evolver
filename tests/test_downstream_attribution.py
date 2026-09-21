@@ -36,7 +36,7 @@ def _feedback():
                 parse_failure_count=0,
                 runaway_count=0,
                 bad_cases=[
-                    DownstreamBadCase("q1", "r1", "p1", "a1"),
+                    DownstreamBadCase("q1", "r1", "p1", "a1", dimension="algebra"),
                     DownstreamBadCase("q2", "r2", "p2", "a2"),
                 ],
             )
@@ -85,6 +85,7 @@ def test_attribution_is_structured_and_audited(tmp_path):
     record = json.loads((tmp_path / "attribution.json").read_text())
     assert record["result"]["status"] == "ok"
     assert "Question: q1" in serving.prompts[0]
+    assert "Dimension: algebra" in serving.prompts[0]
     assert "不要把单个 benchmark 题目当作训练数据" in serving.prompts[0]
     assert "findings 最多 2 条" in serving.prompts[0]
     assert "recommended_actions 最多 3 条" in serving.prompts[0]

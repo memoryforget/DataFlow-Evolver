@@ -20,6 +20,19 @@ def test_exec_repair_prompt_syncs_decision_without_source_browsing():
     assert "当前 iteration" in prompt
 
 
+def test_exec_repair_prompt_has_bounded_context_and_log_paths():
+    prompt = build_selfcorrect_prompt(
+        "/workspace/runs/run/iteration_004",
+        "\x1b[32m" + ("progress\r" * 200000) + "ValueError: boom",
+        "x" * 2_000_000,
+        log_paths={"execution_stderr_log": "/tmp/execution_stderr.log"},
+    )
+    assert len(prompt) < 110_000
+    assert "/tmp/execution_stderr.log" in prompt
+    assert "完整子进程日志（仅按需读取）" in prompt
+    assert "ValueError: boom" in prompt
+
+
 def test_stale_decision_warns_after_execution_repair(tmp_path, monkeypatch, caplog):
     import dataflow_evolver.agents.pipeline_agent as module
 
