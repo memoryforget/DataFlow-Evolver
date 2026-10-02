@@ -67,6 +67,21 @@ def default_system_prompt_append(backend: str) -> str:
     return _SYSTEM_PROMPT_APPEND_TEMPLATE
 
 
+_DIAGNOSTIC_SYSTEM_PROMPT_APPEND_TEMPLATE = """
+你是 DataFlow-Evolver 的流水线执行诊断 Agent。请以只读方式检查当前 iteration
+中的 pipeline.py、operators/、decision.json 和 execution_observation.json。
+不要创建、修改、删除或执行任何项目文件，也不要读取完整 JSONL 数据集；只使用框架提供的
+有界样本和确定性观测。对照声明的算子职责、筛选规则和配额，检查实际步骤行数、保留率、
+字段和低基数字段分布是否一致。你的输出只用于后续 PipelineAgent 的机制性反馈，不参与
+Review 分数、passed 状态或 incumbent 选择。严格按调用 prompt 要求返回 JSON。
+"""
+
+
+def default_diagnostic_system_prompt_append(backend: str) -> str:
+    """Return independent read-only guidance for the Call B diagnostic runtime."""
+    return _DIAGNOSTIC_SYSTEM_PROMPT_APPEND_TEMPLATE
+
+
 
 @dataclass
 class AgentRunResult:
@@ -143,6 +158,7 @@ def _build_options(
     cwd: str,
     resume: str | None = None,
     session_env: dict[str, str] | None = None,
+    system_prompt_append: str | None = None,
 ) -> Any:
     """据 agent 配置段构造 ClaudeAgentOptions。
 
@@ -163,14 +179,15 @@ def _build_options(
     """
     from claude_agent_sdk import ClaudeAgentOptions
 
-    append_text = agent_cfg.get(
-        "system_prompt_append", default_system_prompt_append("claude")
-    )
+    append_text = system_prompt_append or default_system_prompt_append("claude")
     model = backend_value(agent_cfg, "claude", "model", default="claude-opus-4-8")
     effort = backend_value(agent_cfg, "claude", "effort", default="max") or None
     thinking_mode = (agent_cfg.get("thinking", "adaptive") or "adaptive").lower()
     thinking = {"type": "adaptive"} if thinking_mode == "adaptive" else None
     claude_cfg = backend_config(agent_cfg, "claude")
+    permission_mode = claude_cfg.get("permission_mode", "bypassPermissions")
+    if bool(agent_cfg.get("read_only", False)):
+        permission_mode = "plan"
     env = _agent_env(agent_cfg, "claude")
     endpoint = resolve_agent_endpoint(agent_cfg, "claude")
     if endpoint.api_key:
@@ -184,7 +201,7 @@ def _build_options(
         model=model,
         tools={"type": "preset", "preset": "claude_code"},
         system_prompt={"type": "preset", "preset": "claude_code", "append": append_text},
-        permission_mode=claude_cfg.get("permission_mode", "bypassPermissions"),
+        permission_mode=permission_mode,
         setting_sources=list(agent_cfg.get("setting_sources", ["project"])),
         skills="all",
         max_turns=agent_cfg.get("max_turns", 50),
@@ -302,6 +319,7 @@ def run_pipeline_agent(
     agent_cfg: Config,
     tool_log_dir: str | None = None,
     phase: str = "",
+    system_prompt_append: str | None = None,
 ) -> AgentRunResult:
     """Run one PipelineAgent session with timeout, retry, and optional resume.
 
@@ -338,6 +356,7 @@ def run_pipeline_agent(
             cwd,
             resume=resume_id if used_resume else None,
             session_env=session_env,
+            system_prompt_append=system_prompt_append,
         )
         cur_prompt = _RESUME_NUDGE if used_resume else prompt
         logger.info(

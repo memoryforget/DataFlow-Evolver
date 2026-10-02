@@ -146,7 +146,6 @@ def test_cli_runtime_uses_configured_binary_provider_and_session_home(
         {
             "api_key_env": "DF_AGENT_API_KEY",
             "base_url": "https://codex-gateway.example/v1",
-            "system_prompt_append": "developer guard",
             "codex": {
                 "binary": "/opt/codex-0.118/codex",
                 "model": "gpt-5.4",
@@ -163,6 +162,7 @@ def test_cli_runtime_uses_configured_binary_provider_and_session_home(
         resume=None,
         timeout=30,
         session_env={"CODEX_HOME": str(tmp_path / "sessions/codex")},
+        system_prompt_append="developer guard",
     )
 
     assert result.success
@@ -256,7 +256,7 @@ def test_cli_runtime_bypass_sandbox_requires_explicit_opt_in(monkeypatch, tmp_pa
     assert 'sandbox_workspace_write.network_access=false' not in args
     assert args[-1] == "-"
     assert "dataflow-evolver-pipeline" in captured["stdin_prompt"]
-    assert "current iteration artifacts" in captured["stdin_prompt"]
+    assert "supplied task context" in captured["stdin_prompt"]
 
 
 def test_retry_resumes_codex_thread(monkeypatch, tmp_path):
@@ -299,3 +299,63 @@ def test_upstream_stream_disconnect_is_retryable():
     )
 
     assert _is_retryable(result)
+
+
+def test_cli_runtime_supports_explicit_read_only_sandbox(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeProcess:
+        returncode = 0
+        def __init__(self, args, **kwargs):
+            captured["args"] = args
+        def communicate(self, input=None, timeout=None):
+            return ('{"type":"turn.completed","usage":{"input_tokens":1}}\n', '')
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", FakeProcess)
+    runtime._run_once(
+        "inspect",
+        cwd=str(tmp_path),
+        agent_cfg=Config({"codex": {"sandbox_mode": "read-only"}}),
+        resume=None,
+        timeout=30,
+    )
+    assert '--full-auto' in captured["args"]
+    assert 'sandbox_mode="read-only"' in captured["args"]
+    assert 'sandbox_workspace_write.network_access=false' not in captured["args"]
+
+
+def test_read_only_agent_forces_codex_sandbox_and_disables_bypass(
+    monkeypatch, tmp_path
+):
+    captured = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, args, **kwargs):
+            captured["args"] = args
+
+        def communicate(self, input=None, timeout=None):
+            return ('{"type":"turn.completed","usage":{"input_tokens":1}}\n', '')
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", FakeProcess)
+    runtime._run_once(
+        "inspect",
+        cwd=str(tmp_path),
+        agent_cfg=Config(
+            {
+                "read_only": True,
+                "codex": {
+                    "sandbox_mode": "workspace-write",
+                    "bypass_sandbox": True,
+                },
+            }
+        ),
+        resume=None,
+        timeout=30,
+    )
+
+    assert "--dangerously-bypass-approvals-and-sandbox" not in captured["args"]
+    assert "--full-auto" in captured["args"]
+    assert 'sandbox_mode="read-only"' in captured["args"]
+    assert 'sandbox_workspace_write.network_access=false' not in captured["args"]

@@ -35,6 +35,8 @@ class FakePipelineAgent:
         self.parent_iteration_dirs = []
         self.histories = []
         self.downstream_feedback = []
+        self.execution_observations = []
+        self.pipeline_diagnostics = []
         self.initial_downstream_feedback = None
         self.repairs = []
 
@@ -48,6 +50,8 @@ class FakePipelineAgent:
         self.parent_iteration_dirs.append(kwargs["parent_iteration_dir"])
         self.histories.append(kwargs["evolution_history"])
         self.downstream_feedback.append(kwargs.get("downstream_feedback"))
+        self.execution_observations.append(kwargs.get("execution_observation_path"))
+        self.pipeline_diagnostics.append(kwargs.get("pipeline_diagnostic"))
         return _config(str(len(self.feedback)))
 
     def self_correct(
@@ -89,7 +93,13 @@ class FakeExecutor:
         output = iteration_dir / "output.jsonl"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text('{"instruction":"q","output":"a"}\n', encoding="utf-8")
-        return ExecutionResult(True, dataset_path=str(output))
+        observation = iteration_dir / "execution_observation.json"
+        observation.write_text('{"status":"ok"}\n', encoding="utf-8")
+        return ExecutionResult(
+            True,
+            dataset_path=str(output),
+            observation_path=str(observation),
+        )
 
 
 class FakeReviewer:
@@ -135,6 +145,24 @@ class FakeDownstreamAttributionAgent:
         )
 
 
+class FakePipelineDiagnosticAgent:
+    def __init__(self, payload=None, raises=False):
+        self.payload = payload or {
+            "status": "ok",
+            "summary": "step output differs from the intended behavior",
+            "findings": [],
+            "contract_mismatches": [],
+        }
+        self.raises = raises
+        self.calls = []
+
+    def diagnose(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.raises:
+            raise RuntimeError("diagnostic unavailable")
+        return self.payload
+
+
 class FakeDownstreamEvaluator:
     expected_benchmarks = ["gsm8k"]
     bad_cases_per_benchmark = 3
@@ -177,6 +205,7 @@ def _loop(
     downstream_evaluator=None,
     downstream_attribution_agent=None,
     downstream_interval=3,
+    pipeline_diagnostic_agent=None,
 ):
     workspace = tmp_path / "workspace"
     return ReviewOnlyLoop(
@@ -188,6 +217,8 @@ def _loop(
         downstream_evaluator=downstream_evaluator,
         downstream_attribution_agent=downstream_attribution_agent,
         downstream_interval=downstream_interval,
+        pipeline_diagnostic_agent=pipeline_diagnostic_agent,
+        pipeline_diagnostic_enabled=pipeline_diagnostic_agent is not None,
     )
 
 
@@ -355,3 +386,50 @@ def test_run_name_cannot_escape_workspace(tmp_path, name):
             task=TaskSpec("task", {"instruction": "str"}, []), workspace=tmp_path / "workspace",
             run_name=name, max_iterations=1,
         )
+
+
+def test_pipeline_diagnosis_is_next_iteration_feedback_not_selection_input(tmp_path):
+    diagnostic = FakePipelineDiagnosticAgent(
+        payload={
+            "status": "ok",
+            "summary": "mechanical mismatch",
+            "review_score": 999,
+            "findings": [],
+        }
+    )
+    reviewer = FakeReviewer([
+        _review(0.3, True, "first"),
+        _review(0.8, True, "second"),
+    ])
+    loop = _loop(
+        tmp_path,
+        max_iterations=2,
+        reviewer=reviewer,
+        pipeline_diagnostic_agent=diagnostic,
+    )
+
+    best = loop.run()
+
+    assert best is not None and best.iteration == 1
+    assert best.score == 0.8
+    assert len(diagnostic.calls) == 2
+    assert loop.pipeline_agent.execution_observations[0].endswith(
+        "iteration_001/execution_observation.json"
+    )
+    assert loop.pipeline_agent.pipeline_diagnostics[0]["summary"] == "mechanical mismatch"
+    assert "review_score" not in loop.pipeline_agent.pipeline_diagnostics[0]
+
+
+def test_pipeline_diagnosis_failure_does_not_stop_review_loop(tmp_path):
+    diagnostic = FakePipelineDiagnosticAgent(raises=True)
+    loop = _loop(
+        tmp_path,
+        max_iterations=1,
+        pipeline_diagnostic_agent=diagnostic,
+    )
+
+    best = loop.run()
+
+    assert best is not None
+    assert best.review is not None
+    assert best.pipeline_diagnostic["status"] == "failed"

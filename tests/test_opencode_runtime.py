@@ -60,7 +60,7 @@ def test_inline_config_uses_skill_without_dataflow_mcp(monkeypatch, tmp_path):
     assert config["agent"][agent_name]["permission"] == "allow"
     prompt = config["agent"][agent_name]["prompt"]
     assert "dataflow-evolver-pipeline" in prompt
-    assert "current iteration artifacts" in prompt
+    assert "supplied task context" in prompt
     serialized = json.dumps(config)
     assert "secret-must-not-be-serialized" not in serialized
     assert "{env:ANTHROPIC_API_KEY}" in serialized

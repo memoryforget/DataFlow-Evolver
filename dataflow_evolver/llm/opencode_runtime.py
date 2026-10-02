@@ -69,9 +69,23 @@ def build_opencode_config(
     model = _model(agent_cfg)
     provider = model.split("/", 1)[0]
     agent_name = "dataflow-pipeline"
-    permission = str(cfg.get("permission", "allow") or "allow").lower()
-    if permission not in {"allow", "ask", "deny"}:
-        raise ValueError("agent.opencode.permission must be allow, ask, or deny")
+    read_only = bool(cfg.get("read_only", agent_cfg.get("read_only", False)))
+    raw_permission = cfg.get("permission", "allow")
+    if read_only:
+        permission: Any = {
+            "read": "allow",
+            "glob": "allow",
+            "grep": "allow",
+            "list": "allow",
+            "bash": "deny",
+            "edit": "deny",
+            "write": "deny",
+            "webfetch": "deny",
+        }
+    else:
+        permission = str(raw_permission or "allow").lower()
+        if permission not in {"allow", "ask", "deny"}:
+            raise ValueError("agent.opencode.permission must be allow, ask, or deny")
 
     endpoint = resolve_agent_endpoint(agent_cfg, "opencode", provider=provider)
     key_env = endpoint.api_key_env
@@ -83,10 +97,7 @@ def build_opencode_config(
         options["baseURL"] = base_url
 
     selected_prompt = str(
-        system_prompt
-        or agent_cfg.get(
-            "system_prompt_append", default_system_prompt_append("opencode")
-        )
+        system_prompt or default_system_prompt_append("opencode")
     )
     config: dict[str, Any] = {
         "$schema": _CONFIG_SCHEMA,
@@ -172,9 +183,12 @@ def _run_once(
     resume: str | None,
     timeout: float,
     session_env: dict[str, str] | None = None,
+    system_prompt_append: str | None = None,
 ) -> AgentRunResult:
     cfg = _opencode_cfg(agent_cfg)
-    config, agent_name, model = build_opencode_config(agent_cfg, cwd=cwd)
+    config, agent_name, model = build_opencode_config(
+        agent_cfg, cwd=cwd, system_prompt=system_prompt_append
+    )
     binary = str(cfg.get("binary", "opencode") or "opencode")
     command = [
         binary,
@@ -247,6 +261,7 @@ def run_opencode_agent(
     agent_cfg: Config,
     tool_log_dir: str | None = None,
     phase: str = "",
+    system_prompt_append: str | None = None,
 ) -> AgentRunResult:
     """Run OpenCode with the Claude adapter's retry and resume semantics."""
     max_retries = max(1, int(agent_cfg.get("max_retries", 4)))
@@ -280,6 +295,7 @@ def run_opencode_agent(
             resume=resume_id if used_resume else None,
             timeout=timeout,
             session_env=session_env,
+            system_prompt_append=system_prompt_append,
         )
         if tool_log_dir:
             label = phase if attempt == 1 else f"{phase}#retry{attempt - 1}"
@@ -320,6 +336,9 @@ def run_opencode_agent(
 class OpenCodeAgentRuntime:
     """AgentRuntime implementation backed by ``opencode run``."""
 
+    def __init__(self, system_prompt_append: str) -> None:
+        self.system_prompt_append = system_prompt_append
+
     def run(
         self,
         prompt: str,
@@ -335,4 +354,5 @@ class OpenCodeAgentRuntime:
             agent_cfg=agent_cfg,
             tool_log_dir=tool_log_dir,
             phase=phase,
+            system_prompt_append=self.system_prompt_append,
         )

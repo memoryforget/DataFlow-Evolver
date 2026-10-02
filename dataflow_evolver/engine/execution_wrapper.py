@@ -20,6 +20,7 @@ from dataflow_evolver.engine.step_cache import (
     prepare_step_reuse,
     write_step_manifest,
 )
+from dataflow_evolver.engine.execution_observation import write_execution_observation
 from dataflow_evolver.telemetry.pipeline_usage import (
     ATTEMPT_ENV,
     BOOTSTRAP_DIR,
@@ -82,6 +83,37 @@ def _write_process_logs(
     return paths
 
 
+def _try_write_observation(
+    iteration_dir: Path,
+    *,
+    config: PipelineConfig,
+    raw_entry_path: str,
+    final_dataset_path: str | None,
+    status: str,
+    failure_stage: str | None,
+    error: str | None,
+    sample_rows_per_step: int,
+    max_sample_chars: int,
+) -> str | None:
+    try:
+        return str(
+            write_execution_observation(
+                iteration_dir,
+                config=config,
+                raw_entry_path=raw_entry_path,
+                final_dataset_path=final_dataset_path,
+                status=status,
+                failure_stage=failure_stage,
+                error=error,
+                sample_rows_per_step=sample_rows_per_step,
+                max_sample_chars=max_sample_chars,
+            )
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("写 execution observation 失败（不影响主流程）：%s", exc)
+        return None
+
+
 @dataclass
 class ExecutionResult:
     """流水线执行结果。"""
@@ -94,6 +126,7 @@ class ExecutionResult:
     artifacts: dict[str, str] = field(default_factory=dict)
     diagnostics: str = ""
     failure_stage: str | None = None
+    observation_path: str | None = None
 
 
 class ExecutionWrapperABC(ABC):
@@ -128,6 +161,8 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
         python_exe: str | None = None,
         extra_env: dict[str, str] | None = None,
         raw_entry_path: str | None = None,
+        observation_sample_rows: int = 2,
+        observation_max_sample_chars: int = 4000,
     ) -> None:
         self.workspace_dir = Path(workspace_dir).resolve()
         self.pipeline_filename = pipeline_filename
@@ -136,6 +171,8 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
         self.python_exe = python_exe or sys.executable
         self.extra_env = extra_env or {}
         self.raw_entry_path = str(Path(raw_entry_path).resolve()) if raw_entry_path else ""
+        self.observation_sample_rows = max(0, int(observation_sample_rows))
+        self.observation_max_sample_chars = max(256, int(observation_max_sample_chars))
         self._execution_attempts: dict[str, int] = {}
 
     def run(
@@ -231,6 +268,9 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
             "token_usage": str(combined_path),
             "step_reuse_plan": str(iteration_dir / REUSE_PLAN_FILENAME),
             "step_manifest": str(iteration_dir / MANIFEST_FILENAME),
+            "execution_observation": str(
+                iteration_dir / "execution_observation.json"
+            ),
         }
 
         def finalize_usage() -> None:
@@ -316,6 +356,19 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
                     failure_stage="output_validation",
                 )
             artifacts["step_manifest"] = str(manifest_path)
+            observation_path = _try_write_observation(
+                iteration_dir,
+                config=config,
+                raw_entry_path=raw_entry_path,
+                final_dataset_path=reuse_plan.entry_path,
+                status="ok",
+                failure_stage=None,
+                error=None,
+                sample_rows_per_step=self.observation_sample_rows,
+                max_sample_chars=self.observation_max_sample_chars,
+            )
+            if observation_path:
+                artifacts["execution_observation"] = observation_path
             logger.info("Framework step cache 全前缀命中：%s", reuse_plan.entry_path)
             return ExecutionResult(
                 True,
@@ -323,6 +376,7 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
                 stdout=compile_proc.stdout,
                 stderr=compile_proc.stderr,
                 artifacts=artifacts,
+                observation_path=observation_path,
             )
 
         logger.info("compile 预检通过，开始正式执行：%s", pipeline_path)
@@ -400,10 +454,23 @@ class SubprocessExecutionWrapper(ExecutionWrapperABC):
                 failure_stage="output_validation",
             )
         artifacts["step_manifest"] = str(manifest_path)
+        observation_path = _try_write_observation(
+            iteration_dir,
+            config=config,
+            raw_entry_path=raw_entry_path,
+            final_dataset_path=str(dataset_path),
+            status="ok",
+            failure_stage=None,
+            error=None,
+            sample_rows_per_step=self.observation_sample_rows,
+            max_sample_chars=self.observation_max_sample_chars,
+        )
+        if observation_path:
+            artifacts["execution_observation"] = observation_path
         logger.info("流水线产出数据集：%s", dataset_path)
         return ExecutionResult(
             True, dataset_path=str(dataset_path), stdout=proc.stdout, stderr=proc.stderr,
-            artifacts=artifacts,
+            artifacts=artifacts, observation_path=observation_path,
         )
 
 

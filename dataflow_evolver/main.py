@@ -14,6 +14,7 @@ from typing import Any
 
 from dataflow_evolver.agents.downstream_attribution import DownstreamAttributionAgent
 from dataflow_evolver.agents.pipeline_agent import PipelineAgent
+from dataflow_evolver.agents.pipeline_diagnostic import PipelineDiagnosticAgent
 from dataflow_evolver.agents.review_agent import ReviewAgent
 from dataflow_evolver.core import decontamination, input_corpus
 from dataflow_evolver.core.downstream_eval import (
@@ -35,6 +36,7 @@ from dataflow_evolver.engine.execution_wrapper import (
     ExecutionWrapperABC,
     SubprocessExecutionWrapper,
 )
+from dataflow_evolver.llm.agent_runtime import build_pipeline_diagnostic_runtime
 from dataflow_evolver.llm.serving import build_serving
 from dataflow_evolver.llm.skill_paths import skill_root_for_backend
 from dataflow_evolver.utils.config import Config, load_config
@@ -52,6 +54,8 @@ class Candidate:
     config: PipelineConfig
     dataset_path: str | None = None
     review: ReviewResult | None = None
+    execution_observation_path: str | None = None
+    pipeline_diagnostic: Any | None = None
     execution_error: str | None = None
     failure_stage: str | None = None
     parent_iteration: int | None = None
@@ -81,6 +85,9 @@ class ReviewOnlyLoop:
         downstream_evaluator: DownstreamEvaluatorABC | None = None,
         downstream_attribution_agent: DownstreamAttributionAgent | None = None,
         downstream_interval: int = 2,
+        pipeline_diagnostic_agent: Any | None = None,
+        pipeline_diagnostic_enabled: bool = False,
+        pipeline_diagnostic_max_prompt_chars: int = 80000,
     ) -> None:
         if max_iterations < 1:
             raise ValueError("loop.max_iterations 必须至少为 1（包含初始流水线）")
@@ -97,6 +104,11 @@ class ReviewOnlyLoop:
         self.downstream_evaluator = downstream_evaluator
         self.downstream_attribution_agent = downstream_attribution_agent
         self.downstream_interval = int(downstream_interval)
+        self.pipeline_diagnostic_agent = pipeline_diagnostic_agent
+        self.pipeline_diagnostic_enabled = bool(pipeline_diagnostic_enabled)
+        self.pipeline_diagnostic_max_prompt_chars = max(
+            1000, int(pipeline_diagnostic_max_prompt_chars)
+        )
         self.candidates: list[Candidate] = []
         self.downstream_evaluations: list[DownstreamEvaluationResult] = []
         self.latest_downstream_evaluation: DownstreamEvaluationResult | None = None
@@ -192,6 +204,8 @@ class ReviewOnlyLoop:
                 parent_rationale=incumbent.config.rationale,
                 parent_iteration_dir=incumbent.iteration_dir,
                 parent_review=incumbent.review,
+                execution_observation_path=incumbent.execution_observation_path,
+                pipeline_diagnostic=_compact_diagnostic(incumbent.pipeline_diagnostic),
                 downstream_feedback=self.latest_downstream_evaluation,
                 evolution_history=self._evolution_history(),
             )
@@ -283,12 +297,32 @@ class ReviewOnlyLoop:
             parent_review=parent_review,
             usage_dir=str(iteration_dir),
         )
+        diagnostic = None
+        if self.pipeline_diagnostic_enabled and self.pipeline_diagnostic_agent is not None:
+            try:
+                diagnostic = self.pipeline_diagnostic_agent.diagnose(
+                    iteration_dir=iteration_dir,
+                    task=self.task,
+                    observation_path=result.observation_path,
+                    config=config,
+                    review=review,
+                    output_path=iteration_dir / "pipeline_diagnostic.json",
+                    max_prompt_chars=self.pipeline_diagnostic_max_prompt_chars,
+                )
+            except Exception as exc:  # noqa: BLE001 - Call B must not stop selection
+                logger.exception("Pipeline execution diagnosis failed; continuing: %s", exc)
+                diagnostic = {
+                    "status": "failed",
+                    "error": f"pipeline diagnostic exception: {exc}",
+                }
         return Candidate(
             iteration=iteration,
             iteration_dir=iteration_dir,
             config=config,
             dataset_path=result.dataset_path,
             review=review,
+            execution_observation_path=result.observation_path,
+            pipeline_diagnostic=diagnostic,
             execution_repairs=retries,
             wall_time_seconds=round(time.perf_counter() - iteration_started, 6),
         )
@@ -448,6 +482,8 @@ class ReviewOnlyLoop:
                         if candidate.review is not None
                         else [_compact_text(candidate.execution_error or "execution failed", 160)]
                     ),
+                    "execution_observation": candidate.execution_observation_path,
+                    "pipeline_diagnostic": _compact_diagnostic(candidate.pipeline_diagnostic),
                 }
             )
         return history
@@ -587,6 +623,25 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
         llm_block=llm_block,
     )
 
+    diagnostic_cfg = cfg.get("pipeline_diagnostic") or Config({})
+    diagnostic_enabled = _as_bool(diagnostic_cfg.get("enabled", False))
+    diagnostic_agent = None
+    if diagnostic_enabled:
+        if not _as_bool(diagnostic_cfg.get("read_only", False)):
+            raise ValueError("pipeline_diagnostic.read_only must be true")
+        diagnostic_backend = str(diagnostic_cfg.get("backend", "codex") or "codex").lower()
+        diagnostic_backend_cfg = diagnostic_cfg.get(diagnostic_backend) or Config({})
+        if diagnostic_backend == "codex" and _as_bool(
+            diagnostic_backend_cfg.get("bypass_sandbox", False)
+        ):
+            raise ValueError(
+                "pipeline_diagnostic.codex.bypass_sandbox must be false for read-only Call B"
+            )
+        diagnostic_agent = PipelineDiagnosticAgent(
+            agent_cfg=diagnostic_cfg,
+            runtime=build_pipeline_diagnostic_runtime(diagnostic_cfg),
+        )
+
     loop_cfg = cfg.loop
     executor = SubprocessExecutionWrapper(
         workspace_dir=str(workspace),
@@ -596,6 +651,10 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
         python_exe=str(loop_cfg.get("python_exe", "") or "") or None,
         extra_env=extra_env or None,
         raw_entry_path=corpus.entry_path,
+        observation_sample_rows=int(loop_cfg.get("observation_sample_rows", 2)),
+        observation_max_sample_chars=int(
+            loop_cfg.get("observation_max_sample_chars", 4000)
+        ),
     )
     downstream_cfg = cfg.get("downstream_eval") or Config({})
     downstream_evaluator, downstream_interval = _build_downstream_evaluator(
@@ -622,6 +681,11 @@ def build_loop(cfg: Config) -> ReviewOnlyLoop:
         downstream_evaluator=downstream_evaluator,
         downstream_attribution_agent=downstream_attribution_agent,
         downstream_interval=downstream_interval,
+        pipeline_diagnostic_agent=diagnostic_agent,
+        pipeline_diagnostic_enabled=diagnostic_enabled,
+        pipeline_diagnostic_max_prompt_chars=int(
+            diagnostic_cfg.get("max_prompt_chars", 80000)
+        ),
     )
 
 
@@ -634,6 +698,8 @@ def _candidate_record(candidate: Candidate) -> dict[str, Any]:
         "dataset_path": candidate.dataset_path,
         "execution_error": candidate.execution_error,
         "failure_stage": candidate.failure_stage,
+        "execution_observation_path": candidate.execution_observation_path,
+        "pipeline_diagnostic": candidate.pipeline_diagnostic,
         "parent_iteration": candidate.parent_iteration,
         "accepted_as_incumbent": candidate.accepted_as_incumbent,
         "execution_repairs": candidate.execution_repairs,
@@ -642,6 +708,36 @@ def _candidate_record(candidate: Candidate) -> dict[str, Any]:
         "operators": candidate.config.operators,
         "review": asdict(candidate.review) if candidate.review is not None else None,
     }
+
+
+def _compact_diagnostic(value: Any) -> dict[str, Any] | None:
+    """Keep only small, mechanism-oriented evidence in the next prompt."""
+    if not isinstance(value, dict):
+        return None
+    output: dict[str, Any] = {}
+    if value.get("status"):
+        output["status"] = value["status"]
+    if value.get("summary"):
+        output["summary"] = _compact_text(str(value["summary"]), 500)
+    findings = value.get("findings")
+    if isinstance(findings, list):
+        output["findings"] = [
+            {
+                key: _compact_text(str(item.get(key, "")), 280)
+                for key in ("step", "severity", "evidence", "diagnosis", "recommended_action")
+                if item.get(key) not in (None, "")
+            }
+            for item in findings[:3]
+            if isinstance(item, dict)
+        ]
+    mismatches = value.get("contract_mismatches")
+    if isinstance(mismatches, list):
+        output["contract_mismatches"] = [
+            _compact_text(str(item), 300) for item in mismatches[:3]
+        ]
+    if value.get("error"):
+        output["error"] = _compact_text(str(value["error"]), 400)
+    return output or None
 
 
 def _safe_run_name(value: str) -> str:

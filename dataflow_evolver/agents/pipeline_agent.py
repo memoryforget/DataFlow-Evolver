@@ -79,6 +79,8 @@ class PipelineAgent:
         parent_rationale: str | None = None,
         parent_iteration_dir: Path | None = None,
         parent_review: ReviewResult | None = None,
+        execution_observation_path: str | None = None,
+        pipeline_diagnostic: Any | None = None,
         downstream_feedback: DownstreamEvaluationResult | None = None,
         evolution_history: list[dict[str, Any]] | None = None,
     ) -> PipelineConfig | None:
@@ -98,6 +100,8 @@ class PipelineAgent:
                 else None
             ),
             parent_review=parent_review,
+            execution_observation_path=execution_observation_path,
+            pipeline_diagnostic=pipeline_diagnostic,
             downstream_feedback=downstream_feedback,
             evolution_history=evolution_history,
         )

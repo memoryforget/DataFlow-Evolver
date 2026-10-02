@@ -247,9 +247,22 @@ def _run_once_cli(
     resume: str | None,
     timeout: float,
     session_env: dict[str, str] | None,
+    system_prompt_append: str | None = None,
 ) -> AgentRunResult:
     cfg = backend_config(agent_cfg, "codex")
-    bypass_sandbox = cfg.get("bypass_sandbox", False) is True
+    read_only = agent_cfg.get("read_only", False) is True
+    bypass_sandbox = cfg.get("bypass_sandbox", False) is True and not read_only
+    sandbox_mode = (
+        "read-only"
+        if read_only
+        else str(
+            cfg.get("sandbox_mode", "workspace-write") or "workspace-write"
+        ).strip()
+    )
+    if sandbox_mode not in {"read-only", "workspace-write", "danger-full-access"}:
+        raise ValueError(
+            "agent.codex.sandbox_mode must be read-only, workspace-write, or danger-full-access"
+        )
     overrides, env, _ = _codex_provider_overrides(agent_cfg)
     if session_env:
         env.update(session_env)
@@ -258,10 +271,11 @@ def _run_once_cli(
         overrides.extend(
             [
                 'approval_policy="never"',
-                'sandbox_mode="workspace-write"',
-                'sandbox_workspace_write.network_access=false',
+                f'sandbox_mode="{sandbox_mode}"',
             ]
         )
+        if sandbox_mode == "workspace-write":
+            overrides.append('sandbox_workspace_write.network_access=false')
 
     binary = str(cfg.get("binary", "") or "codex").strip() or "codex"
     binary_path = Path(binary).expanduser()
@@ -294,9 +308,7 @@ def _run_once_cli(
         args.append(resume)
     else:
         developer = str(
-            agent_cfg.get(
-                "system_prompt_append", default_system_prompt_append("codex")
-            )
+            system_prompt_append or default_system_prompt_append("codex")
         ).strip()
         if developer:
             prompt = f"{developer}\n\n{prompt}"
@@ -352,6 +364,7 @@ def _run_once(
     resume: str | None,
     timeout: float,
     session_env: dict[str, str] | None = None,
+    system_prompt_append: str | None = None,
 ) -> AgentRunResult:
     return _run_once_cli(
         prompt,
@@ -360,6 +373,7 @@ def _run_once(
         resume=resume,
         timeout=timeout,
         session_env=session_env,
+        system_prompt_append=system_prompt_append,
     )
 
 
@@ -370,6 +384,7 @@ def run_codex_agent(
     agent_cfg: Config,
     tool_log_dir: str | None = None,
     phase: str = "",
+    system_prompt_append: str | None = None,
 ) -> AgentRunResult:
     """Run Codex with the same retry/resume contract as the other backends."""
     max_retries = max(1, int(agent_cfg.get("max_retries", 4)))
@@ -402,6 +417,7 @@ def run_codex_agent(
             resume=resume_id if used_resume else None,
             timeout=timeout,
             session_env=session_env,
+            system_prompt_append=system_prompt_append,
         )
         label = phase if attempt == 1 else f"{phase}#retry{attempt - 1}"
         if tool_log_dir:
@@ -447,6 +463,9 @@ def run_codex_agent(
 class CodexAgentRuntime:
     """AgentRuntime implementation backed by ``codex exec --json``."""
 
+    def __init__(self, system_prompt_append: str) -> None:
+        self.system_prompt_append = system_prompt_append
+
     def run(
         self,
         prompt: str,
@@ -462,4 +481,5 @@ class CodexAgentRuntime:
             agent_cfg=agent_cfg,
             tool_log_dir=tool_log_dir,
             phase=phase,
+            system_prompt_append=self.system_prompt_append,
         )

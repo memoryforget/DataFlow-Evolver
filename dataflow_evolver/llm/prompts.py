@@ -5,7 +5,8 @@ import json
 
 from dataflow_evolver.core.downstream_eval import DownstreamEvaluationResult
 from dataflow_evolver.core.input_corpus import InputCorpus
-from dataflow_evolver.core.schemas import ReviewResult, TaskSpec
+from dataflow_evolver.core.schemas import PipelineConfig, ReviewResult, TaskSpec
+
 _BAD_CASE_RESPONSE_HEAD_CHARS = 1200
 _BAD_CASE_RESPONSE_TAIL_CHARS = 1800
 _RUNAWAY_RESPONSE_HEAD_CHARS = 500
@@ -66,9 +67,11 @@ Entry file: {entry_path}
    确定性的 artifact 校验、compile 预检和正式运行。
 9. 以解决 Review 与下游归因报告指出的问题为首要目标，不以最少代码、文件或算子为目标，也不为节省调用成本而牺牲数据质量；LLM 调用范围应根据任务与反馈合理设计。
    根据职责边界和反馈自由增加、删除、拆分或合并算子；不要为了缓存复用而保留不合理的父流水线结构。
-{init_block}{parent_block}{review_block}{downstream_block}{history_block}
+{init_block}{parent_block}{review_block}{execution_block}{diagnostic_block}{downstream_block}{history_block}
 约束：无头自动化运行，禁止 AskUserQuestion 与 git/gh 子流程，不能获取新数据；所有实现
-依据均来自专用 skill、本轮 Prompt、明确提供的父轮上下文、对固定 Entry file 的只读审查。当前 iteration 是输出目录。"""
+依据均来自专用 skill、本轮 Prompt、明确提供的父轮上下文、对固定 Entry file 的只读审查。
+当前候选是进化循环中的一轮新输出，目录 `{iteration_dir}` 是本轮 pipeline 的工作目录；父轮来源
+以显式的“父流水线”block 为准，不要根据历史编号自行选择父轮。"""
 
 
 DECISION_SYNC_NOTE = """如果修复改变了算子、字段流或设计取舍，请同步覆盖
@@ -152,6 +155,68 @@ REVIEW_PROMPT = """你是数据质量评审员。下面是候选数据集的有�
 没有失败信号时使用空数组。不要输出 JSON 以外的内容。"""
 
 
+def build_pipeline_diagnostic_prompt(
+    *,
+    iteration_dir: str,
+    task: TaskSpec,
+    observation_path: str | None,
+    source_files: list[str],
+    config: PipelineConfig,
+    review: ReviewResult,
+    max_prompt_chars: int = 80_000,
+) -> str:
+    """Build the non-scoring, read-only Call B prompt."""
+    review_context = {
+        "correctness_score": review.correctness_score,
+        "relevance_score": review.relevance_score,
+        "difficulty_score": review.difficulty_score,
+        "schema_score": review.schema_score,
+        "failure_signals": list(review.failure_signals),
+        "issues": list(review.issues),
+        "hard_metrics": {
+            "dup_rate": review.dup_rate,
+            "null_rate": review.null_rate,
+            "parse_valid_rate": review.parse_valid_rate,
+            "contamination_rate": review.contamination_rate,
+        },
+    }
+    declared_operators = [
+        item for item in config.operators[:20] if isinstance(item, dict)
+    ]
+    prompt = (
+        "你是只读的流水线执行诊断 Agent。\n\n"
+        "请判断已执行的流水线是否符合其声明的设计，包括算子职责、筛选规则和配额。"
+        "以框架生成的 execution_observation.json 作为主要执行证据，"
+        "必要时再只读检查列出的 pipeline.py、operators/ 和 decision.json。\n"
+        "请逐步比较实际行数、保留率、字段、低基数字段分布和有界样本，定位声明与实际结果"
+        "首次出现偏差的算子。\n"
+        "不要修改、创建、删除或执行流水线文件，也不要读取完整输入或输出 JSONL；"
+        "只使用 "
+        "execution_observation.json 中的有界样本。\n"
+        "这只是机制性诊断：不要给数据质量打分、预测 benchmark 提升，"
+        "也不要为了影响 Review 而提出建议。\n\n"
+        "严格只返回一个 JSON object，格式如下（键名保持不变）：\n"
+        '{"status":"ok","summary":"...","findings":[{"step":"...",'
+        '"severity":"low|medium|high","evidence":"...","diagnosis":"...",'
+        '"recommended_action":"..."}],"contract_mismatches":[]}\n\n'
+        f"当前 iteration 目录：{iteration_dir}\n"
+        f"执行观测文件：{observation_path or '缺失'}\n"
+        "可只读检查的产物：\n"
+        + "\n".join(f"- {path}" for path in source_files)
+        + "\n\n任务：\n"
+        + str(task.task_description)
+        + "\n声明的算子：\n"
+        + json.dumps(declared_operators, ensure_ascii=False, default=str)
+        + "\nReview 证据（仅作上下文，不是评分目标）：\n"
+        + json.dumps(review_context, ensure_ascii=False, default=str)
+        + "\n"
+    )
+    limit = max(1000, int(max_prompt_chars))
+    if len(prompt) > limit:
+        marker = "\n[诊断提示已由框架截断]\n"
+        prompt = prompt[: max(0, limit - len(marker))] + marker
+    return prompt
+
 def build_pipeline_prompt(
     task: TaskSpec,
     corpus: InputCorpus,
@@ -161,6 +226,8 @@ def build_pipeline_prompt(
     parent_rationale: str | None = None,
     parent_iteration_dir: str | None = None,
     parent_review: ReviewResult | None = None,
+    execution_observation_path: str | None = None,
+    pipeline_diagnostic: object | None = None,
     downstream_feedback: DownstreamEvaluationResult | None = None,
     evolution_history: list[dict] | None = None,
     is_init: bool = False,
@@ -189,6 +256,8 @@ def build_pipeline_prompt(
         review_block=(
             _parent_quality_block(parent_review) if parent_review is not None else ""
         ),
+        execution_block=_execution_observation_block(execution_observation_path),
+        diagnostic_block=_pipeline_diagnostic_block(pipeline_diagnostic),
         downstream_block=_downstream_feedback_block(downstream_feedback),
         history_block=_history_block(evolution_history),
     )
@@ -237,7 +306,7 @@ def _parent_block(
 ) -> str:
     if not code and not rationale:
         return ""
-    lines = ["【上一轮流水线】"]
+    lines = ["【父流水线（当前最佳 incumbent）】"]
     if parent_iteration_dir:
         lines.append(
             f"父轮 incumbent 目录：`{parent_iteration_dir}`。这是本轮唯一允许继承的父轮目录；"
@@ -245,11 +314,11 @@ def _parent_block(
         )
     if code:
         lines.append(
-            "下面是上一轮已执行流水线，仅作为可复用的参考，不限制本轮设计空间。根据任务与反馈自由设计，并可按需保留、替换、拆分、合并、增加或删除算子；不要为了缓存复用而维持原结构：\n"
+            "下面是本轮实际继承的父流水线，仅作为可复用的参考，不限制本轮设计空间。根据任务与反馈自由设计，并可按需保留、替换、拆分、合并、增加或删除算子；不要为了缓存复用而维持原结构：\n"
             f"```python\n{code}\n```"
         )
     if rationale:
-        lines.append(f"上一轮设计理由：{rationale}")
+        lines.append(f"父流水线设计理由：{rationale}")
     if code:
         lines.append(
             "【Framework-owned 父轮复用】只判断哪些连续前缀算子在语义上保持不变，并复制这些算子"
@@ -333,21 +402,60 @@ def _history_block(history: list[dict] | None) -> str:
         return ""
     visible = history[-12:]
     lines = [
-        "【简要进化历史——不要重复 rejected 尝试的同类策略】",
-        "这里只记录 decision 摘要，不代表要继承 rejected pipeline。",
+        "【简要进化历史——不要重复已拒绝尝试的同类策略】",
+        "已接受历史只含摘要；被拒历史若附带 observation/diagnostic，仅用于避免重复失败，不是可继承的 pipeline。",
+        "当前父流水线的执行观测和诊断只看上方独立的父流水线 block。",
     ]
     if len(history) > len(visible):
         lines.append(f"- 更早的 {len(history) - len(visible)} 次尝试仅保存在运行记录中。")
     for item in visible:
         score = item.get("review_score")
-        score_text = f"{float(score):.3f}" if score is not None else "n/a"
-        operators = ">".join(str(name) for name in item.get("operators", [])) or "unknown"
-        issues = "；".join(str(issue) for issue in item.get("issues", [])) or "none"
+        score_text = f"{float(score):.3f}" if score is not None else "无"
+        operators = ">".join(str(name) for name in item.get("operators", [])) or "未知"
+        issues = "；".join(str(issue) for issue in item.get("issues", [])) or "无"
+        outcome = str(item.get("outcome") or "未知")
+        outcome = {"accepted": "已接受", "rejected": "已拒绝"}.get(outcome, outcome)
         lines.append(
-            f"- iter {item.get('iteration')} [{item.get('outcome')}], score={score_text}, "
-            f"ops={operators}, decision={item.get('decision') or 'none'}, issues={issues}"
+            f"- 第 {item.get('iteration')} 轮 [{outcome}]，评审分数={score_text}，"
+            f"算子={operators}，decision={item.get('decision') or '无'}，问题={issues}"
         )
+        observation = item.get("execution_observation")
+        diagnostic = item.get("pipeline_diagnostic")
+        if item.get("outcome") == "rejected" and observation:
+            lines.append(f"  被拒尝试执行观测（仅用于避免重复失败）：{observation}")
+        if item.get("outcome") == "rejected" and diagnostic:
+            lines.append(
+                "  被拒尝试执行诊断（仅用于避免重复失败，不参与评分）："
+                + json.dumps(diagnostic, ensure_ascii=False, separators=(",", ":"))
+            )
     return "\n".join(lines) + "\n"
+
+
+def _execution_observation_block(path: str | None) -> str:
+    if not path:
+        return ""
+    return (
+        "【父流水线执行观测（当前最佳 incumbent）】框架已经完成本轮实际继承的父流水线。"
+        "以下是确定性执行证据，不是 Review 分数。修改算子前请检查各步骤的实际行数、"
+        "保留率、字段、低基数字段分布和有界样本；必要时读取完整文件：\n"
+        + "- execution_observation.json：" + path + "\n"
+    )
+
+
+def _pipeline_diagnostic_block(diagnostic: object | None) -> str:
+    if not diagnostic:
+        return ""
+    if isinstance(diagnostic, dict):
+        payload = json.dumps(diagnostic, ensure_ascii=False, indent=2)
+    else:
+        payload = str(diagnostic)
+    if len(payload) > 12000:
+        payload = payload[:11950] + "\n[诊断内容已由框架截断]"
+    return (
+        "【父流水线执行诊断（当前最佳 incumbent）】这是独立诊断 Agent 给出的机制性意见。"
+        "它不影响 review_score、passed 或 incumbent 选择。"
+        "采取行动前请结合 execution_observation 和产物自行核实：\n" + payload + "\n"
+    )
 
 
 def _downstream_feedback_block(
