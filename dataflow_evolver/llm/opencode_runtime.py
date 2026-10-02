@@ -22,6 +22,7 @@ from dataflow_evolver.llm.session_state import (
     finalize_agent_session,
     prepare_agent_session_store,
 )
+from dataflow_evolver.llm.skill_isolation import isolated_agent_cwd
 from dataflow_evolver.utils.config import Config
 from dataflow_evolver.utils.logging import get_logger
 
@@ -336,8 +337,9 @@ def run_opencode_agent(
 class OpenCodeAgentRuntime:
     """AgentRuntime implementation backed by ``opencode run``."""
 
-    def __init__(self, system_prompt_append: str) -> None:
+    def __init__(self, system_prompt_append: str, *, disable_project_skills: bool = False) -> None:
         self.system_prompt_append = system_prompt_append
+        self.disable_project_skills = disable_project_skills
 
     def run(
         self,
@@ -348,11 +350,12 @@ class OpenCodeAgentRuntime:
         tool_log_dir: str | None,
         phase: str,
     ) -> AgentRunResult:
-        return run_opencode_agent(
-            prompt,
-            cwd=cwd,
-            agent_cfg=agent_cfg,
-            tool_log_dir=tool_log_dir,
-            phase=phase,
-            system_prompt_append=self.system_prompt_append,
-        )
+        with isolated_agent_cwd(cwd, enabled=self.disable_project_skills) as agent_cwd:
+            return run_opencode_agent(
+                prompt,
+                cwd=str(agent_cwd),
+                agent_cfg=agent_cfg,
+                tool_log_dir=tool_log_dir,
+                phase=phase,
+                system_prompt_append=self.system_prompt_append,
+            )

@@ -159,6 +159,7 @@ def _build_options(
     resume: str | None = None,
     session_env: dict[str, str] | None = None,
     system_prompt_append: str | None = None,
+    enable_project_skills: bool = True,
 ) -> Any:
     """据 agent 配置段构造 ClaudeAgentOptions。
 
@@ -202,8 +203,12 @@ def _build_options(
         tools={"type": "preset", "preset": "claude_code"},
         system_prompt={"type": "preset", "preset": "claude_code", "append": append_text},
         permission_mode=permission_mode,
-        setting_sources=list(agent_cfg.get("setting_sources", ["project"])),
-        skills="all",
+        setting_sources=(
+            list(agent_cfg.get("setting_sources", ["project"]))
+            if enable_project_skills
+            else []
+        ),
+        skills="all" if enable_project_skills else [],
         max_turns=agent_cfg.get("max_turns", 50),
         mcp_servers={},
         resume=resume,
@@ -320,6 +325,7 @@ def run_pipeline_agent(
     tool_log_dir: str | None = None,
     phase: str = "",
     system_prompt_append: str | None = None,
+    disable_project_skills: bool = False,
 ) -> AgentRunResult:
     """Run one PipelineAgent session with timeout, retry, and optional resume.
 
@@ -357,6 +363,7 @@ def run_pipeline_agent(
             resume=resume_id if used_resume else None,
             session_env=session_env,
             system_prompt_append=system_prompt_append,
+            enable_project_skills=not disable_project_skills,
         )
         cur_prompt = _RESUME_NUDGE if used_resume else prompt
         logger.info(
