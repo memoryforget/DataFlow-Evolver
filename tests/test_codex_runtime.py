@@ -57,8 +57,8 @@ def test_cli_jsonl_converts_text_tools_session_and_usage():
             '{"type":"turn.started"}',
             (
                 '{"type":"item.completed","item":{"id":"item-1",'
-                '"type":"mcp_tool_call","server":"dataflow-operators",'
-                '"tool":"list_operators"}}'
+                '"type":"mcp_tool_call","server":"example-server",'
+                '"tool":"example-tool"}}'
             ),
             (
                 '{"type":"item.completed","item":{"id":"item-2",'
@@ -76,7 +76,7 @@ def test_cli_jsonl_converts_text_tools_session_and_usage():
     assert result.success
     assert result.session_id == "thread-cli"
     assert result.result_text == "done"
-    assert result.tool_uses[0]["name"] == "dataflow-operators_list_operators"
+    assert result.tool_uses[0]["name"] == "example-server_example-tool"
     assert result.usage == {
         "input_tokens": 12,
         "cached_input_tokens": 2,
@@ -120,7 +120,8 @@ def test_cli_runtime_uses_configured_binary_provider_and_session_home(
             captured["args"] = args
             captured["kwargs"] = kwargs
 
-        def communicate(self, timeout=None):
+        def communicate(self, input=None, timeout=None):
+            captured["stdin_prompt"] = input
             captured["timeout"] = timeout
             return (
                 "\n".join(
@@ -145,7 +146,6 @@ def test_cli_runtime_uses_configured_binary_provider_and_session_home(
         {
             "api_key_env": "DF_AGENT_API_KEY",
             "base_url": "https://codex-gateway.example/v1",
-            "system_prompt_append": "developer guard",
             "codex": {
                 "binary": "/opt/codex-0.118/codex",
                 "model": "gpt-5.4",
@@ -162,6 +162,7 @@ def test_cli_runtime_uses_configured_binary_provider_and_session_home(
         resume=None,
         timeout=30,
         session_env={"CODEX_HOME": str(tmp_path / "sessions/codex")},
+        system_prompt_append="developer guard",
     )
 
     assert result.success
@@ -174,8 +175,10 @@ def test_cli_runtime_uses_configured_binary_provider_and_session_home(
         for item in args
     )
     assert "model_providers.openai-custom.supports_websockets=false" in args
-    assert any(item.startswith("mcp_servers.dataflow-operators.command=") for item in args)
-    assert args[-1].startswith("developer guard\n\nwrite pipeline")
+    assert not any("mcp_servers." in item for item in args)
+    assert args[-1] == "-"
+    assert captured["stdin_prompt"].startswith("developer guard\n\nwrite pipeline")
+    assert captured["kwargs"]["stdin"] is runtime.subprocess.PIPE
     assert captured["kwargs"]["env"]["CODEX_API_KEY"] == "generic-key"
     assert captured["kwargs"]["env"]["OPENAI_API_KEY"] == "generic-key"
     assert captured["kwargs"]["env"]["CODEX_HOME"].endswith("sessions/codex")
@@ -214,7 +217,8 @@ def test_cli_runtime_bypass_sandbox_requires_explicit_opt_in(monkeypatch, tmp_pa
         def __init__(self, args, **kwargs):
             captured["args"] = args
 
-        def communicate(self, timeout=None):
+        def communicate(self, input=None, timeout=None):
+            captured["stdin_prompt"] = input
             return (
                 "\n".join(
                     [
@@ -250,8 +254,9 @@ def test_cli_runtime_bypass_sandbox_requires_explicit_opt_in(monkeypatch, tmp_pa
     assert "--full-auto" not in args
     assert 'sandbox_mode="workspace-write"' not in args
     assert 'sandbox_workspace_write.network_access=false' not in args
-    assert ".agents/skills/dataflow-dev/templates/operator_api_reference.md" in args[-1]
-    assert ".claude/skills/dataflow-dev" not in args[-1]
+    assert args[-1] == "-"
+    assert "dataflow-evolver-pipeline" in captured["stdin_prompt"]
+    assert "supplied task context" in captured["stdin_prompt"]
 
 
 def test_retry_resumes_codex_thread(monkeypatch, tmp_path):
@@ -294,3 +299,63 @@ def test_upstream_stream_disconnect_is_retryable():
     )
 
     assert _is_retryable(result)
+
+
+def test_cli_runtime_supports_explicit_read_only_sandbox(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeProcess:
+        returncode = 0
+        def __init__(self, args, **kwargs):
+            captured["args"] = args
+        def communicate(self, input=None, timeout=None):
+            return ('{"type":"turn.completed","usage":{"input_tokens":1}}\n', '')
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", FakeProcess)
+    runtime._run_once(
+        "inspect",
+        cwd=str(tmp_path),
+        agent_cfg=Config({"codex": {"sandbox_mode": "read-only"}}),
+        resume=None,
+        timeout=30,
+    )
+    assert '--full-auto' in captured["args"]
+    assert 'sandbox_mode="read-only"' in captured["args"]
+    assert 'sandbox_workspace_write.network_access=false' not in captured["args"]
+
+
+def test_read_only_agent_forces_codex_sandbox_and_disables_bypass(
+    monkeypatch, tmp_path
+):
+    captured = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, args, **kwargs):
+            captured["args"] = args
+
+        def communicate(self, input=None, timeout=None):
+            return ('{"type":"turn.completed","usage":{"input_tokens":1}}\n', '')
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", FakeProcess)
+    runtime._run_once(
+        "inspect",
+        cwd=str(tmp_path),
+        agent_cfg=Config(
+            {
+                "read_only": True,
+                "codex": {
+                    "sandbox_mode": "workspace-write",
+                    "bypass_sandbox": True,
+                },
+            }
+        ),
+        resume=None,
+        timeout=30,
+    )
+
+    assert "--dangerously-bypass-approvals-and-sandbox" not in captured["args"]
+    assert "--full-auto" in captured["args"]
+    assert 'sandbox_mode="read-only"' in captured["args"]
+    assert 'sandbox_workspace_write.network_access=false' not in captured["args"]

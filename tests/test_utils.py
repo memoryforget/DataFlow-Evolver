@@ -12,7 +12,8 @@ def test_config_loads_and_expands():
     cfg = load_config(
         Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
     )
-    assert int(cfg.loop.max_iterations) == 4
+    assert int(cfg.loop.max_iterations) == 5
+    assert int(cfg.downstream_eval.interval) == 2
     assert cfg.agent.backend == "claude"
     assert cfg.agent.setting_sources == ["project"]
     assert cfg.agent.claude.permission_mode == "bypassPermissions"

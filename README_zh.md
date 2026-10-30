@@ -42,6 +42,7 @@ DataFlow-Evolver/
 | `iteration_NNN/operators/` | 自动生成的自定义算子 |
 | `iteration_NNN/review.jsonl` | Review Agent 的结构化评审证据 |
 | `iteration_NNN/sessions/<backend>/` | 原生 Agent 状态和逐轮 token 用量 |
+| `downstream_eval/checkpoint_NNN/` | 可选的外部 SFT/评测请求、结果与日志 |
 
 框架会以 `workspace/` 为工作目录启动 Claude、OpenCode 或 Codex。每个后端都会从其原生发现路径获得一份完整的 DataFlow Skill；三份 Skill 有意保持相同指导内容，仅适配各后端的根路径。
 
@@ -69,7 +70,7 @@ export DF_API_URL=https://api.example/v1/chat/completions
 export DF_API_KEY=...
 export DF_API_MAX_WORKERS=10
 export DF_RUN_NAME=experiment_001
-export DF_MAX_ITERATIONS=4
+export DF_MAX_ITERATIONS=5
 export DF_EXECUTION_REPAIRS=1
 export DF_COMPILE_TIMEOUT_SEC=120
 export DF_AGENT_PYTHON="$(command -v python)"
@@ -152,6 +153,31 @@ review_score = (0.75 * llm_composite + 0.25 * embedding_quality) * hard_metric_f
 ```
 
 可通过 `DF_DATASET_QUALITY_SCORE_WEIGHT` 修改默认的 `0.25` 权重。
+
+## 可选的周期性 SFT/评测反馈
+
+框架可以在每隔若干轮静态 Review 后触发一次高成本下游信号：把当时的 best-so-far
+数据集交给外部命令完成 SFT 和 benchmark 评测，严格验证各 benchmark 分数与完整 bad
+cases，再将这些证据注入后续 PipelineAgent prompt。外部命令可以使用独立 Conda 环境，
+DataFlow Evolver 不会安装或导入任何训练、CUDA、模型与评测依赖。
+
+```yaml
+downstream_eval:
+  enabled: true
+  interval: 2
+  command:
+    - /opt/conda/envs/downstream/bin/python
+    - /absolute/path/to/run_sft_and_eval.py
+  benchmarks: [gsm8k, math, math500, aime]
+  baseline:
+    enabled: true  # 第 0 轮仅评测未训练模型，不执行 SFT
+  bad_cases_per_benchmark: 3  # 上限；实际错误少于 3 时允许返回更少
+  timeout_sec: 86400
+```
+
+下游结果不会混入静态 `review_score`，只作为后续 Pipeline 变异的诊断依据，并完整写入
+运行清单。请求/结果协议、失败语义及 benchmark 泄漏注意事项详见
+[`docs/downstream_evaluation.md`](docs/downstream_evaluation.md)。
 
 ## 运行
 

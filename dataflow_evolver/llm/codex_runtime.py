@@ -5,7 +5,6 @@ import json
 import os
 import signal
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -29,18 +28,11 @@ from dataflow_evolver.llm.session_state import (
     prepare_agent_session_store,
     record_codex_turn_usage,
 )
+from dataflow_evolver.llm.skill_isolation import isolated_agent_cwd
 from dataflow_evolver.utils.config import Config
 from dataflow_evolver.utils.logging import get_logger
 
 logger = get_logger("llm.codex_runtime")
-
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_OPERATOR_TOOLS = (
-    "list_operator_categories",
-    "recommend_operator_categories",
-    "list_operators",
-    "get_operator_detail",
-)
 
 
 def _jsonable(value: Any) -> Any:
@@ -162,26 +154,6 @@ def _codex_provider_overrides(
     return overrides, env, provider
 
 
-def _codex_mcp_overrides(cwd: str, timeout_ms: int) -> list[str]:
-    pythonpath = str(_PROJECT_ROOT)
-    inherited = os.environ.get("PYTHONPATH", "")
-    if inherited:
-        pythonpath += os.pathsep + inherited
-    server = "mcp_servers.dataflow-operators"
-    return [
-        f"{server}.command={json.dumps(sys.executable)}",
-        f"{server}.args={json.dumps(['-m', 'dataflow_evolver.llm.mcp_stdio'])}",
-        f"{server}.cwd={json.dumps(str(_PROJECT_ROOT))}",
-        (
-            f"{server}.env={{DF_WORKSPACE={json.dumps(cwd)},"
-            f"PYTHONPATH={json.dumps(pythonpath)}}}"
-        ),
-        f"{server}.startup_timeout_ms={timeout_ms}",
-        f"{server}.tool_timeout_sec={max(timeout_ms / 1000.0, 1.0)}",
-        f"{server}.enabled_tools={json.dumps(list(_OPERATOR_TOOLS))}",
-    ]
-
-
 def result_from_codex_cli(
     stdout: str,
     stderr: str,
@@ -276,23 +248,35 @@ def _run_once_cli(
     resume: str | None,
     timeout: float,
     session_env: dict[str, str] | None,
+    system_prompt_append: str | None = None,
 ) -> AgentRunResult:
     cfg = backend_config(agent_cfg, "codex")
-    bypass_sandbox = cfg.get("bypass_sandbox", False) is True
+    read_only = agent_cfg.get("read_only", False) is True
+    bypass_sandbox = cfg.get("bypass_sandbox", False) is True and not read_only
+    sandbox_mode = (
+        "read-only"
+        if read_only
+        else str(
+            cfg.get("sandbox_mode", "workspace-write") or "workspace-write"
+        ).strip()
+    )
+    if sandbox_mode not in {"read-only", "workspace-write", "danger-full-access"}:
+        raise ValueError(
+            "agent.codex.sandbox_mode must be read-only, workspace-write, or danger-full-access"
+        )
     overrides, env, _ = _codex_provider_overrides(agent_cfg)
     if session_env:
         env.update(session_env)
-    timeout_ms = int(cfg.get("mcp_timeout_ms", 30000) or 30000)
-    overrides.extend(_codex_mcp_overrides(cwd, timeout_ms))
     overrides.append('web_search="disabled"')
     if not bypass_sandbox:
         overrides.extend(
             [
                 'approval_policy="never"',
-                'sandbox_mode="workspace-write"',
-                'sandbox_workspace_write.network_access=false',
+                f'sandbox_mode="{sandbox_mode}"',
             ]
         )
+        if sandbox_mode == "workspace-write":
+            overrides.append('sandbox_workspace_write.network_access=false')
 
     binary = str(cfg.get("binary", "") or "codex").strip() or "codex"
     binary_path = Path(binary).expanduser()
@@ -325,20 +309,21 @@ def _run_once_cli(
         args.append(resume)
     else:
         developer = str(
-            agent_cfg.get(
-                "system_prompt_append", default_system_prompt_append("codex")
-            )
+            system_prompt_append or default_system_prompt_append("codex")
         ).strip()
         if developer:
             prompt = f"{developer}\n\n{prompt}"
-    args.append(prompt)
+    # Codex accepts ``-`` as an explicit request to read the prompt from stdin.
+    # Passing a large downstream-feedback prompt as one argv item can exceed
+    # Linux MAX_ARG_STRLEN before the Codex process is even started.
+    args.append("-")
 
     try:
         process = subprocess.Popen(
             args,
             cwd=cwd,
             env=env,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -353,7 +338,10 @@ def _run_once_cli(
             error_type=type(exc).__name__,
         )
     try:
-        stdout, stderr = process.communicate(timeout=timeout if timeout > 0 else None)
+        stdout, stderr = process.communicate(
+            input=prompt,
+            timeout=timeout if timeout > 0 else None,
+        )
         return result_from_codex_cli(
             stdout,
             stderr,
@@ -377,6 +365,7 @@ def _run_once(
     resume: str | None,
     timeout: float,
     session_env: dict[str, str] | None = None,
+    system_prompt_append: str | None = None,
 ) -> AgentRunResult:
     return _run_once_cli(
         prompt,
@@ -385,6 +374,7 @@ def _run_once(
         resume=resume,
         timeout=timeout,
         session_env=session_env,
+        system_prompt_append=system_prompt_append,
     )
 
 
@@ -395,11 +385,12 @@ def run_codex_agent(
     agent_cfg: Config,
     tool_log_dir: str | None = None,
     phase: str = "",
+    system_prompt_append: str | None = None,
 ) -> AgentRunResult:
     """Run Codex with the same retry/resume contract as the other backends."""
     max_retries = max(1, int(agent_cfg.get("max_retries", 4)))
     base_delay = float(agent_cfg.get("retry_base_delay", 10))
-    timeout = float(agent_cfg.get("run_timeout_sec", 1800))
+    timeout = float(agent_cfg.get("run_timeout_sec", 3600))
     resume_enabled = bool(agent_cfg.get("resume_on_retry", True))
     session_store = prepare_agent_session_store(
         agent_cfg,
@@ -427,6 +418,7 @@ def run_codex_agent(
             resume=resume_id if used_resume else None,
             timeout=timeout,
             session_env=session_env,
+            system_prompt_append=system_prompt_append,
         )
         label = phase if attempt == 1 else f"{phase}#retry{attempt - 1}"
         if tool_log_dir:
@@ -472,6 +464,10 @@ def run_codex_agent(
 class CodexAgentRuntime:
     """AgentRuntime implementation backed by ``codex exec --json``."""
 
+    def __init__(self, system_prompt_append: str, *, disable_project_skills: bool = False) -> None:
+        self.system_prompt_append = system_prompt_append
+        self.disable_project_skills = disable_project_skills
+
     def run(
         self,
         prompt: str,
@@ -481,10 +477,12 @@ class CodexAgentRuntime:
         tool_log_dir: str | None,
         phase: str,
     ) -> AgentRunResult:
-        return run_codex_agent(
-            prompt,
-            cwd=cwd,
-            agent_cfg=agent_cfg,
-            tool_log_dir=tool_log_dir,
-            phase=phase,
-        )
+        with isolated_agent_cwd(cwd, enabled=self.disable_project_skills) as agent_cwd:
+            return run_codex_agent(
+                prompt,
+                cwd=str(agent_cwd),
+                agent_cfg=agent_cfg,
+                tool_log_dir=tool_log_dir,
+                phase=phase,
+                system_prompt_append=self.system_prompt_append,
+            )

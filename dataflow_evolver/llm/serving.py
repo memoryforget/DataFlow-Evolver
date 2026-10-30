@@ -106,15 +106,19 @@ class APILLMServing(LLMServingABC):
         from openai import OpenAI  # 惰性导入，避免无谓依赖
 
         self.model_name = model_name
-        self.max_workers = max_workers
-        self.temperature = temperature
+        # Environment placeholders are expanded as strings by Config. Normalize
+        # numeric values at this boundary before passing them to OpenAI/httpx.
+        self.max_workers = int(max_workers)
+        self.temperature = float(temperature)
+        normalized_timeout = float(request_timeout)
+        normalized_retries = int(max_retries)
         base_url = _to_base_url(api_url)
         # timeout / max_retries 交给 openai 客户端：网络抖动在 HTTP 层自动退避重试（见 review H1）
         self._client = OpenAI(
             base_url=base_url,
             api_key=api_key or "EMPTY",
-            timeout=request_timeout,
-            max_retries=max_retries,
+            timeout=normalized_timeout,
+            max_retries=normalized_retries,
         )
         logger.info("APILLMServing 就绪：model=%s base_url=%s", model_name, base_url)
 
@@ -139,13 +143,24 @@ class APILLMServing(LLMServingABC):
                 error_type=type(exc).__name__,
             )
             raise
+        # Some OpenAI-compatible relays return the response body as a plain
+        # string instead of an SDK ChatCompletion object. Treat that body as
+        # the completion text so review calls do not fail with
+        # ``'str' object has no attribute 'choices'``.
+        if isinstance(resp, str):
+            result = resp
+            response_model = self.model_name
+            response_usage = None
+        else:
+            response_model = str(getattr(resp, "model", None) or self.model_name)
+            response_usage = getattr(resp, "usage", None)
+            result = resp.choices[0].message.content or ""
         self._record_usage(
-            model=str(getattr(resp, "model", None) or self.model_name),
-            raw_usage=getattr(resp, "usage", None),
+            model=response_model,
+            raw_usage=response_usage,
             success=True,
             latency_seconds=time.perf_counter() - started,
         )
-        result = resp.choices[0].message.content or ""
         logger.debug("API 响应：len=%d, preview=%.200s", len(result), result)
         return result
 

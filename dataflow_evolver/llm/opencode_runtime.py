@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -23,6 +22,7 @@ from dataflow_evolver.llm.session_state import (
     finalize_agent_session,
     prepare_agent_session_store,
 )
+from dataflow_evolver.llm.skill_isolation import isolated_agent_cwd
 from dataflow_evolver.utils.config import Config
 from dataflow_evolver.utils.logging import get_logger
 
@@ -59,16 +59,6 @@ def _model(agent_cfg: Config) -> str:
     return raw if "/" in raw else f"{provider}/{raw}"
 
 
-def _operator_mcp(cwd: str, timeout_ms: int) -> dict[str, Any]:
-    return {
-        "type": "local",
-        "command": [sys.executable, "-m", "dataflow_evolver.llm.mcp_stdio"],
-        "enabled": True,
-        "timeout": timeout_ms,
-        "environment": {"DF_WORKSPACE": cwd},
-    }
-
-
 def build_opencode_config(
     agent_cfg: Config,
     *,
@@ -80,10 +70,23 @@ def build_opencode_config(
     model = _model(agent_cfg)
     provider = model.split("/", 1)[0]
     agent_name = "dataflow-pipeline"
-    timeout_ms = int(cfg.get("mcp_timeout_ms", 30000) or 30000)
-    permission = str(cfg.get("permission", "allow") or "allow").lower()
-    if permission not in {"allow", "ask", "deny"}:
-        raise ValueError("agent.opencode.permission must be allow, ask, or deny")
+    read_only = bool(cfg.get("read_only", agent_cfg.get("read_only", False)))
+    raw_permission = cfg.get("permission", "allow")
+    if read_only:
+        permission: Any = {
+            "read": "allow",
+            "glob": "allow",
+            "grep": "allow",
+            "list": "allow",
+            "bash": "deny",
+            "edit": "deny",
+            "write": "deny",
+            "webfetch": "deny",
+        }
+    else:
+        permission = str(raw_permission or "allow").lower()
+        if permission not in {"allow", "ask", "deny"}:
+            raise ValueError("agent.opencode.permission must be allow, ask, or deny")
 
     endpoint = resolve_agent_endpoint(agent_cfg, "opencode", provider=provider)
     key_env = endpoint.api_key_env
@@ -95,10 +98,7 @@ def build_opencode_config(
         options["baseURL"] = base_url
 
     selected_prompt = str(
-        system_prompt
-        or agent_cfg.get(
-            "system_prompt_append", default_system_prompt_append("opencode")
-        )
+        system_prompt or default_system_prompt_append("opencode")
     )
     config: dict[str, Any] = {
         "$schema": _CONFIG_SCHEMA,
@@ -112,7 +112,6 @@ def build_opencode_config(
                 "permission": permission,
             }
         },
-        "mcp": {"dataflow-operators": _operator_mcp(cwd, timeout_ms)},
     }
     if options:
         config["provider"] = {provider: {"options": options}}
@@ -185,9 +184,12 @@ def _run_once(
     resume: str | None,
     timeout: float,
     session_env: dict[str, str] | None = None,
+    system_prompt_append: str | None = None,
 ) -> AgentRunResult:
     cfg = _opencode_cfg(agent_cfg)
-    config, agent_name, model = build_opencode_config(agent_cfg, cwd=cwd)
+    config, agent_name, model = build_opencode_config(
+        agent_cfg, cwd=cwd, system_prompt=system_prompt_append
+    )
     binary = str(cfg.get("binary", "opencode") or "opencode")
     command = [
         binary,
@@ -260,11 +262,12 @@ def run_opencode_agent(
     agent_cfg: Config,
     tool_log_dir: str | None = None,
     phase: str = "",
+    system_prompt_append: str | None = None,
 ) -> AgentRunResult:
     """Run OpenCode with the Claude adapter's retry and resume semantics."""
     max_retries = max(1, int(agent_cfg.get("max_retries", 4)))
     base_delay = float(agent_cfg.get("retry_base_delay", 10))
-    timeout = float(agent_cfg.get("run_timeout_sec", 1800))
+    timeout = float(agent_cfg.get("run_timeout_sec", 3600))
     resume_enabled = bool(agent_cfg.get("resume_on_retry", True))
     session_store = prepare_agent_session_store(
         agent_cfg,
@@ -293,6 +296,7 @@ def run_opencode_agent(
             resume=resume_id if used_resume else None,
             timeout=timeout,
             session_env=session_env,
+            system_prompt_append=system_prompt_append,
         )
         if tool_log_dir:
             label = phase if attempt == 1 else f"{phase}#retry{attempt - 1}"
@@ -333,6 +337,10 @@ def run_opencode_agent(
 class OpenCodeAgentRuntime:
     """AgentRuntime implementation backed by ``opencode run``."""
 
+    def __init__(self, system_prompt_append: str, *, disable_project_skills: bool = False) -> None:
+        self.system_prompt_append = system_prompt_append
+        self.disable_project_skills = disable_project_skills
+
     def run(
         self,
         prompt: str,
@@ -342,10 +350,12 @@ class OpenCodeAgentRuntime:
         tool_log_dir: str | None,
         phase: str,
     ) -> AgentRunResult:
-        return run_opencode_agent(
-            prompt,
-            cwd=cwd,
-            agent_cfg=agent_cfg,
-            tool_log_dir=tool_log_dir,
-            phase=phase,
-        )
+        with isolated_agent_cwd(cwd, enabled=self.disable_project_skills) as agent_cwd:
+            return run_opencode_agent(
+                prompt,
+                cwd=str(agent_cwd),
+                agent_cfg=agent_cfg,
+                tool_log_dir=tool_log_dir,
+                phase=phase,
+                system_prompt_append=self.system_prompt_append,
+            )

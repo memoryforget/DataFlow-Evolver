@@ -4,7 +4,7 @@ The four sample-level review dimensions are combined into one comparable score:
 - 四维 LLM-judge（各 0-1）：correctness / relevance / difficulty / schema。
 - 固定权重复合分：``llm_composite = 0.40·correctness + 0.25·relevance
   + 0.15·difficulty + 0.20·schema``。
-- embedding quality（启用时）由归一化 DAS、normalized Vendi 和 NN-cosine p95 构成；
+- embedding quality（启用时）由已配置的归一化 DAS、normalized Vendi 和 NN-cosine p95 构成；
   默认占 review_score 的 25%，sample-level LLM 占 75%。
 - 硬指标惩罚（扫全份文件，不花 LLM）：``dup_rate`` / ``null_rate`` / ``parse_valid_rate``
   / ``contamination_rate``，在上述混合质量分之后统一相乘。
@@ -14,8 +14,8 @@ The four sample-level review dimensions are combined into one comparable score:
 - 抽样从「取前 N 行」改为**随机蓄水池采样**（一趟遍历、O(k) 内存、全份等概率）。
 - ``passed`` 同时要求 correctness / relevance / schema 达到各自阈值，用于剔除答案错误、
   任务偏离或结构不合格的节点。
-- 可选 DatasetQualityEvaluator 固定采样候选集和高质量代理集，计算 DAS=-MMD，并复用
-  候选 embedding 计算 Vendi Score 与近邻 cosine 分布。这些 dataset-level 原始值保持独立，
+- 可选 DatasetQualityEvaluator 固定采样候选集并计算 Vendi Score 与近邻 cosine 分布；
+  仅在配置高质量代理集时计算 DAS=-MMD。这些 dataset-level 原始值保持独立，
   不与 0-1 的 LLM 分数做无标定加权，但会随 ReviewResult 回传 PipelineAgent。
 
 Optional decontamination references are used only for n-gram overlap detection and are
@@ -81,6 +81,7 @@ class ReviewAgent(AgentABC):
         dataset_quality_weight: float = 0.25,
         dataset_quality_score_weights: dict[str, float] | None = None,
         duplicate_fields: list[str] | None = None,
+        contamination_fields: list[str] | None = None,
     ) -> None:
         super().__init__(serving, max_retries=max_retries)
         self.schema_threshold = schema_threshold
@@ -102,6 +103,9 @@ class ReviewAgent(AgentABC):
             dataset_quality_score_weights
         )
         self.duplicate_fields = list(duplicate_fields) if duplicate_fields else None
+        self.contamination_fields = (
+            list(contamination_fields) if contamination_fields else None
+        )
 
     def build_prompt(self, task: TaskSpec, samples_text: str) -> str:
         return build_review_prompt(task, samples_text)
@@ -187,7 +191,10 @@ class ReviewAgent(AgentABC):
         # 去污染：与 benchmark 测试集重合的数据不是"质量差"，是把评测答案抄进了训练集。
         # 既按比例打折（少量疑似重合可能是假阳，不该一票否决），又设硬门槛（超过阈值就是
         # 在刷分，必须判不通过并把证据喂回 Agent，否则搜索会持续往这个方向走）。
-        contam = self.contamination.scan(dataset_path)
+        contam = self.contamination.scan(
+            dataset_path,
+            fields=self.contamination_fields,
+        )
         result.contamination_rate = contam.rate
         if contam.hits:
             self.logger.warning(
@@ -376,7 +383,7 @@ class ReviewAgent(AgentABC):
 
     def _compute_embedding_quality(self, result: ReviewResult) -> float | None:
         quality = result.dataset_quality
-        if quality.status != "ok" or quality.mmd is None:
+        if quality.status != "ok":
             quality.embedding_quality_components = {}
             quality.embedding_quality_score = None
             return None
@@ -384,10 +391,10 @@ class ReviewAgent(AgentABC):
         diversity = quality.embedding_diversity
         vendi_ratio = diversity.get("cosine_vendi_ratio")
         nn_p95 = diversity.get("nearest_neighbor_cosine_p95")
-        components: dict[str, float] = {
+        components: dict[str, float] = {}
+        if quality.mmd is not None:
             # RBF kernels are bounded in [0, 1], so MMD is bounded by sqrt(2).
-            "das": _clip01(1.0 - quality.mmd / math.sqrt(2.0)),
-        }
+            components["das"] = _clip01(1.0 - quality.mmd / math.sqrt(2.0))
         if vendi_ratio is not None:
             components["vendi"] = _clip01(vendi_ratio)
         if nn_p95 is not None:

@@ -19,7 +19,7 @@ from dataflow_evolver.telemetry.pipeline_usage import (
 )
 
 
-CFG = PipelineConfig([], "", "", "")
+CFG = PipelineConfig([{"name": "HttpStep"}], "", "", "")
 
 
 class _Response:
@@ -37,6 +37,30 @@ def _request(payload, url="https://api.example/v1/chat/completions"):
         url=url,
         method="POST",
     )
+
+
+def test_review_serving_normalizes_env_expanded_numeric_strings(monkeypatch):
+    captured = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+    serving = APILLMServing(
+        api_url="https://api.example/v1/chat/completions",
+        model_name="review-model",
+        api_key="secret",
+        max_workers="10",
+        temperature="0.7",
+        request_timeout="600",
+        max_retries="3",
+    )
+
+    assert serving.max_workers == 10
+    assert serving.temperature == 0.7
+    assert captured["timeout"] == 600.0
+    assert captured["max_retries"] == 3
 
 
 def test_normalize_usage_supports_openai_and_anthropic_fields():
@@ -162,6 +186,26 @@ def test_review_serving_capture_records_exact_usage_without_prompt(tmp_path):
     assert "private review prompt" not in serialized
 
 
+def test_review_serving_accepts_plain_string_relay_response(tmp_path):
+    serving = APILLMServing.__new__(APILLMServing)
+    serving.model_name = "configured-review-model"
+    serving.max_workers = 1
+    serving.temperature = 0.0
+    serving._client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **_kwargs: '{"passed": true}')
+        )
+    )
+    events = tmp_path / "review_llm_calls.jsonl"
+
+    with serving.capture_usage(events, phase="iteration_002"):
+        assert serving.generate_one("review prompt") == '{"passed": true}'
+
+    event = json.loads(events.read_text(encoding="utf-8"))
+    assert event["success"] is True
+    assert event["usage_status"] == "missing"
+
+
 def test_combined_iteration_usage_includes_review_and_embedding(tmp_path):
     review = {"kind": "review_llm", "tokens": {"total_tokens": 120}}
     embedding = {"kind": "embedding", "tokens": {"total_tokens": 500}}
@@ -189,21 +233,35 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         self.rfile.read(length)
-        payload = {
-            "id": "response-1",
-            "model": "synthetic-model",
-            "choices": [{"message": {"content": "answer"}}],
-            "usage": {
-                "prompt_tokens": 120,
-                "completion_tokens": 30,
-                "total_tokens": 150,
-                "prompt_tokens_details": {"cached_tokens": 20},
-                "completion_tokens_details": {"reasoning_tokens": 5}
+        chunks = [
+            {
+                "id": "response-1",
+                "model": "synthetic-model",
+                "choices": [{"index": 0, "delta": {"reasoning_content": "derive"}}],
+            },
+            {
+                "id": "response-1",
+                "model": "synthetic-model",
+                "choices": [{"index": 0, "delta": {"content": "answer"}}],
+            },
+            {
+                "id": "response-1",
+                "model": "synthetic-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 120,
+                    "completion_tokens": 30,
+                    "total_tokens": 150,
+                    "prompt_tokens_details": {"cached_tokens": 20},
+                    "completion_tokens_details": {"reasoning_tokens": 5}
+                }
             }
-        }
-        body = json.dumps(payload).encode()
+        ]
+        events = [f"data: {json.dumps(chunk)}" for chunk in chunks]
+        events.append("data: [DONE]")
+        body = ("\n\n".join(events) + "\n\n").encode()
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -217,10 +275,19 @@ thread = threading.Thread(target=server.handle_request)
 thread.start()
 response = requests.post(
     f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
-    json={"model": "synthetic-model", "messages": [{"role": "user", "content": "private"}]},
+    json={
+        "model": "synthetic-model",
+        "messages": [{"role": "user", "content": "private"}],
+        "stream": True,
+    },
     timeout=10,
 )
 response.raise_for_status()
+assert response.json()["choices"][0]["message"] == {
+    "role": "assistant",
+    "reasoning_content": "derive",
+    "content": "answer",
+}
 thread.join(timeout=10)
 server.server_close()
 
@@ -246,9 +313,13 @@ output.write_text('{"instruction":"q","output":"a"}\n', encoding="utf-8")
 def test_execution_wrapper_collects_real_requests_usage_and_accumulates(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    raw_entry = workspace / "raw.jsonl"
+    raw_entry.write_text('{"instruction":"raw"}\n', encoding="utf-8")
     iteration = workspace / "runs/run_a/iteration_001"
     _write_http_pipeline(iteration)
-    executor = SubprocessExecutionWrapper(str(workspace), timeout_sec=30)
+    executor = SubprocessExecutionWrapper(
+        str(workspace), timeout_sec=30, raw_entry_path=str(raw_entry)
+    )
 
     first = executor.run(CFG, iteration)
     second = executor.run(CFG, iteration)

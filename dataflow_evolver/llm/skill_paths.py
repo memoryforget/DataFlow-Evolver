@@ -3,9 +3,9 @@ from __future__ import annotations
 
 
 SKILL_ROOTS: dict[str, str] = {
-    "claude": ".claude/skills/dataflow-dev",
-    "codex": ".agents/skills/dataflow-dev",
-    "opencode": ".opencode/skills/dataflow-dev",
+    "claude": ".claude/skills/dataflow-evolver-pipeline",
+    "codex": ".agents/skills/dataflow-evolver-pipeline",
+    "opencode": ".opencode/skills/dataflow-evolver-pipeline",
 }
 
 

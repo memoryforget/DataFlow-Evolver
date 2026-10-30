@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 import dataflow_evolver.llm.agent_sdk as sdk
 from dataflow_evolver.llm.agent_sdk import AgentRunResult
 from dataflow_evolver.utils.config import Config
@@ -11,6 +13,7 @@ def test_tool_arguments_are_truncated():
 
 
 def test_claude_permission_and_root_acknowledgement_are_backend_scoped(tmp_path):
+    pytest.importorskip("claude_agent_sdk")
     options = sdk._build_options(
         Config(
             {

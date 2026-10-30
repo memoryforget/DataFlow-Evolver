@@ -42,7 +42,7 @@ agent:
   pipeline_filename: pipeline.py
   max_retries: 4
   retry_base_delay: 10
-  run_timeout_sec: 1800
+  run_timeout_sec: ${DF_AGENT_RUN_TIMEOUT_SEC:3600}
   resume_on_retry: true
   claude:
     model: ${CLAUDE_AGENT_MODEL:}
@@ -71,7 +71,7 @@ agent:
     binary: ${CODEX_BIN:codex}
     model: ${CODEX_MODEL:}
     model_provider: ${CODEX_MODEL_PROVIDER:}
-    effort: ${CODEX_EFFORT:}
+    effort: ${CODEX_EFFORT:xhigh}
     api_key_env: ${CODEX_API_KEY_ENV:}
     base_url: ${CODEX_BASE_URL:}
     mcp_timeout_ms: ${CODEX_MCP_TIMEOUT_MS:30000}
@@ -80,13 +80,38 @@ agent:
 
 loop:
   # Total number of linear Pipeline -> Review iterations.
-  max_iterations: ${DF_MAX_ITERATIONS:4}
+  max_iterations: ${DF_MAX_ITERATIONS:5}
   # Deterministic framework-owned preflight; the Agent never executes pipeline.py itself.
   compile_timeout_sec: ${DF_COMPILE_TIMEOUT_SEC:120}
   execution_timeout_sec: ${DF_EXECUTION_TIMEOUT_SEC:1200}
   # Additional Agent repair calls after one generated pipeline fails to execute.
   execution_repairs: ${DF_EXECUTION_REPAIRS:1}
   python_exe: ${DF_AGENT_PYTHON:}
+
+# Optional process-isolated SFT/evaluation feedback. After every N static Review
+# iterations, the framework evaluates the current best-so-far dataset. The command
+# runs in its own environment and receives appended `--request` and `--result` paths.
+# With the default five iterations, interval=2 creates checkpoints after iterations 2 and 4.
+downstream_eval:
+  enabled: ${DF_DOWNSTREAM_EVAL_ENABLED:false}
+  interval: ${DF_DOWNSTREAM_EVAL_INTERVAL:2}
+  command: []
+  benchmarks: []
+  # Optional checkpoint 0: evaluate the untrained downstream model before the
+  # first PipelineAgent call. The external runner receives stage=baseline and
+  # must skip SFT because dataset_path and pipeline_path are null.
+  baseline:
+    enabled: ${DF_DOWNSTREAM_BASELINE_ENABLED:false}
+  # Maximum retained cases; actual count is min(this value, result.incorrect_count).
+  bad_cases_per_benchmark: 3
+  timeout_sec: ${DF_DOWNSTREAM_EVAL_TIMEOUT_SEC:86400}
+  # Convert bounded bad cases into a structured data-side diagnosis before
+  # anything is shown to the next PipelineAgent.
+  attribution:
+    enabled: ${DF_DOWNSTREAM_ATTRIBUTION_ENABLED:true}
+    max_retries: ${DF_DOWNSTREAM_ATTRIBUTION_MAX_RETRIES:2}
+    max_findings: 6
+    max_actions: 8
 
 review:
   sample_size: ${DF_REVIEW_SAMPLE_SIZE:80}

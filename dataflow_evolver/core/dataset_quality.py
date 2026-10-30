@@ -1,4 +1,4 @@
-"""Dataset-level embedding evaluation with proxy-set MMD/DAS and diversity.
+"""Dataset-level embedding evaluation with optional proxy MMD/DAS and diversity.
 
 The implementation follows Data-Preparation-Bench's DAS definition:
 ``DAS = -sqrt(max(0, biased_MMD_squared))`` with an RBF kernel.  Candidate
@@ -244,12 +244,12 @@ def _combine_embedding_usage(
 
 
 class DatasetQualityEvaluator:
-    """Compare a candidate JSONL dataset with a fixed high-quality proxy dataset."""
+    """Evaluate candidate diversity and optionally compare with a quality proxy."""
 
     def __init__(
         self,
         *,
-        proxy: ProxyDatasetConfig,
+        proxy: ProxyDatasetConfig | None,
         embedder: EmbeddingBackend,
         sample_size: int = 5000,
         seed: int = 42,
@@ -259,12 +259,16 @@ class DatasetQualityEvaluator:
         max_embedding_fail_rate: float = 0.02,
         cache_dir: str | Path | None = None,
         require_full_sample: bool = True,
+        proxy_comparison_enabled: bool = True,
     ) -> None:
         if sample_size < 1:
             raise ValueError("dataset_quality.sample_size 必须至少为 1")
         if sigma <= 0:
             raise ValueError("dataset_quality.sigma 必须大于 0")
+        if proxy_comparison_enabled and proxy is None:
+            raise ValueError("DAS/MMD enabled but no proxy dataset was configured")
         self.proxy = proxy
+        self.proxy_comparison_enabled = proxy_comparison_enabled
         self.embedder = embedder
         self.sample_size = sample_size
         self.seed = seed
@@ -279,6 +283,8 @@ class DatasetQualityEvaluator:
 
     @property
     def proxy_name(self) -> str:
+        if self.proxy is None:
+            return "disabled (candidate-only diversity)"
         if self.proxy.name and self.proxy.name != "default":
             return f"{self.proxy.path}:{self.proxy.name}"
         return self.proxy.path
@@ -294,8 +300,9 @@ class DatasetQualityEvaluator:
         base = DatasetQualityResult(
             enabled=True,
             status="error",
+            metric=("DAS" if self.proxy_comparison_enabled else "candidate_embedding_diversity"),
             proxy_name=self.proxy_name,
-            proxy_sample_size=self.sample_size,
+            proxy_sample_size=(self.sample_size if self.proxy_comparison_enabled else 0),
             embedding_model=self.embedder.model_name,
             normalized=self.normalize_embeddings,
             sigma=self.sigma,
@@ -331,21 +338,23 @@ class DatasetQualityEvaluator:
                 base.error = "候选数据没有可编码记录"
                 return base
 
-            proxy_messages = self._load_proxy_messages()
-            base.proxy_sample_size = len(proxy_messages)
-            if self.require_full_sample and len(proxy_messages) < self.sample_size:
-                base.status = "insufficient_proxy_samples"
-                base.error = (
-                    f"代理数据只有 {len(proxy_messages)} 条可编码记录，配置要求 "
-                    f"{self.sample_size} 条"
-                )
-                return base
-
             candidate_batch = self._embed_cached(candidate_messages, scope="candidate")
-            proxy_batch = self._embed_cached(proxy_messages, scope="proxy")
-            base.embedding_fail_rate = max(
-                candidate_batch.fail_rate, proxy_batch.fail_rate
-            )
+            base.embedding_fail_rate = candidate_batch.fail_rate
+            proxy_batch = None
+            if self.proxy_comparison_enabled:
+                proxy_messages = self._load_proxy_messages()
+                base.proxy_sample_size = len(proxy_messages)
+                if self.require_full_sample and len(proxy_messages) < self.sample_size:
+                    base.status = "insufficient_proxy_samples"
+                    base.error = (
+                        f"代理数据只有 {len(proxy_messages)} 条可编码记录，配置要求 "
+                        f"{self.sample_size} 条"
+                    )
+                    return base
+                proxy_batch = self._embed_cached(proxy_messages, scope="proxy")
+                base.embedding_fail_rate = max(
+                    candidate_batch.fail_rate, proxy_batch.fail_rate
+                )
             if base.embedding_fail_rate > self.max_embedding_fail_rate:
                 base.error = (
                     f"embedding 失败率 {base.embedding_fail_rate:.2%} 超过上限 "
@@ -353,29 +362,29 @@ class DatasetQualityEvaluator:
                 )
                 return base
 
-            mmd, terms = compute_rbf_mmd(
-                candidate_batch.vectors,
-                proxy_batch.vectors,
-                sigma=self.sigma,
-                biased=self.biased,
-                normalize=self.normalize_embeddings,
-            )
             base.status = "ok"
             base.embedding_dim = int(candidate_batch.vectors.shape[1])
-            base.mmd = mmd
-            base.das = -mmd
-            base.kernel_terms = terms
             base.embedding_diversity = compute_embedding_diversity(
                 candidate_batch.vectors
             )
+            if proxy_batch is not None:
+                mmd, terms = compute_rbf_mmd(
+                    candidate_batch.vectors,
+                    proxy_batch.vectors,
+                    sigma=self.sigma,
+                    biased=self.biased,
+                    normalize=self.normalize_embeddings,
+                )
+                base.mmd = mmd
+                base.das = -mmd
+                base.kernel_terms = terms
             logger.info(
-                "Dataset embedding 完成：proxy=%s candidate=%d proxy_samples=%d "
-                "MMD=%.6f DAS=%.6f Vendi=%.3f NN-cos-mean=%.4f",
+                "Dataset embedding 完成：proxy=%s candidate=%d "
+                "MMD=%s DAS=%s Vendi=%.3f NN-cos-mean=%.4f",
                 self.proxy_name,
                 len(candidate_batch.vectors),
-                len(proxy_batch.vectors),
-                mmd,
-                -mmd,
+                f"{base.mmd:.6f}" if base.mmd is not None else "disabled",
+                f"{base.das:.6f}" if base.das is not None else "disabled",
                 base.embedding_diversity.get("cosine_vendi_score", 0.0),
                 base.embedding_diversity.get("nearest_neighbor_cosine_mean", 0.0),
             )
@@ -396,6 +405,8 @@ class DatasetQualityEvaluator:
     def _load_proxy_messages(self) -> list[Conversation]:
         if self._proxy_messages is not None:
             return self._proxy_messages
+        if self.proxy is None:
+            raise ValueError("proxy comparison is disabled")
         source = self.proxy.source.strip().lower()
         if source in {"local", "jsonl", "json"}:
             messages, _, _ = _sample_local_proxy(
@@ -622,6 +633,41 @@ def _l2_normalize(values: np.ndarray) -> np.ndarray:
 def _conversation(record: dict[str, Any], user_field: str, assistant_field: str) -> Conversation | None:
     user = record.get(user_field)
     assistant = record.get(assistant_field)
+    if user_field == assistant_field and isinstance(user, list):
+        messages: Conversation = []
+        if user and all(isinstance(message, str) for message in user):
+            if len(user) % 2 != 0 or any(not message.strip() for message in user):
+                return None
+            # Alternating string-list proxies such as EduChat carry a repeated
+            # branding system prompt. Exclude that metadata so MMD compares the
+            # educational exchanges instead of a shared boilerplate prefix.
+            messages.extend(
+                {
+                    "role": "user" if index % 2 == 0 else "assistant",
+                    "content": content.strip(),
+                }
+                for index, content in enumerate(user)
+            )
+        else:
+            for message in user:
+                if not isinstance(message, dict):
+                    return None
+                role = message.get("role")
+                content = message.get("content")
+                if role not in {"system", "user", "assistant"}:
+                    return None
+                if not isinstance(content, str) or not content.strip():
+                    return None
+                messages.append({"role": role, "content": content.strip()})
+        dialog = messages[1:] if messages and messages[0]["role"] == "system" else messages
+        expected = ["user" if index % 2 == 0 else "assistant" for index in range(len(dialog))]
+        if (
+            len(dialog) < 2
+            or dialog[-1]["role"] != "assistant"
+            or [message["role"] for message in dialog] != expected
+        ):
+            return None
+        return messages
     if not isinstance(user, str) or not user.strip():
         return None
     if not isinstance(assistant, str) or not assistant.strip():
@@ -640,31 +686,49 @@ def _sample_jsonl_conversations(
     user_field: str,
     assistant_field: str,
 ) -> tuple[list[Conversation], int, int]:
+    return _sample_jsonl_files(
+        [Path(path)],
+        sample_size=sample_size,
+        seed=seed,
+        user_field=user_field,
+        assistant_field=assistant_field,
+    )
+
+
+def _sample_jsonl_files(
+    paths: list[Path],
+    *,
+    sample_size: int,
+    seed: int,
+    user_field: str,
+    assistant_field: str,
+) -> tuple[list[Conversation], int, int]:
     rng = random.Random(seed)
     reservoir: list[Conversation] = []
     total = 0
     valid = 0
-    with Path(path).open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            if not raw_line.strip():
-                continue
-            total += 1
-            try:
-                record = json.loads(raw_line)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            if not isinstance(record, dict):
-                continue
-            messages = _conversation(record, user_field, assistant_field)
-            if messages is None:
-                continue
-            valid += 1
-            if len(reservoir) < sample_size:
-                reservoir.append(messages)
-            else:
-                index = rng.randint(0, valid - 1)
-                if index < sample_size:
-                    reservoir[index] = messages
+    for path in paths:
+        with path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                if not raw_line.strip():
+                    continue
+                total += 1
+                try:
+                    record = json.loads(raw_line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                messages = _conversation(record, user_field, assistant_field)
+                if messages is None:
+                    continue
+                valid += 1
+                if len(reservoir) < sample_size:
+                    reservoir.append(messages)
+                else:
+                    index = rng.randint(0, valid - 1)
+                    if index < sample_size:
+                        reservoir[index] = messages
     return reservoir, total, valid
 
 
@@ -678,9 +742,22 @@ def _sample_local_proxy(
 ) -> tuple[list[Conversation], int, int]:
     proxy_path = Path(path)
     if proxy_path.is_dir():
+        jsonl_files = sorted(
+            file
+            for pattern in ("*.jsonl", "*.ndjson")
+            for file in proxy_path.rglob(pattern)
+        )
+        if jsonl_files:
+            return _sample_jsonl_files(
+                jsonl_files,
+                sample_size=sample_size,
+                seed=seed,
+                user_field=user_field,
+                assistant_field=assistant_field,
+            )
         parquet_files = sorted(proxy_path.rglob("*.parquet"))
         if not parquet_files:
-            raise ValueError(f"本地代理目录中没有 Parquet 分片：{proxy_path}")
+            raise ValueError(f"本地代理目录中没有 JSONL/NDJSON 或 Parquet 分片：{proxy_path}")
         try:
             from datasets import load_dataset
         except ImportError as exc:

@@ -46,6 +46,7 @@ Each run is self-contained:
 | `iteration_NNN/operators/` | Generated custom operators |
 | `iteration_NNN/review.jsonl` | Structured Review Agent evidence |
 | `iteration_NNN/sessions/<backend>/` | Native Agent state and per-turn token usage |
+| `downstream_eval/checkpoint_NNN/` | Optional external SFT/evaluation request, result, and logs |
 
 The framework starts Claude, OpenCode, or Codex with `workspace/` as its working
 directory. Each backend receives a complete DataFlow skill under its native discovery
@@ -78,7 +79,7 @@ export DF_API_URL=https://api.example/v1/chat/completions
 export DF_API_KEY=...
 export DF_API_MAX_WORKERS=10
 export DF_RUN_NAME=experiment_001
-export DF_MAX_ITERATIONS=4
+export DF_MAX_ITERATIONS=5
 export DF_EXECUTION_REPAIRS=1
 export DF_COMPILE_TIMEOUT_SEC=120
 export DF_AGENT_PYTHON="$(command -v python)"
@@ -181,6 +182,33 @@ review_score = (0.75 * llm_composite + 0.25 * embedding_quality) * hard_metric_f
 ```
 
 Set `DF_DATASET_QUALITY_SCORE_WEIGHT` to change the default `0.25` contribution.
+
+## Optional periodic SFT/evaluation feedback
+
+An expensive downstream signal can run after every configurable number of static Review
+iterations. The framework sends the current best-so-far dataset to an external command,
+validates per-benchmark scores and complete bad cases, and adds that evidence to later
+PipelineAgent prompts. The command can use a separate Conda environment; no SFT or eval
+dependencies are installed in DataFlow Evolver.
+
+```yaml
+downstream_eval:
+  enabled: true
+  interval: 2
+  command:
+    - /opt/conda/envs/downstream/bin/python
+    - /absolute/path/to/run_sft_and_eval.py
+  benchmarks: [gsm8k, math, math500, aime]
+  baseline:
+    enabled: true  # checkpoint 0 evaluates the untrained model without SFT
+  bad_cases_per_benchmark: 3  # maximum; fewer are accepted when incorrect_count is lower
+  timeout_sec: 86400
+```
+
+The downstream result remains separate from static `review_score`; it guides subsequent
+pipeline changes and is fully recorded in the run manifest. See
+[`docs/downstream_evaluation.md`](docs/downstream_evaluation.md) for the request/result
+protocol, failure behavior, and benchmark-leakage guidance.
 
 ## Run
 

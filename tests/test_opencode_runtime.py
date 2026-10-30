@@ -1,13 +1,8 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
-import sys
 
-import anyio
-from mcp.client.session import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
 
 import dataflow_evolver.llm.opencode_runtime as runtime
 from dataflow_evolver.llm.agent_runtime import build_agent_runtime
@@ -55,19 +50,17 @@ def test_unknown_runtime_is_rejected():
         raise AssertionError("unknown backend should fail")
 
 
-def test_inline_config_exposes_only_pipeline_tools(monkeypatch, tmp_path):
+def test_inline_config_uses_skill_without_dataflow_mcp(monkeypatch, tmp_path):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "secret-must-not-be-serialized")
     config, agent_name, model = build_opencode_config(_cfg(), cwd=str(tmp_path))
 
     assert agent_name == "dataflow-pipeline"
     assert model == "anthropic/claude-opus-4-8"
-    assert set(config["mcp"]) == {"dataflow-operators"}
-    assert config["mcp"]["dataflow-operators"]["timeout"] == 30000
-    assert config["mcp"]["dataflow-operators"]["environment"]["DF_WORKSPACE"] == str(tmp_path)
+    assert "mcp" not in config
     assert config["agent"][agent_name]["permission"] == "allow"
     prompt = config["agent"][agent_name]["prompt"]
-    assert ".opencode/skills/dataflow-dev/templates/operator_api_reference.md" in prompt
-    assert ".claude/skills/dataflow-dev" not in prompt
+    assert "dataflow-evolver-pipeline" in prompt
+    assert "supplied task context" in prompt
     serialized = json.dumps(config)
     assert "secret-must-not-be-serialized" not in serialized
     assert "{env:ANTHROPIC_API_KEY}" in serialized
@@ -116,7 +109,7 @@ def test_parse_opencode_ndjson_records_text_session_and_tools():
                     "type": "tool_use",
                     "sessionID": "ses_1",
                     "part": {
-                        "tool": "dataflow-operators_list_operators",
+                        "tool": "example-server_example-tool",
                         "state": {"input": {"category": "reasoning"}},
                     },
                 }
@@ -133,7 +126,7 @@ def test_parse_opencode_ndjson_records_text_session_and_tools():
     assert result.tool_uses == [
         {
             "turn": 1,
-            "name": "dataflow-operators_list_operators",
+            "name": "example-server_example-tool",
             "input": {"category": "reasoning"},
         }
     ]
@@ -176,7 +169,7 @@ def test_headless_run_uses_stdin_inline_config_and_cli_flags(monkeypatch, tmp_pa
     assert captured["command"][:3] == ["opencode", "run", "--format"]
     inline = json.loads(captured["env"]["OPENCODE_CONFIG_CONTENT"])
     assert inline["agent"]["dataflow-pipeline"]["model"] == "anthropic/claude-opus-4-8"
-    assert set(inline["mcp"]) == {"dataflow-operators"}
+    assert "mcp" not in inline
     session_dir = iteration_dir / "sessions/opencode"
     assert captured["env"]["HOME"] == str((session_dir / "home").resolve())
     assert captured["env"]["XDG_DATA_HOME"] == str(
@@ -210,25 +203,3 @@ def test_retry_resumes_open_session(monkeypatch, tmp_path):
     assert calls[0] == ("original", None)
     assert calls[1][1] == "ses_retry"
     assert calls[1][0] != "original"
-
-
-def test_stdio_bridge_exposes_operator_tools():
-    async def list_names():
-        env = os.environ.copy()
-        params = StdioServerParameters(
-            command=sys.executable,
-            args=["-m", "dataflow_evolver.llm.mcp_stdio"],
-            env=env,
-        )
-        async with stdio_client(params) as (read_stream, write_stream):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                result = await session.list_tools()
-                return {tool.name for tool in result.tools}
-
-    assert anyio.run(list_names) == {
-        "list_operator_categories",
-        "recommend_operator_categories",
-        "list_operators",
-        "get_operator_detail",
-    }

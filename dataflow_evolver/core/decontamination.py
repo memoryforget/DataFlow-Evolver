@@ -220,10 +220,18 @@ def _row_text(row: dict, fields: list[str] | None) -> str:
     默认取全部字符串字段：污染既可能在题干也可能在答案里，而字段名在生成数据与基准之间
     往往对不上（question/instruction/problem…），按名字挑反而容易漏。
     """
-    if fields:
-        picked = [str(row.get(k, "")) for k in fields]
-    else:
-        picked = [v for v in row.values() if isinstance(v, str)]
+    def strings(value):
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, dict):
+            for nested in value.values():
+                yield from strings(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                yield from strings(nested)
+
+    values = [row.get(k) for k in fields] if fields else row.values()
+    picked = [text for value in values for text in strings(value)]
     return " ".join(p for p in picked if p)
 
 

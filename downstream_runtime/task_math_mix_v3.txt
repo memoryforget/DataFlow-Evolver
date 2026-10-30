@@ -1,0 +1,15 @@
+Transform the supplied 14,181-row GSM8K-train + MATH-train corpus into a dataset containing the best 3,000 high-quality SFT records for Qwen2.5-7B Base.
+Input rows contain source metadata plus problem, golden_solution, and golden_answer; use problem as the math prompt and preserve answer consistency with golden_answer. The final training schema remains exactly instruction and output.
+Downstream SFT uses Qwen2.5-7B Base with cutoff_len=16,384; generated outputs must be complete within this limit and must not rely on truncation.
+
+Each final record must:
+
+1. Contain a non-empty `instruction` field stating the math problem.
+2. Contain a correct, self-contained `output` field that:
+   - Identifies the key components of the problem.
+   - Applies the relevant theorems or formulas with a step-by-step derivation.
+   - Shows calculations and verifies important intermediate results.
+   - Concludes with the final answer explicitly wrapped in LaTeX `\boxed{}` notation.
+3. Be distinct, mathematically valid, and suitable for supervised fine-tuning.
+
+The final dataset must contain exactly 3,000 records. Validate the row count, schema, non-empty fields, uniqueness, and answer consistency.

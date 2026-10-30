@@ -1,7 +1,7 @@
 """Build and refine DataFlow pipelines from direct ReviewAgent feedback.
 
-它不直接产出文本，而是通过配置的 AgentRuntime 启动无头编码 Agent，让 Agent 借助 MCP 算子发现、
-源码阅读和 dataflow-dev 技能把完整可运行的 DataFlow 流水线写到 iteration workspace；
+它不直接产出文本，而是通过配置的 AgentRuntime 启动无头编码 Agent，让 Agent 只依据专用
+dataflow-evolver-pipeline 技能和本轮上下文，把完整可运行的流水线写到 iteration workspace；
 然后框架读取 pipeline.py + decision.json，并负责确定性的 artifact、compile 与执行检查。
 
 注意：PipelineAgent 不继承 AgentABC（那是非-SDK 辅助 Agent 的基类）。
@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from dataflow_evolver.core.downstream_eval import DownstreamEvaluationResult
 from dataflow_evolver.core.input_corpus import InputCorpus
 from dataflow_evolver.core.schemas import (
     PipelineConfig,
@@ -21,12 +22,10 @@ from dataflow_evolver.core.schemas import (
 )
 from dataflow_evolver.llm.agent_runtime import AgentRuntime, build_agent_runtime
 from dataflow_evolver.llm.agent_sdk import AgentInfraError
-from dataflow_evolver.llm.mcp_operators import _recommend_categories
 from dataflow_evolver.llm.prompts import (
     build_pipeline_prompt,
     build_selfcorrect_prompt,
 )
-from dataflow_evolver.llm.skill_paths import skill_root_for_backend
 from dataflow_evolver.utils.config import Config
 from dataflow_evolver.utils.logging import get_logger
 
@@ -48,7 +47,6 @@ class PipelineAgent:
         self.pipeline_filename = agent_cfg.get("pipeline_filename", "pipeline.py")
         self.llm_block = llm_block
         self.backend = str(agent_cfg.get("backend", "claude") or "claude").strip().lower()
-        self.skill_root = skill_root_for_backend(self.backend)
         self.runtime = runtime or build_agent_runtime(agent_cfg)
         self.logger = get_logger(f"agents.{self.name}")
 
@@ -57,6 +55,7 @@ class PipelineAgent:
         self,
         task: TaskSpec,
         iteration_dir: Path,
+        downstream_feedback: DownstreamEvaluationResult | None = None,
     ) -> PipelineConfig | None:
         """Build the first pipeline over the fixed raw corpus."""
         iteration_dir = iteration_dir.resolve()
@@ -66,7 +65,7 @@ class PipelineAgent:
             corpus=self.corpus,
             iteration_dir=str(iteration_dir),
             llm_block=self.llm_block,
-            recommended_categories=_recommend_categories(task.task_description),
+            downstream_feedback=downstream_feedback,
             is_init=True,
         )
         return self._run_and_assemble(prompt, iteration_dir, phase="generate_initial")
@@ -78,23 +77,32 @@ class PipelineAgent:
         iteration_dir: Path,
         parent_code: str | None = None,
         parent_rationale: str | None = None,
+        parent_iteration_dir: Path | None = None,
         parent_review: ReviewResult | None = None,
+        execution_observation_path: str | None = None,
+        pipeline_diagnostic: Any | None = None,
+        downstream_feedback: DownstreamEvaluationResult | None = None,
         evolution_history: list[dict[str, Any]] | None = None,
     ) -> PipelineConfig | None:
         """Challenge the incumbent using its review and compact attempt history."""
         iteration_dir = iteration_dir.resolve()
         iteration_dir.mkdir(parents=True, exist_ok=True)
-        # 预调用推荐引擎，把结果直接注入 prompt 强制引导算子选择
-        recommended = _recommend_categories(task.task_description)
         prompt = build_pipeline_prompt(
             task=task,
             corpus=self.corpus,
             iteration_dir=str(iteration_dir),
             llm_block=self.llm_block,
             parent_code=parent_code,
-            recommended_categories=recommended,
             parent_rationale=parent_rationale,
+            parent_iteration_dir=(
+                str(parent_iteration_dir.resolve())
+                if parent_iteration_dir is not None
+                else None
+            ),
             parent_review=parent_review,
+            execution_observation_path=execution_observation_path,
+            pipeline_diagnostic=pipeline_diagnostic,
+            downstream_feedback=downstream_feedback,
             evolution_history=evolution_history,
         )
         return self._run_and_assemble(prompt, iteration_dir)
@@ -106,6 +114,7 @@ class PipelineAgent:
         traceback: str,
         diagnostics: str = "",
         failure_stage: str = "execution",
+        log_paths: dict[str, str] | None = None,
     ) -> PipelineConfig | None:
         iteration_dir = iteration_dir.resolve()
         prompt = build_selfcorrect_prompt(
@@ -113,7 +122,7 @@ class PipelineAgent:
             traceback,
             diagnostics,
             failure_stage=failure_stage,
-            skill_root=self.skill_root,
+            log_paths=log_paths,
         )
         return self._run_and_assemble(
             prompt,
